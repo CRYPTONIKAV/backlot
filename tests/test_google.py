@@ -6090,6 +6090,18 @@ def test_gmail_raw_with_attachment_is_valid_mime(tmp_path):
 _GMAIL_SHAPES = [
     {
         "source_type": "gmail",
+        "doc_id": "two-files",
+        "mailbox": "ava",
+        "title": "Two files",
+        "content": "Both attached.",
+        "author_email": "ava@acme.com",
+        "attachments": [
+            {"filename": "a.txt", "mime": "text/plain", "content": "hello"},
+            {"filename": "b.txt", "mime": "text/plain"},
+        ],
+    },
+    {
+        "source_type": "gmail",
         "doc_id": "att",
         "mailbox": "ceo",
         "title": "With attachment",
@@ -6152,18 +6164,6 @@ _GMAIL_SHAPES = [
         "author_email": "ceo@x.com",
         "to": "회의 <peer@x.com>",
         "attachments": [{"filename": "회의록.txt", "mime": "text/plain", "content": "안녕"}],
-    },
-    {
-        "source_type": "gmail",
-        "doc_id": "two-files",
-        "mailbox": "ava",
-        "title": "Two files",
-        "content": "Both attached.",
-        "author_email": "ava@acme.com",
-        "attachments": [
-            {"filename": "a.txt", "mime": "text/plain", "content": "hello"},
-            {"filename": "b.txt", "mime": "text/plain"},
-        ],
     },
 ]
 
