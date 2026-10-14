@@ -1047,6 +1047,24 @@ def gh_client(tmp_path_factory):
         yield c, settings
 
 
+@pytest.mark.parametrize(
+    "auth, carries",
+    [
+        ("Bearer nope", False),
+        ("Bearer\tnope", True),
+        ("token\tnope", True),
+    ],
+)
+def test_github_tab_after_scheme_carries_ratelimit_headers(gh_client, auth, carries):
+    """Measured (#707): a tab after the scheme is refused as "Bad credentials" like the
+    space form, but carries the five `x-ratelimit-*` headers where the space form has none."""
+    c, _ = gh_client
+    r = c.get("/github/rate_limit", headers={"Authorization": auth})
+    assert r.status_code == 401 and r.json()["message"] == "Bad credentials"
+    five = [name for name in r.headers if name.startswith("x-ratelimit-")]
+    assert (len(five) == 5) is carries
+
+
 @pytest.fixture(scope="module")
 def gh_org(gh_client):
     c, _ = gh_client

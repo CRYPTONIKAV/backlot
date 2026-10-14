@@ -467,6 +467,19 @@ def refused_a_credential(request: Request) -> bool:
     return auth.bearer_token(request) is not None and auth.resolve_bearer(request) is None
 
 
+def tab_separated_credential(request: Request) -> bool:
+    """Whether `Authorization` puts a tab between the scheme and the credential.
+
+    Measured against api.github.com 2026-10-14 (#707): `Bearer<TAB>nope` and `token<TAB>nope`
+    are refused as "Bad credentials" like their space-separated spellings, but carry the five
+    `x-ratelimit-*` headers of a fresh window (`limit: 60`) where the space forms carry none.
+    Real splits the scheme on the space alone, so the tab form counts as an address-keyed
+    caller for rate limiting while still failing credential resolution.
+    """
+    raw = request.headers.get("authorization") or ""
+    return re.match(r"(?i)(bearer|token)\t", raw) is not None
+
+
 def rate_limit_headers(request: Request, status_code: int) -> dict[str, str]:
     """The five `x-ratelimit-*` headers for a `/github` answer.
 

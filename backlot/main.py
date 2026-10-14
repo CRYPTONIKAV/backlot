@@ -293,7 +293,7 @@ async def report_github_rate_limit(request: Request, call_next):
     """
     gated = (
         request.url.path.startswith("/github")
-        and not github.refused_a_credential(request)
+        and (not github.refused_a_credential(request) or github.tab_separated_credential(request))
         and (_some_github_route_matches(request.scope) or "authorization" not in request.headers)
     )
     if gated:
