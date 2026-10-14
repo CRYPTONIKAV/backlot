@@ -288,8 +288,10 @@ async def report_github_rate_limit(request: Request, call_next):
     rate-limit answers are not measured. A 404 for a path no route matches at all gets them only
     for a request that carried no `Authorization` header at all — see
     ``_some_github_route_matches`` — and a credential that did not resolve gets them on no path at
-    all (``github.refused_a_credential``); the refusal check shares that same gate, so neither is
-    ever refused by it.
+    all (``github.refused_a_credential``), except a tab between the scheme and the credential,
+    which real counts as an address-keyed caller and answers with the five
+    (``github.tab_separated_credential``, measured #707); the refusal check shares that same
+    gate, so neither is ever refused by it.
     """
     gated = (
         request.url.path.startswith("/github")

@@ -1062,7 +1062,17 @@ def test_github_tab_after_scheme_carries_ratelimit_headers(gh_client, auth, carr
     r = c.get("/github/rate_limit", headers={"Authorization": auth})
     assert r.status_code == 401 and r.json()["message"] == "Bad credentials"
     five = [name for name in r.headers if name.startswith("x-ratelimit-")]
-    assert (len(five) == 5) is carries
+    assert five == (
+        [
+            "x-ratelimit-limit",
+            "x-ratelimit-remaining",
+            "x-ratelimit-reset",
+            "x-ratelimit-resource",
+            "x-ratelimit-used",
+        ]
+        if carries
+        else []
+    )
 
 
 @pytest.fixture(scope="module")
