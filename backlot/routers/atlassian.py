@@ -1883,11 +1883,13 @@ async def confluence_restrictions(content_id: int, request: Request):
     emails = store.doc_member_emails(conn, "confluence", content_id)
     users = [] if emails is None else [_conf_user(e, _site(request)) for e in sorted(emails)]
 
+    site = _site(request)
+
     def _op(name):
         return {
             "_expandable": {"content": f"/rest/api/content/{content_id}"},
             "_links": {
-                "self": f"{_site(request)}/wiki/rest/api/content/{content_id}/restriction/byOperation/{name}"
+                "self": f"{site}/wiki/rest/api/content/{content_id}/restriction/byOperation/{name}"
             },
             "operation": name,
             "restrictions": {
@@ -1896,7 +1898,6 @@ async def confluence_restrictions(content_id: int, request: Request):
             },
         }
 
-    site = _site(request)
     return {
         "_links": {
             "self": f"{site}/wiki/rest/api/content/{content_id}/restriction/byOperation",
