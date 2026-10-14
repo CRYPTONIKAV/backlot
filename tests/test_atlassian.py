@@ -1375,6 +1375,12 @@ def test_confluence_restrictions_has_update(tmp_path):
     result = asyncio.run(confluence_restrictions(cid, Request(scope)))
     assert "read" in result and "update" in result
     assert result["read"]["restrictions"]["user"]["results"]  # the private doc's author
+    # Measured (#563): top-level _links plus one self link per operation.
+    assert result["_links"]["context"] == "/wiki"
+    assert result["_links"]["base"].endswith("/wiki")
+    assert result["_links"]["self"].endswith(f"/rest/api/content/{cid}/restriction/byOperation")
+    for op in ("read", "update"):
+        assert result[op]["_links"]["self"].endswith(f"/restriction/byOperation/{op}")
 
 
 @pytest.mark.parametrize("route", ["child/page", "child/attachment", "restriction/byOperation"])

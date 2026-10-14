@@ -1885,15 +1885,27 @@ async def confluence_restrictions(content_id: int, request: Request):
 
     def _op(name):
         return {
+            "_expandable": {"content": f"/rest/api/content/{content_id}"},
+            "_links": {
+                "self": f"{_site(request)}/wiki/rest/api/content/{content_id}/restriction/byOperation/{name}"
+            },
             "operation": name,
             "restrictions": {
                 "user": {"results": users, "start": 0, "limit": 200, "size": len(users)},
                 "group": {"results": [], "start": 0, "limit": 200, "size": 0},
             },
-            "_expandable": {"content": f"/rest/api/content/{content_id}"},
         }
 
-    return {"read": _op("read"), "update": _op("update")}
+    site = _site(request)
+    return {
+        "_links": {
+            "self": f"{site}/wiki/rest/api/content/{content_id}/restriction/byOperation",
+            "base": f"{site}/wiki",
+            "context": "/wiki",
+        },
+        "read": _op("read"),
+        "update": _op("update"),
+    }
 
 
 def _conf_user(email: str, site: str) -> dict:
