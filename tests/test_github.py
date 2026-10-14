@@ -1066,9 +1066,9 @@ def test_github_tab_after_scheme_carries_ratelimit_headers(gh_client, auth, carr
         [
             "x-ratelimit-limit",
             "x-ratelimit-remaining",
+            "x-ratelimit-used",
             "x-ratelimit-reset",
             "x-ratelimit-resource",
-            "x-ratelimit-used",
         ]
         if carries
         else []
