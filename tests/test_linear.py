@@ -2839,6 +2839,40 @@ def _linear_identifiers(client, authorization):
     return r.status_code, r.json()
 
 
+def test_linear_team_issue_count_excludes_archived(tmp_path):
+    """Measured (#568): `Team.issueCount` counts the live issues, like the
+    default `issues` listing — not the `includeArchived: true` one."""
+    records = [
+        complete(
+            "linear",
+            doc_id="live",
+            team="engineering",
+            identifier="ENG-1",
+            title="Live issue",
+        ),
+        complete(
+            "linear",
+            doc_id="old",
+            team="engineering",
+            identifier="ENG-2",
+            title="Archived issue",
+            archivedAt="2026-03-01T00:00:00Z",
+        ),
+    ]
+    with corpus_client(tmp_path, records) as (client, settings):
+        h = {"Authorization": settings.admin_token}
+        data = gql(
+            client,
+            '{ team(id: "ENG") { issueCount } '
+            "live: issues { nodes { identifier } } "
+            "all: issues(includeArchived: true) { nodes { identifier } } }",
+            h,
+        ).json()["data"]
+        assert [n["identifier"] for n in data["live"]["nodes"]] == ["ENG-1"]
+        assert [n["identifier"] for n in data["all"]["nodes"]] == ["ENG-1", "ENG-2"]
+        assert data["team"]["issueCount"] == 1
+
+
 def test_an_issue_with_no_recorded_edit_is_filtered_on_the_updatedAt_it_serves(tmp_path):
     """`Issue.updatedAt` is non-null in Linear; Backlot serves an issue with no recorded edit at its
     creation time (`COALESCE(updated_ts, created_ts)`), and the sorts already read that expression.

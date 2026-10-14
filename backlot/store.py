@@ -1780,10 +1780,12 @@ def linear_entity_has_visible(conn, kind: str, value, visible_ids=None) -> bool:
 
 def linear_team_issue_counts(conn, visible_ids=None) -> dict[str, int]:
     """team -> visible issue count, in one grouped scan — ``Team.issueCount`` for a whole page of
-    teams without a COUNT(*) per team."""
+    teams without a COUNT(*) per team. Counts live issues only, the way the listing does (#568):
+    archived rows are invisible unless asked for."""
     clause, cparams = _acl_clause("linear", visible_ids=visible_ids)
     rows = conn.execute(
-        f"SELECT team, COUNT(*) FROM linear_issues WHERE 1=1{clause} GROUP BY team", cparams
+        f"SELECT team, COUNT(*) FROM linear_issues WHERE 1=1{_linear_archived(False)}{clause} GROUP BY team",
+        cparams,
     )
     return {r[0]: r[1] for r in rows}
 
