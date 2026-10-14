@@ -1715,17 +1715,79 @@ async def confluence_restrictions(content_id: int, request: Request):
     emails = store.doc_member_emails(conn, "confluence", content_id)
     users = [] if emails is None else [_conf_user(e, _site(request)) for e in sorted(emails)]
 
-    def _op(name):
-        return {
+    known_ops = ("read", "update")
+
+    def _op(name, selected):
+        op = {
             "operation": name,
-            "restrictions": {
-                "user": {"results": users, "start": 0, "limit": 200, "size": len(users)},
-                "group": {"results": [], "start": 0, "limit": 200, "size": 0},
-            },
             "_expandable": {"content": f"/rest/api/content/{content_id}"},
         }
+        if not selected:
+            op["_expandable"] = {
+                "restrictions": "",
+                "content": f"/rest/api/content/{content_id}",
+            }
+            return op
+        op["restrictions"] = {}
+        if "user" in selected:
+            op["restrictions"]["user"] = {
+                "results": users,
+                "start": 0,
+                "limit": 200,
+                "size": len(users),
+            }
+        if "group" in selected:
+            op["restrictions"]["group"] = {
+                "results": [],
+                "start": 0,
+                "limit": 200,
+                "size": 0,
+            }
+        omitted = {"user", "group"} - selected
+        if omitted:
+            op["restrictions"]["_expandable"] = {key: "" for key in sorted(omitted)}
+        return op
 
-    return {"read": _op("read"), "update": _op("update")}
+    def _expand_selection():
+        # `expand=read,update.restrictions.group`: named operations are
+        # answered, unnamed ones land under top-level `_expandable`; a named
+        # operation shows only the restrictions it names (#723).
+        selection = {}
+        for value in request.query_params.getlist("expand"):
+            for item in value.split(","):
+                parts = [part.strip() for part in item.split(".")]
+                if not parts or not parts[0]:
+                    continue
+                selection.setdefault(parts[0], []).append(tuple(parts[1:]))
+        return selection
+
+    selection = _expand_selection()
+    if not selection:
+        return {"read": _op("read", {"user", "group"}), "update": _op("update", {"user", "group"})}
+
+    result = {}
+    expandable = {}
+    for name in known_ops:
+        paths = selection.get(name)
+        if paths is None:
+            expandable[name] = ""
+            continue
+        picked = set()
+        for path in paths:
+            if not path:
+                continue
+            head, tail = path[0], path[1:]
+            if head == "restrictions":
+                if not tail:
+                    picked |= {"user", "group"}
+                elif tail[0] in ("user", "group"):
+                    picked.add(tail[0])
+            elif head in ("user", "group"):
+                picked.add(head)
+        result[name] = _op(name, picked)
+    if expandable:
+        result["_expandable"] = expandable
+    return result
 
 
 def _conf_user(email: str, site: str) -> dict:

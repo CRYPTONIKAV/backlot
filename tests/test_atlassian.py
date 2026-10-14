@@ -1728,6 +1728,44 @@ def test_confluence_child_attachment_is_the_empty_page_from_any_start(
         assert body["_links"]["prev"].endswith(f"/child/attachment?{prev}")
 
 
+@pytest.mark.parametrize(
+    "expand, top, read, restrictions",
+    [
+        # (none) answers both operations in full.
+        (
+            None,
+            ["read", "update"],
+            ["operation", "_expandable", "restrictions"],
+            ["user", "group"],
+        ),
+        # A named operation alone comes without its restrictions.
+        ("read", ["read", "_expandable"], ["operation", "_expandable"], []),
+        # Restrictions sub-paths filter user/group; the rest goes expandable.
+        ("update.restrictions.group", ["update", "_expandable"], [], []),
+        (
+            "read.restrictions.user",
+            ["read", "_expandable"],
+            ["operation", "_expandable", "restrictions"],
+            ["user", "_expandable"],
+        ),
+        ("read,update", ["read", "update"], ["operation", "_expandable"], []),
+        # Unknown names answer neither operation (#723).
+        ("bogus", ["_expandable"], [], []),
+    ],
+)
+def test_confluence_restrictions_honor_expand(client, admin_h, expand, top, read, restrictions):
+    """Measured (#723): `expand` selects operations and restriction members."""
+    api = "/atlassian/wiki/rest/api"
+    cid = client.get(f"{api}/content?limit=1", headers=admin_h).json()["results"][0]["id"]
+    url = f"{api}/content/{cid}/restriction/byOperation"
+    if expand is not None:
+        url += f"?expand={expand}"
+    body = client.get(url, headers=admin_h).json()
+    assert list(body) == top
+    assert list(body.get("read", {})) == read
+    assert list(body.get("read", {}).get("restrictions", {})) == restrictions
+
+
 @pytest.mark.parametrize("route", ["child/page", "child/comment", "child/attachment", "label"])
 def test_confluence_child_listings_refuse_a_limit_they_cannot_convert(client, admin_h, route):
     """Measured: each answers Spring's two-key 400, the same body `content` gives."""
