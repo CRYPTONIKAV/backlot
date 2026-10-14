@@ -394,6 +394,32 @@ def test_s3_a_write_is_refused_as_not_implemented(live_server, path, method, bod
     assert "<Code>NotImplemented</Code>" in r.text
 
 
+@pytest.mark.parametrize("method", ["PUT", "POST", "DELETE", "PATCH"])
+@pytest.mark.parametrize(
+    "query, message",
+    [
+        ("annotationName=x", "Unexpected query string parameter"),
+        ("annotationName=x&acl", "Conflicting query string parameters: acl, annotationName"),
+        (
+            "annotation&annotationName=x&acl",
+            "Conflicting query string parameters: acl, annotation, annotationName",
+        ),
+        ("partNumber=1&acl", "Conflicting query string parameters: acl, partNumber"),
+    ],
+)
+def test_s3_a_write_reads_annotationName_and_partNumber(live_server, method, query, message):
+    """Measured (#693): a write at a key reads `annotationName` and `partNumber` beside a
+    selector as the GET does — alone the former is "Unexpected query string parameter", beside
+    a selector either joins the conflict — and the conflict names `annotationName` beside
+    `annotation`, all ahead of the bucket."""
+    import httpx
+
+    base_url, _ = live_server
+    r = httpx.request(method, f"{base_url}{_KEY}?{query}")
+    assert r.status_code == 400
+    assert "<Code>InvalidArgument</Code>" in r.text and message in r.text
+
+
 @pytest.mark.parametrize(
     "path, message",
     [
@@ -2511,6 +2537,10 @@ _PARAMETER_ROWS = [
      "startAfter only supported in REST.GET.BUCKET with list-type=2", _argued("start-after")),
     ("GET", "/s3/eng-artifacts?versionId=x&acl&versioning", 400,
      "Conflicting query string parameters: acl, versioning", _argued("ResourceType", "acl")),
+    # Beside `annotation` and another selector, the conflict names `annotationName` too (#693).
+    ("GET", f"{_KEY}?annotation&annotationName=x&acl", 400,
+     "Conflicting query string parameters: acl, annotation, annotationName",
+     _argued("ResourceType", "acl")),
     ("GET", "/s3/eng-artifacts?versionId=x&partNumber=1", 400, "Object must have a valid key name.",
      ""),
     ("GET", "/s3/eng-artifacts?versionId=x&delete", *_VERSION_ID_X),
