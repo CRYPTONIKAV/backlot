@@ -525,9 +525,7 @@ def test_notion_search_filter_data_source_only(client, notion_h):
     ).json()
     assert s["results"] and all(r["object"] == "data_source" for r in s["results"])
     assert {r["object"] for r in s["results"]} == {"data_source"}
-    assert any(
-        r["id"] == synth.notion_data_source_id("nt-tasks-db") for r in s["results"]
-    )
+    assert any(r["id"] == synth.notion_data_source_id("nt-tasks-db") for r in s["results"])
 
 
 def test_notion_users(client, notion_h):
