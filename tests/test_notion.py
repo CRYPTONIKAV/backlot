@@ -516,6 +516,17 @@ def test_notion_search_filter_database_only(client, notion_h):
     assert any(r["id"] == synth.notion_id("nt-tasks-db") for r in s["results"])
 
 
+def test_notion_search_filter_data_source_only(client, notion_h):
+    """Measured (#564): `data_source` serves the data sources alone, not the workspace."""
+    s = client.post(
+        "/notion/v1/search",
+        json={"query": "", "filter": {"property": "object", "value": "data_source"}},
+        headers=notion_h,
+    ).json()
+    assert s["results"] and all(r["object"] == "data_source" for r in s["results"])
+    assert {r["object"] for r in s["results"]} == {"data_source"}
+
+
 def test_notion_users(client, notion_h):
     me = client.get("/notion/v1/users/me", headers=notion_h).json()
     assert me["object"] == "user" and me["type"] == "bot"

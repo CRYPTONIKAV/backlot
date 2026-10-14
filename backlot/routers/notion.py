@@ -701,7 +701,7 @@ async def search(request: Request):
     conn = auth.conn(request)
     visible = auth.visible_ids(request, caller)
     query = body.get("query", "")
-    want = body.get("filter", {}).get("value")  # 'page' | 'database' | None
+    want = body.get("filter", {}).get("value")  # 'page' | 'database' | 'data_source' | None
     offset = pagination.decode_cursor(body.get("start_cursor"))
     limit = _page_size(body.get("page_size"))
     # Over-fetch so object-type filtering still fills a page; cap keeps it bounded. An empty query
@@ -718,14 +718,21 @@ async def search(request: Request):
             continue
         if want == "page" and is_db:
             continue
+        if want == "data_source" and not is_db:
+            # A data source is the queryable half of a database row (#564):
+            # databases narrow to their data source objects below.
+            continue
         picked.append(r)
     window = picked[offset : offset + limit]
-    results = [
-        _database_obj(conn, r, _version(request))
-        if r["subtype"] == "database"
-        else _page_obj(conn, r)
-        for r in window
-    ]
+    if want == "data_source":
+        results = [_data_source_obj(conn, r) for r in window]
+    else:
+        results = [
+            _database_obj(conn, r, _version(request))
+            if r["subtype"] == "database"
+            else _page_obj(conn, r)
+            for r in window
+        ]
     return _list_obj(results, offset, len(window), len(picked), "page_or_database")
 
 
