@@ -206,6 +206,33 @@ def test_jira_404s_a_project_role_an_anonymous_caller_cannot_see(client, headers
         assert r.json()["errorMessages"] == [f"No project could be found with key '{key}'."]
 
 
+@pytest.mark.parametrize("route", ["role", "role/10002"])
+def test_jira_finds_a_project_by_its_id_on_the_role_routes(client, admin_h, route):
+    """Measured (#702): real finds the project by its id as by its key — the credentialled
+    caller gets the same answer either way — and the 404 says `id` for an id-shaped segment,
+    `key` otherwise (`0<id>` and nineteen digits read as a key)."""
+    from backlot import synth
+
+    key = synth.jira_project_key("payments")
+    pid = str(synth.github_user_id("payments"))
+    by_key = client.get(f"/atlassian/rest/api/3/project/{key}/{route}", headers=admin_h)
+    by_id = client.get(f"/atlassian/rest/api/3/project/{pid}/{route}", headers=admin_h)
+    assert by_id.status_code == by_key.status_code == 200
+    if route == "role":
+        # The role listing addresses itself with the segment as spelled; same project either way.
+        assert by_id.json()["Users"].replace(pid, key) == by_key.json()["Users"]
+    else:
+        assert by_id.json() == by_key.json()
+    missing = client.get(f"/atlassian/rest/api/3/project/0{pid}/{route}", headers=admin_h)
+    assert missing.status_code == 404
+    assert missing.json()["errorMessages"] == [f"No project could be found with key '0{pid}'."]
+    neither = client.get("/atlassian/rest/api/3/project/9999999999999999999/" + route)
+    assert neither.status_code == 404
+    assert neither.json()["errorMessages"] == [
+        "No project could be found with key '9999999999999999999'."
+    ]
+
+
 def test_jira_refuses_a_bearer_it_cannot_read_as_a_connect_token(client):
     """A bearer is not the Basic pair: Jira does not go anonymous for one it cannot resolve, it
     refuses with 403 and a body that is neither API's envelope. A Backlot token is an opaque

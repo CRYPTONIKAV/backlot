@@ -402,6 +402,29 @@ async def jira_project_search(request: Request):
     return {"values": values, "maxResults": 50, "startAt": 0, "total": len(values), "isLast": True}
 
 
+def _jira_segment_reads_as_id(segment: str) -> bool:
+    """Whether a project path segment reads as an id rather than a key.
+
+    Measured against Jira Cloud 2026-10-14 (#702): one to eighteen ASCII digits with no leading
+    zero read as an id, anything else as a key — so `0<id>` names nothing and its 404 says `key`.
+    """
+    return (
+        segment.isascii()
+        and segment.isdigit()
+        and 1 <= len(segment) <= 18
+        and not (len(segment) > 1 and segment.startswith("0"))
+    )
+
+
+def _jira_container_for_id(conn, token: str) -> str | None:
+    """The container behind a project id, or None. The id is what `project/search` reports for
+    the project (`#702`); resolution is exact, leading zeros included (those read as a key)."""
+    for r in store.list_containers(conn, "jira"):
+        if str(synth.github_user_id(r["name"])) == token:
+            return r["name"]
+    return None
+
+
 def _require_project(request: Request, conn, key: str) -> str:
     """The container behind a project key the caller can reach, or Jira's own 404 for it.
 
@@ -415,6 +438,10 @@ def _require_project(request: Request, conn, key: str) -> str:
     """
     ids = auth.visible_ids(request, _jira_caller(request))
     container = _jira_container_for_key(conn, key, request)
+    reads_as_id = _jira_segment_reads_as_id(key)
+    if container is None and reads_as_id:
+        # Real finds the project by its id as by its key, on both role routes (#702).
+        container = _jira_container_for_id(conn, key)
     # The `ids is None` short-circuit mirrors `github._repo_visible`, where it is load-bearing: a
     # `subtype: repo` record creates a container holding no document, and the admin keeps the repo
     # as soon as that record exists. No Jira record can do that — `project` is required on every
@@ -423,7 +450,8 @@ def _require_project(request: Request, conn, key: str) -> str:
         ids is None or store.has_visible_document(conn, "jira", container, ids)
     ):
         return container
-    raise HTTPException(status_code=404, detail=f"No project could be found with key '{key}'.")
+    named = f"id '{key}'" if reads_as_id else f"key '{key}'"
+    raise HTTPException(status_code=404, detail=f"No project could be found with {named}.")
 
 
 @router.get("/rest/api/3/project/{key}/role")
