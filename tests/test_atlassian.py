@@ -1729,31 +1729,18 @@ def test_confluence_child_attachment_is_the_empty_page_from_any_start(
 
 
 @pytest.mark.parametrize(
-    "expand, top, read, restrictions",
+    "expand, top",
     [
-        # (none) answers both operations in full.
-        (
-            None,
-            ["read", "update"],
-            ["operation", "_expandable", "restrictions"],
-            ["user", "group"],
-        ),
-        # A named operation alone comes without its restrictions.
-        ("read", ["read", "_expandable"], ["operation", "_expandable"], []),
-        # Restrictions sub-paths filter user/group; the rest goes expandable.
-        ("update.restrictions.group", ["update", "_expandable"], [], []),
-        (
-            "read.restrictions.user",
-            ["read", "_expandable"],
-            ["operation", "_expandable", "restrictions"],
-            ["user", "_expandable"],
-        ),
-        ("read,update", ["read", "update"], ["operation", "_expandable"], []),
-        # Unknown names answer neither operation (#723).
-        ("bogus", ["_expandable"], [], []),
+        (None, ["read", "update"]),
+        ("read", ["read", "_expandable"]),
+        ("update.restrictions.group", ["update", "_expandable"]),
+        ("read.restrictions.user", ["read", "_expandable"]),
+        ("read.restrictions", ["read", "_expandable"]),
+        ("read,update", ["read", "update"]),
+        ("bogus", ["_expandable"]),
     ],
 )
-def test_confluence_restrictions_honor_expand(client, admin_h, expand, top, read, restrictions):
+def test_confluence_restrictions_honor_expand(client, admin_h, expand, top):
     """Measured (#723): `expand` selects operations and restriction members."""
     api = "/atlassian/wiki/rest/api"
     cid = client.get(f"{api}/content?limit=1", headers=admin_h).json()["results"][0]["id"]
@@ -1762,8 +1749,41 @@ def test_confluence_restrictions_honor_expand(client, admin_h, expand, top, read
         url += f"?expand={expand}"
     body = client.get(url, headers=admin_h).json()
     assert list(body) == top
-    assert list(body.get("read", {})) == read
-    assert list(body.get("read", {}).get("restrictions", {})) == restrictions
+
+
+@pytest.mark.parametrize(
+    "expand, path, keys",
+    [
+        (None, ("read", "restrictions"), ["user", "group"]),
+        ("read", ("read",), ["operation", "_expandable"]),
+        ("read.restrictions.user", ("read", "restrictions"), ["user", "_expandable"]),
+        ("read.restrictions", ("read", "restrictions"), ["user", "group"]),
+        ("update.restrictions.group", ("update", "restrictions"), ["group", "_expandable"]),
+        ("bogus", (), ["_expandable"]),
+    ],
+)
+def test_confluence_restrictions_expand_payloads(client, admin_h, expand, path, keys):
+    """Measured (#723): named members carry their content, the rest goes expandable."""
+    api = "/atlassian/wiki/rest/api"
+    cid = client.get(f"{api}/content?limit=1", headers=admin_h).json()["results"][0]["id"]
+    url = f"{api}/content/{cid}/restriction/byOperation"
+    if expand is not None:
+        url += f"?expand={expand}"
+    body = client.get(url, headers=admin_h).json()
+    node = body
+    for key in path:
+        node = node.get(key, {})
+    assert list(node) == keys
+    if expand == "bogus":
+        assert body["_expandable"] == {"read": "", "update": ""}
+    if expand == "read":
+        assert body["_expandable"] == {"update": ""}
+        assert body["read"]["_expandable"] == {
+            "restrictions": "",
+            "content": body["read"]["_expandable"]["content"],
+        }
+    if expand == "read.restrictions.user":
+        assert body["read"]["restrictions"]["_expandable"] == {"group": ""}
 
 
 @pytest.mark.parametrize("route", ["child/page", "child/comment", "child/attachment", "label"])

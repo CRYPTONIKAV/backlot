@@ -1718,34 +1718,32 @@ async def confluence_restrictions(content_id: int, request: Request):
     known_ops = ("read", "update")
 
     def _op(name, selected):
-        op = {
-            "operation": name,
-            "_expandable": {"content": f"/rest/api/content/{content_id}"},
-        }
-        if not selected:
+        op = {"operation": name}
+        if selected:
+            op["restrictions"] = {}
+            if "user" in selected:
+                op["restrictions"]["user"] = {
+                    "results": users,
+                    "start": 0,
+                    "limit": 200,
+                    "size": len(users),
+                }
+            if "group" in selected:
+                op["restrictions"]["group"] = {
+                    "results": [],
+                    "start": 0,
+                    "limit": 200,
+                    "size": 0,
+                }
+            omitted = {"user", "group"} - selected
+            if omitted:
+                op["restrictions"]["_expandable"] = {key: "" for key in sorted(omitted)}
+            op["_expandable"] = {"content": f"/rest/api/content/{content_id}"}
+        else:
             op["_expandable"] = {
                 "restrictions": "",
                 "content": f"/rest/api/content/{content_id}",
             }
-            return op
-        op["restrictions"] = {}
-        if "user" in selected:
-            op["restrictions"]["user"] = {
-                "results": users,
-                "start": 0,
-                "limit": 200,
-                "size": len(users),
-            }
-        if "group" in selected:
-            op["restrictions"]["group"] = {
-                "results": [],
-                "start": 0,
-                "limit": 200,
-                "size": 0,
-            }
-        omitted = {"user", "group"} - selected
-        if omitted:
-            op["restrictions"]["_expandable"] = {key: "" for key in sorted(omitted)}
         return op
 
     def _expand_selection():
