@@ -1675,6 +1675,27 @@ async def confluence_attachments(content_id: int, request: Request):
     }
 
 
+# The label prefixes real reads, in this case only (Confluence Cloud, 2026-10-14).
+_LABEL_PREFIXES = frozenset({"global", "my", "team", "system"})
+
+
+def _refuse_a_label_prefix(request: Request) -> None:
+    """Confluence's 400 for a `prefix` it cannot convert, measured on `content/{id}/label` on
+    2026-10-09 and 2026-10-14.
+
+    Every `prefix` value is read, each split at its commas and each element trimmed as Java's
+    `String.trim` trims (`%09global` is `global`); a single empty `prefix` is the parameter unsent.
+    Any element outside :data:`_LABEL_PREFIXES` is the refusal, which names every element in the
+    order sent: `?prefix=global&prefix=bogus` names `[global, bogus]`, `?prefix=global,` names
+    `[global, ]` and `?prefix=%20` names `[]`."""
+    values = request.query_params.getlist("prefix")
+    if values in ([], [""]):
+        return
+    parts = [part.strip(_JAVA_TRIMMED) for value in values for part in value.split(",")]
+    if not _LABEL_PREFIXES.issuperset(parts):
+        raise errors_atlassian.label_prefixes_not_converted(parts)
+
+
 @router.get("/wiki/rest/api/content/{content_id}/label", openapi_extra=_P_CONTENT_CHILD)
 async def confluence_labels(content_id: int, request: Request):
     conn = auth.conn(request)
@@ -1683,17 +1704,12 @@ async def confluence_labels(content_id: int, request: Request):
     row = store.get_document(conn, "confluence", content_id, visible_ids=ids)
     if row is None:
         raise HTTPException(status_code=404, detail="No content found with id")
+    # Real converts `limit` and `start` before it reads `prefix`, and refuses a negative or zero
+    # one after it (measured 2026-10-14).
+    _int_param(request, "limit", 200)
+    _int_param(request, "start", 0)
+    _refuse_a_label_prefix(request)
     limit, start = _confluence_page_params(request, default=200, cap=200, refuse_zero=True)
-    prefix = request.query_params.get("prefix")
-    if prefix is not None and prefix not in ("global", "my", "team"):
-        # Real refuses unknown prefixes with 400 (#562, measured once each);
-        # the corpus carries global labels only, so the valid values behave
-        # exactly as before.
-        raise HTTPException(
-            status_code=400,
-            detail="com.atlassian.confluence.api.service.exceptions.api."
-            f"BadRequestException: Could not convert label prefixes :[{prefix}]",
-        )
     labels = store.jcol(row, "labels")
     results = [
         {"prefix": "global", "name": lbl, "id": str(synth.confluence_id(lbl)), "label": lbl}

@@ -1699,22 +1699,43 @@ def test_confluence_label_serves_one_of_two_labels_and_a_next(client, admin_h):
     assert page["_links"]["next"].endswith("next=true&limit=1&start=1")
 
 
-@pytest.mark.parametrize("prefix", ["global", "my", "team"])
-def test_confluence_label_accepts_known_prefixes(client, admin_h, prefix):
-    """Measured (#562): real answers `global`/`my`/`team` with 200."""
+@pytest.mark.parametrize(
+    "query, refused",
+    [
+        *[(f"prefix={p}", None) for p in ("global", "my", "team", "system", "", "%20global")],
+        *[(f"prefix={p}", None) for p in ("%09global", "global,my", "my,team,system,global")],
+        ("prefix=bogus", ["bogus"]),
+        ("prefix=GLOBAL", ["GLOBAL"]),
+        ("prefix=%20bogus", ["bogus"]),
+        ("prefix=%20", [""]),
+        ("prefix=global,bogus", ["global", "bogus"]),
+        ("prefix=global%20,%20bogus", ["global", "bogus"]),
+        ("prefix=global,", ["global", ""]),
+        ("prefix=global&prefix=bogus", ["global", "bogus"]),
+        ("prefix=bogus&prefix=global", ["bogus", "global"]),
+        ("prefix=&prefix=bogus", ["", "bogus"]),
+        # where the refusal sits among the others, as the comment in `confluence_labels` records
+        ("prefix=bogus&limit=0", ["bogus"]),
+        ("prefix=bogus&limit=-1&start=-1", ["bogus"]),
+        ("prefix=bogus&limit=abc", "limit=abc"),
+        ("prefix=bogus&start=abc", "start=abc"),
+    ],
+)
+def test_confluence_label_reads_its_prefix_as_real_does(client, admin_h, query, refused):
+    """Real's answers to `content/{id}/label?prefix=…`, the rule `_refuse_a_label_prefix`
+    records: ``refused`` is the elements the 400 names, ``None`` a 200, or a query whose answer this
+    one is."""
     api = "/atlassian/wiki/rest/api"
     cid = client.get(f"{api}/content?limit=1", headers=admin_h).json()["results"][0]["id"]
-    r = client.get(f"{api}/content/{cid}/label?prefix={prefix}", headers=admin_h)
-    assert r.status_code == 200, r.text
-
-
-def test_confluence_label_refuses_unknown_prefix(client, admin_h):
-    """Measured (#562): real answers `prefix=bogus` with 400, not an empty 200 page."""
-    api = "/atlassian/wiki/rest/api"
-    cid = client.get(f"{api}/content?limit=1", headers=admin_h).json()["results"][0]["id"]
-    r = client.get(f"{api}/content/{cid}/label?prefix=bogus", headers=admin_h)
-    assert r.status_code == 400, r.text
-    assert "Could not convert label prefixes :[bogus]" in r.text
+    r = client.get(f"{api}/content/{cid}/label?{query}", headers=admin_h)
+    if refused is None:
+        assert r.status_code == 200, r.text
+    elif isinstance(refused, str):
+        twin = client.get(f"{api}/content/{cid}/label?{refused}", headers=admin_h)
+        assert (r.status_code, r.json()) == (400, twin.json())
+    else:
+        want = errors_atlassian.label_prefixes_not_converted(refused)
+        assert (r.status_code, r.json()) == (400, want.body)
 
 
 # (query, start, limit, prev) for a page holding no attachment, which every corpus page is
