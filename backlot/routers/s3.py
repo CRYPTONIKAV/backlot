@@ -523,6 +523,41 @@ def request_ids(method: str, path: str, query: str) -> tuple[str, str]:
     return request_id, base64.b64encode(raw[10:]).decode("ascii")
 
 
+# The control characters real S3 writes as character references rather than raw: U+0000 to
+# U+001F but the tab, LF and CR (measured 2026-10-13, #696). U+007F stays raw.
+_CONTROL_REF = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+
+def _xml_escape(value: str) -> str:
+    """`value` as real S3 echoes it in an error body: `&`, `<` and `>` escaped, and each control
+    character but the tab, LF and CR as a decimal character reference (`a&#1;b`, `&#0;` for a
+    NUL; measured 2026-10-13, #696). U+007F and the rest stay raw, as `escape` leaves them."""
+    return _CONTROL_REF.sub(lambda m: f"&#{ord(m.group(0))};", escape(value))
+
+
+def _xml_escape_hex(value: str) -> str:
+    """`value` as real S3 echoes it in a listing: same set, as lower-case hexadecimal references
+    (`c&#x1;`; measured 2026-10-13, #696)."""
+    return _CONTROL_REF.sub(lambda m: f"&#x{ord(m.group(0)):x};", escape(value))
+
+
+def _nul_refusal(q, names: tuple[tuple[str, str], ...]) -> Response | None:
+    """Real's 400 for a NUL in a listing's parameter: `InvalidArgument`, "Value must be a
+    sequence of Unicode characters and cannot include Null.", naming `prefix` for a prefix-like
+    parameter and `key-marker` for a marker-like one, the value with a decimal reference
+    (`c&#0;`; measured 2026-10-13, #696). `names` pairs each parameter with its ArgumentName, in
+    the order they are judged."""
+    for param, argument in names:
+        value = _first(q, param, None)
+        if value is not None and "\x00" in value:
+            return _argument_error(
+                "Value must be a sequence of Unicode characters and cannot include Null.",
+                argument,
+                value,
+            )
+    return None
+
+
 def _error(
     code: str,
     message: str,
@@ -549,7 +584,9 @@ def _error(
     # bodies: `NoSuchBucket`, `NoSuchKey`, `InvalidArgument`, `MethodNotAllowed`, `BadRequest`,
     # `PreconditionFailed` and `AccessForbidden`).
     tail = f"<RequestId>{ids[0]}</RequestId><HostId>{ids[1]}</HostId>" if ids else ""
-    body = f"<Error><Code>{code}</Code><Message>{escape(message)}</Message>{extra}{tail}</Error>"
+    body = (
+        f"<Error><Code>{code}</Code><Message>{_xml_escape(message)}</Message>{extra}{tail}</Error>"
+    )
     return _xml(body, status=_ERR_STATUS.get(code, 400), headers=headers, prolog=prolog)
 
 
@@ -557,12 +594,14 @@ def _no_such_bucket(bucket: str) -> Response:
     return _error(
         "NoSuchBucket",
         "The specified bucket does not exist",
-        f"<BucketName>{escape(bucket)}</BucketName>",
+        f"<BucketName>{_xml_escape(bucket)}</BucketName>",
     )
 
 
 def _no_such_key(key: str) -> Response:
-    return _error("NoSuchKey", "The specified key does not exist.", f"<Key>{escape(key)}</Key>")
+    return _error(
+        "NoSuchKey", "The specified key does not exist.", f"<Key>{_xml_escape(key)}</Key>"
+    )
 
 
 def _head(status: int, headers: dict | None = None) -> Response:
@@ -610,8 +649,8 @@ def _argument_error(message: str, name: str, value: str) -> Response:
         "InvalidArgument",
         message,
         extra=(
-            f"<ArgumentName>{escape(name)}</ArgumentName>"
-            f"<ArgumentValue>{escape(value)}</ArgumentValue>"
+            f"<ArgumentName>{_xml_escape(name)}</ArgumentName>"
+            f"<ArgumentValue>{_xml_escape(value)}</ArgumentValue>"
         ),
     )
 
@@ -623,7 +662,7 @@ def _argument_name(name: str) -> str:
     ``continuation-token`` refusal — the body is ``Code``, ``Message`` and ``ArgumentName`` alone,
     whatever was sent and for an empty value too (measured 2026-09-14 and 2026-09-17). The other
     ``InvalidArgument`` refusals here carry both (see ``_argument_error``)."""
-    return f"<ArgumentName>{escape(name)}</ArgumentName>"
+    return f"<ArgumentName>{_xml_escape(name)}</ArgumentName>"
 
 
 def _conflict(selected: list[str]) -> Response:
@@ -642,7 +681,7 @@ def _refused_credential(refusal: auth.SigV4Refusal, head: bool = False) -> Respo
     """Real's answer for a credential it refuses, members and all; on a `HEAD`, its status alone."""
     if head:
         return _head(_ERR_STATUS[refusal.code])
-    members = "".join(f"<{name}>{escape(value)}</{name}>" for name, value in refusal.members)
+    members = "".join(f"<{name}>{_xml_escape(value)}</{name}>" for name, value in refusal.members)
     return _error(refusal.code, refusal.message, members)
 
 
@@ -980,12 +1019,12 @@ async def list_buckets(request: Request):
     page, truncated = names[:max_buckets], len(names) > max_buckets
     region_xml = f"<BucketRegion>{sigv4.REGION}</BucketRegion>" if paged else ""
     items = "".join(
-        f"<Bucket><Name>{escape(b)}</Name>"
+        f"<Bucket><Name>{_xml_escape(b)}</Name>"
         f"<CreationDate>{synth.s3_iso(synth.epoch('s3-bucket:' + b))}</CreationDate>"
-        f"{region_xml}<BucketArn>arn:aws:s3:::{escape(b)}</BucketArn></Bucket>"
+        f"{region_xml}<BucketArn>arn:aws:s3:::{_xml_escape(b)}</BucketArn></Bucket>"
         for b in page
     )
-    tail = f"<Prefix>{escape(prefix)}</Prefix>" if prefix is not None else ""
+    tail = f"<Prefix>{_xml_escape(prefix)}</Prefix>" if prefix is not None else ""
     if truncated:
         tail += f"<ContinuationToken>{_encode_key_token(page[-1])}</ContinuationToken>"
     buckets = f"<Buckets>{items}</Buckets>" if items else "<Buckets/>"
@@ -1039,6 +1078,16 @@ async def head_bucket(request: Request, bucket: str):
     and a valued `website` are the 400 ahead of a selector's 405, as on real (same date)."""
     q = request.query_params
     selected = _bucket_selected(q, _BUCKET_READ_SELECTORS)
+    # As the GET's parses run before its selector refusal, so do these: a NUL marker on
+    # `?versions` or `?uploads` is the 400, not the selector's 405 (#696).
+    if selected == ["versions"]:
+        nul = _nul_refusal(q, (("prefix", "prefix"), ("key-marker", "key-marker")))
+    elif selected == ["uploads"]:
+        nul = _nul_refusal(q, (("key-marker", "key-marker"),))
+    else:
+        nul = None
+    if nul is not None:
+        return _head(nul.status_code)
     first = _version_id_refusal(q, selected) or _website_refusal(q)
     refused = _read_refusal(request, selected, _BUCKET_GET_REFUSALS, _BUCKET_GETS, first)
     if refused is not None:
@@ -1093,6 +1142,9 @@ async def bucket_get(request: Request, bucket: str):
         # value is parsed here and judged against the range after the lookup (measured). The other
         # parameters are read after it too.
         max_uploads, first = _int32_param(q, "max-uploads", _MAX_UPLOADS)
+        if first is None:
+            # A NUL key-marker is refused here too, ahead of the bucket (#696).
+            first = _nul_refusal(q, (("key-marker", "key-marker"),))
     elif selected == ["versions"]:
         max_keys, first = _versions_parse(q)
     elif not selected:
@@ -1137,7 +1189,12 @@ def _listing_parse(q, v2: bool) -> tuple[int, Response | None]:
     for name, message in _V1_ONLY if v2 else _V2_ONLY:
         if _first(q, name, None) is not None:
             return max_keys, _error("InvalidArgument", message, extra=_argument_name(name))
-    return max_keys, None
+    # A NUL in a listing's parameter is refused before the credential and the bucket too; where
+    # it falls against the parses above is not measured (#696).
+    nul = _nul_refusal(
+        q, (("prefix", "prefix"), ("start-after", "prefix"), ("marker", "key-marker"))
+    )
+    return max_keys, nul
 
 
 def _listing_checks(q, v2: bool) -> tuple[str | None, str | None, tuple | None, Response | None]:
@@ -1406,29 +1463,29 @@ def _list_objects(
     next_marker = last_val if (is_truncated and entries and not v2 and delimiter) else None
 
     body = [
-        f'<ListBucketResult xmlns="{NS}"><Name>{escape(bucket)}</Name>',
-        f"<Prefix>{escape(enc(prefix))}</Prefix>",
+        f'<ListBucketResult xmlns="{NS}"><Name>{_xml_escape(bucket)}</Name>',
+        f"<Prefix>{_xml_escape_hex(enc(prefix))}</Prefix>",
     ]
     if v2:
         # Both echoes turn on whether the parameter was sent, not on whether it has a value: an
         # empty `start-after` is echoed as the empty element, and an empty token was refused above,
         # so `is None` is the only reading with an input behind it.
         if start_after is not None and continuation is None:
-            body.append(f"<StartAfter>{escape(enc(start_after))}</StartAfter>")
+            body.append(f"<StartAfter>{_xml_escape_hex(enc(start_after))}</StartAfter>")
         if continuation is not None:
-            body.append(f"<ContinuationToken>{escape(continuation)}</ContinuationToken>")
+            body.append(f"<ContinuationToken>{_xml_escape(continuation)}</ContinuationToken>")
         if next_token:
             body.append(f"<NextContinuationToken>{next_token}</NextContinuationToken>")
         body.append(f"<KeyCount>{len(entries)}</KeyCount>")
     else:
-        body.append(f"<Marker>{escape(enc(marker))}</Marker>")
+        body.append(f"<Marker>{_xml_escape_hex(enc(marker))}</Marker>")
         if next_marker is not None:
-            body.append(f"<NextMarker>{escape(enc(next_marker))}</NextMarker>")
+            body.append(f"<NextMarker>{_xml_escape(enc(next_marker))}</NextMarker>")
     body.append(f"<MaxKeys>{max_keys}</MaxKeys>")
     if delimiter:
-        body.append(f"<Delimiter>{escape(enc(delimiter))}</Delimiter>")
+        body.append(f"<Delimiter>{_xml_escape_hex(enc(delimiter))}</Delimiter>")
     if encoding_type is not None:
-        body.append(f"<EncodingType>{escape(encoding_type)}</EncodingType>")
+        body.append(f"<EncodingType>{_xml_escape(encoding_type)}</EncodingType>")
     body.append(f"<IsTruncated>{'true' if is_truncated else 'false'}</IsTruncated>")
     # Every `Contents`, then every `CommonPrefixes` — real's document order, not the key order
     # `entries` holds (see this function's docstring).
@@ -1438,14 +1495,14 @@ def _list_objects(
         r = by_key[val]
         ts = r["updated_ts"] or r["created_ts"]
         body.append(
-            f"<Contents><Key>{escape(enc(val))}</Key>"
+            f"<Contents><Key>{_xml_escape(enc(val))}</Key>"
             f"<LastModified>{synth.s3_iso(ts)}</LastModified>"
-            f"<ETag>{escape(synth.s3_etag(r['key'], r['content']))}</ETag>"
+            f"<ETag>{_xml_escape(synth.s3_etag(r['key'], r['content']))}</ETag>"
             f"<Size>{len(r['content'].encode())}</Size>{owner}"
-            f"<StorageClass>{escape(r['subtype'] or 'STANDARD')}</StorageClass></Contents>"
+            f"<StorageClass>{_xml_escape(r['subtype'] or 'STANDARD')}</StorageClass></Contents>"
         )
     for val in [v for kind, v in entries if kind == "cp"]:
-        body.append(f"<CommonPrefixes><Prefix>{escape(enc(val))}</Prefix></CommonPrefixes>")
+        body.append(f"<CommonPrefixes><Prefix>{_xml_escape(enc(val))}</Prefix></CommonPrefixes>")
     body.append("</ListBucketResult>")
     return _xml("".join(body))
 
@@ -1569,13 +1626,13 @@ def _list_multipart_uploads(request: Request, bucket: str, max_uploads: int) -> 
     delimiter = _first(q, "delimiter")
     enc = _url_encode if encoding_type is not None else (lambda v: v)
     body = [
-        f'<ListMultipartUploadsResult xmlns="{NS}"><Bucket>{escape(bucket)}</Bucket>',
-        f"<KeyMarker>{escape(enc(key_marker))}</KeyMarker><UploadIdMarker></UploadIdMarker>",
+        f'<ListMultipartUploadsResult xmlns="{NS}"><Bucket>{_xml_escape(bucket)}</Bucket>',
+        f"<KeyMarker>{_xml_escape_hex(enc(key_marker))}</KeyMarker><UploadIdMarker></UploadIdMarker>",
         "<NextKeyMarker></NextKeyMarker><NextUploadIdMarker></NextUploadIdMarker>",
-        f"<Delimiter>{escape(enc(delimiter))}</Delimiter>" if delimiter else "",
-        f"<Prefix>{escape(enc(prefix))}</Prefix>" if prefix else "",
+        f"<Delimiter>{_xml_escape_hex(enc(delimiter))}</Delimiter>" if delimiter else "",
+        f"<Prefix>{_xml_escape_hex(enc(prefix))}</Prefix>" if prefix else "",
         f"<MaxUploads>{min(max_uploads, _MAX_UPLOADS)}</MaxUploads>",
-        f"<EncodingType>{escape(encoding_type)}</EncodingType>"
+        f"<EncodingType>{_xml_escape(encoding_type)}</EncodingType>"
         if encoding_type is not None
         else "",
         "<IsTruncated>false</IsTruncated></ListMultipartUploadsResult>",
@@ -1600,7 +1657,7 @@ def _versions_parse(q) -> tuple[int, Response | None]:
         return max_keys, _argument_error(
             "A version-id marker cannot be empty.", "version-id-marker", ""
         )
-    return max_keys, None
+    return max_keys, _nul_refusal(q, (("prefix", "prefix"), ("key-marker", "key-marker")))
 
 
 def _list_object_versions(request: Request, conn, bucket: str, visible, max_keys: int) -> Response:
@@ -1661,34 +1718,34 @@ def _list_object_versions(request: Request, conn, bucket: str, visible, max_keys
         min(max_keys, _MAX_KEYS),
     )
     body = [
-        f'<ListVersionsResult xmlns="{NS}"><Name>{escape(bucket)}</Name>',
-        f"<Prefix>{escape(enc(prefix))}</Prefix><KeyMarker>{escape(enc(key_marker))}</KeyMarker>",
-        f"<VersionIdMarker>{escape(marker or '')}</VersionIdMarker>",
+        f'<ListVersionsResult xmlns="{NS}"><Name>{_xml_escape(bucket)}</Name>',
+        f"<Prefix>{_xml_escape_hex(enc(prefix))}</Prefix><KeyMarker>{_xml_escape_hex(enc(key_marker))}</KeyMarker>",
+        f"<VersionIdMarker>{_xml_escape(marker or '')}</VersionIdMarker>",
     ]
     if is_truncated and entries:
         kind, last = entries[-1]
-        body.append(f"<NextKeyMarker>{escape(enc(last))}</NextKeyMarker>")
+        body.append(f"<NextKeyMarker>{_xml_escape(enc(last))}</NextKeyMarker>")
         if kind == "obj":
             body.append("<NextVersionIdMarker>null</NextVersionIdMarker>")
     body.append(f"<MaxKeys>{max_keys}</MaxKeys>")
     if delimiter is not None:
-        body.append(f"<Delimiter>{escape(enc(delimiter))}</Delimiter>")
+        body.append(f"<Delimiter>{_xml_escape_hex(enc(delimiter))}</Delimiter>")
     if encoding_type is not None:
-        body.append(f"<EncodingType>{escape(encoding_type)}</EncodingType>")
+        body.append(f"<EncodingType>{_xml_escape(encoding_type)}</EncodingType>")
     body.append(f"<IsTruncated>{'true' if is_truncated else 'false'}</IsTruncated>")
     owner = f"<Owner><ID>{_owner_id(request)}</ID></Owner>"
     for val in [v for kind, v in entries if kind == "obj"]:
         r = by_key[val]
         body.append(
-            f"<Version><Key>{escape(enc(val))}</Key><VersionId>null</VersionId>"
+            f"<Version><Key>{_xml_escape(enc(val))}</Key><VersionId>null</VersionId>"
             f"<IsLatest>true</IsLatest>"
             f"<LastModified>{synth.s3_iso(r['updated_ts'] or r['created_ts'])}</LastModified>"
-            f"<ETag>{escape(synth.s3_etag(r['key'], r['content']))}</ETag>"
+            f"<ETag>{_xml_escape(synth.s3_etag(r['key'], r['content']))}</ETag>"
             f"<Size>{len(r['content'].encode())}</Size>{owner}"
-            f"<StorageClass>{escape(r['subtype'] or 'STANDARD')}</StorageClass></Version>"
+            f"<StorageClass>{_xml_escape(r['subtype'] or 'STANDARD')}</StorageClass></Version>"
         )
     for val in [v for kind, v in entries if kind == "cp"]:
-        body.append(f"<CommonPrefixes><Prefix>{escape(enc(val))}</Prefix></CommonPrefixes>")
+        body.append(f"<CommonPrefixes><Prefix>{_xml_escape(enc(val))}</Prefix></CommonPrefixes>")
     body.append("</ListVersionsResult>")
     return _xml("".join(body))
 
@@ -1705,7 +1762,7 @@ def _bucket_configuration(request: Request, bucket: str, selector: str) -> Respo
         extra = (
             "<Method>GET</Method>"
             if code == "V1APIsNotAllowed"
-            else f"<BucketName>{escape(bucket)}</BucketName>"
+            else f"<BucketName>{_xml_escape(bucket)}</BucketName>"
         )
         prolog = "" if code in _NO_PROLOG else _DECLARATION + "\n"
         return _error(code, message, extra, prolog=prolog)
@@ -1824,7 +1881,7 @@ async def object_get(request: Request, bucket: str, key: str):
             "NoSuchUpload",
             "The specified upload does not exist. The upload ID may be invalid, or the upload may "
             "have been aborted or completed.",
-            f"<UploadId>{escape(_first(q, 'uploadId'))}</UploadId>",
+            f"<UploadId>{_xml_escape(_first(q, 'uploadId'))}</UploadId>",
         )
     if selected == ["torrent"]:
         return _method_refusal(request, _OBJECT_WRITE_SELECTORS["torrent"][0])
@@ -1856,7 +1913,7 @@ async def object_get(request: Request, bucket: str, key: str):
         # A key's `?tagging` names what is missing with its bucket, the rest the key alone, and
         # `?attributes` sends no declaration; `versionId=null` of a key there is none of is the
         # version that is missing (measured 2026-09-29).
-        missing = escape(f"{bucket}/{key}" if selected == ["tagging"] else key)
+        missing = _xml_escape(f"{bucket}/{key}" if selected == ["tagging"] else key)
         prolog = "" if selected == ["attributes"] else _DECLARATION + "\n"
         if version is not None:
             return _error(
@@ -1907,7 +1964,7 @@ async def object_get(request: Request, bucket: str, key: str):
             return _error(
                 "InvalidRange",
                 "The requested range is not satisfiable",
-                f"<RangeRequested>{escape(rng)}</RangeRequested>"
+                f"<RangeRequested>{_xml_escape(rng)}</RangeRequested>"
                 f"<ActualObjectSize>{total}</ActualObjectSize>",
             )
         start, end = parsed
@@ -2063,10 +2120,10 @@ def _object_subresource(request: Request, bucket: str, key: str, row, selector: 
         asked = set(_attribute_names(request.headers.get("x-amz-object-attributes")))
         data = row["content"].encode("utf-8")
         elements = {
-            "ETag": escape(synth.s3_etag(row["key"], row["content"]).strip('"')),
+            "ETag": _xml_escape(synth.s3_etag(row["key"], row["content"]).strip('"')),
             "Checksum": f"<ChecksumCRC64NVME>{_crc64nvme(data)}</ChecksumCRC64NVME>"
             "<ChecksumType>FULL_OBJECT</ChecksumType>",
-            "StorageClass": escape(row["subtype"] or "STANDARD"),
+            "StorageClass": _xml_escape(row["subtype"] or "STANDARD"),
             "ObjectSize": str(len(data)),
         }
         inner = "".join(
@@ -2083,7 +2140,7 @@ def _object_subresource(request: Request, bucket: str, key: str, row, selector: 
         return _error(
             "NoSuchAnnotation",
             "The specified annotation does not exist.",
-            f"<AnnotationName>{escape(name)}</AnnotationName>",
+            f"<AnnotationName>{_xml_escape(name)}</AnnotationName>",
         )
     if "continuation-token" in q:
         # After the key, where the count's refusals come before the bucket (same date): there are
@@ -2096,14 +2153,14 @@ def _object_subresource(request: Request, bucket: str, key: str, row, selector: 
     echo = ""
     prefix = _first(q, "annotation-prefix", None)
     if prefix is not None:
-        echo += f"<AnnotationPrefix>{escape(prefix)}</AnnotationPrefix>"
+        echo += f"<AnnotationPrefix>{_xml_escape(prefix)}</AnnotationPrefix>"
     if "max-annotation-results" in q:
         count, _ = _int32_param(q, "max-annotation-results", _MAX_ANNOTATIONS)
         echo += f"<MaxAnnotationResults>{count}</MaxAnnotationResults>"
     root = "ListObjectAnnotationsOutput"
     return _xml(
-        f'<{root} xmlns="{NS}"><Annotations/><Bucket>{escape(bucket)}</Bucket>'
-        f"<Key>{escape(key)}</Key>{echo}<AnnotationCount>0</AnnotationCount></{root}>",
+        f'<{root} xmlns="{NS}"><Annotations/><Bucket>{_xml_escape(bucket)}</Bucket>'
+        f"<Key>{_xml_escape(key)}</Key>{echo}<AnnotationCount>0</AnnotationCount></{root}>",
         media_type=None,
     )
 
@@ -2309,7 +2366,7 @@ _CORS_METHODS = frozenset({"GET", "HEAD", "POST", "PUT", "DELETE", "PATCH", "OPT
 
 
 def _method_type(method: str, resource_type: str) -> str:
-    return f"<Method>{escape(method)}</Method><ResourceType>{resource_type}</ResourceType>"
+    return f"<Method>{_xml_escape(method)}</Method><ResourceType>{resource_type}</ResourceType>"
 
 
 def _cors_preflight(request: Request, message: str) -> Response:
@@ -2480,7 +2537,7 @@ def _content_md5(request: Request) -> tuple[str | None, bytes | None, Response |
         refusal = _error(
             "InvalidDigest",
             "The Content-MD5 you specified was invalid.",
-            f"<Content-MD5>{escape(sent)}</Content-MD5>",
+            f"<Content-MD5>{_xml_escape(sent)}</Content-MD5>",
         )
         return sent, None, refusal
     return sent, digest, None
@@ -2497,7 +2554,7 @@ def _md5_mismatch(expected: str, digest: bytes, body: bytes) -> Response | None:
         "BadDigest",
         "The Content-MD5 you specified did not match what we received.",
         f"<CalculatedDigest>{base64.b64encode(actual).decode()}</CalculatedDigest>"
-        f"<ExpectedDigest>{escape(expected)}</ExpectedDigest>",
+        f"<ExpectedDigest>{_xml_escape(expected)}</ExpectedDigest>",
     )
 
 
@@ -2516,7 +2573,7 @@ def _payload_mismatch(request: Request, body: bytes) -> Response | None:
     return _error(
         "XAmzContentSHA256Mismatch",
         "The provided 'x-amz-content-sha256' header does not match what was computed.",
-        f"<ClientComputedContentSHA256>{escape(sent)}</ClientComputedContentSHA256>"
+        f"<ClientComputedContentSHA256>{_xml_escape(sent)}</ClientComputedContentSHA256>"
         f"<S3ComputedContentSHA256>{actual}</S3ComputedContentSHA256>",
     )
 
