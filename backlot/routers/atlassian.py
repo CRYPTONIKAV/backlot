@@ -1684,6 +1684,16 @@ async def confluence_labels(content_id: int, request: Request):
     if row is None:
         raise HTTPException(status_code=404, detail="No content found with id")
     limit, start = _confluence_page_params(request, default=200, cap=200, refuse_zero=True)
+    prefix = request.query_params.get("prefix")
+    if prefix is not None and prefix not in ("global", "my", "team"):
+        # Real refuses unknown prefixes with 400 (#562, measured once each);
+        # the corpus carries global labels only, so the valid values behave
+        # exactly as before.
+        raise HTTPException(
+            status_code=400,
+            detail="com.atlassian.confluence.api.service.exceptions.api."
+            f"BadRequestException: Could not convert label prefixes :[{prefix}]",
+        )
     labels = store.jcol(row, "labels")
     results = [
         {"prefix": "global", "name": lbl, "id": str(synth.confluence_id(lbl)), "label": lbl}

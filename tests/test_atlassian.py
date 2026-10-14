@@ -1699,6 +1699,24 @@ def test_confluence_label_serves_one_of_two_labels_and_a_next(client, admin_h):
     assert page["_links"]["next"].endswith("next=true&limit=1&start=1")
 
 
+@pytest.mark.parametrize("prefix", ["global", "my", "team"])
+def test_confluence_label_accepts_known_prefixes(client, admin_h, prefix):
+    """Measured (#562): real answers `global`/`my`/`team` with 200."""
+    api = "/atlassian/wiki/rest/api"
+    cid = client.get(f"{api}/content?limit=1", headers=admin_h).json()["results"][0]["id"]
+    r = client.get(f"{api}/content/{cid}/label?prefix={prefix}", headers=admin_h)
+    assert r.status_code == 200, r.text
+
+
+def test_confluence_label_refuses_unknown_prefix(client, admin_h):
+    """Measured (#562): real answers `prefix=bogus` with 400, not an empty 200 page."""
+    api = "/atlassian/wiki/rest/api"
+    cid = client.get(f"{api}/content?limit=1", headers=admin_h).json()["results"][0]["id"]
+    r = client.get(f"{api}/content/{cid}/label?prefix=bogus", headers=admin_h)
+    assert r.status_code == 400, r.text
+    assert "Could not convert label prefixes :[bogus]" in r.text
+
+
 # (query, start, limit, prev) for a page holding no attachment, which every corpus page is
 _ATTACHMENT_PAGES = [
     ("", 0, 50, None),
