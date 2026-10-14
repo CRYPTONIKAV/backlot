@@ -518,15 +518,24 @@ def test_notion_search_filter_database_only(client, notion_h):
     assert any(r["id"] == synth.notion_data_source_id("nt-tasks-db") for r in s["results"])
 
 
-def test_notion_search_lists_databases_on_old_versions(client, notion_h):
-    # 2022-06-28 still lists databases, not data sources (#722).
+@pytest.mark.parametrize(
+    "version",
+    ["2022-06-28", "2025-09-03", "2026-03-11"],
+    ids=["old-model", "split", "new-model"],
+)
+def test_notion_search_version_split(client, notion_h, version):
+    # 2022-06-28 lists databases; from 2025-09-03 on, their data sources (#722).
     s = client.post(
         "/notion/v1/search",
         json={"query": ""},
-        headers={**notion_h, "Notion-Version": "2022-06-28"},
+        headers={**notion_h, "Notion-Version": version},
     ).json()
-    assert s["results"] and all(r["object"] in ("database", "page") for r in s["results"])
-    assert any(r["object"] == "database" for r in s["results"])
+    kinds = {r["object"] for r in s["results"]}
+    assert "page" in kinds
+    if version == "2022-06-28":
+        assert "database" in kinds and "data_source" not in kinds
+    else:
+        assert "data_source" in kinds and "database" not in kinds
 
 
 def test_notion_users(client, notion_h):

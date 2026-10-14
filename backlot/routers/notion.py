@@ -15,6 +15,8 @@ behind Basic auth refuse in their own shape, ``{"error","request_id"}`` (see ``u
   and rows are read via ``POST /data_sources/{id}/query``.
 - before it (2022-06-28 and the four versions older than that): ``databases.retrieve`` returns
   ``properties`` (schema) inline and rows are read via ``POST /databases/{id}/query``.
+- ``search`` follows the same split: from 2025-09-03 on, databases read as
+  their data sources (#722); older versions keep ``database`` objects.
 
 One query path per version, as on the real API: the other one answers ``invalid_request_url``,
 and so does ``GET /data_sources/{id}`` under a version older than the split, which mounts no data
@@ -717,13 +719,14 @@ async def search(request: Request):
             continue
         picked.append(r)
     window = picked[offset : offset + limit]
-    new_model = _data_sources_model(_version(request))
+    version = _version(request)
+    new_model = _data_sources_model(version)
     results = [
         _data_source_obj(conn, r)
         if r["subtype"] == "database" and new_model
         # From 2025-09-03 on, search lists a database's data source where
         # 2022-06-28 lists the database (#722).
-        else _database_obj(conn, r, _version(request))
+        else _database_obj(conn, r, version)
         if r["subtype"] == "database"
         else _page_obj(conn, r)
         for r in window
