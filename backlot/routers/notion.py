@@ -717,8 +717,13 @@ async def search(request: Request):
             continue
         picked.append(r)
     window = picked[offset : offset + limit]
+    new_model = _data_sources_model(_version(request))
     results = [
-        _database_obj(conn, r, _version(request))
+        _data_source_obj(conn, r)
+        if r["subtype"] == "database" and new_model
+        # From 2025-09-03 on, search lists a database's data source where
+        # 2022-06-28 lists the database (#722).
+        else _database_obj(conn, r, _version(request))
         if r["subtype"] == "database"
         else _page_obj(conn, r)
         for r in window

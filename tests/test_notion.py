@@ -507,13 +507,26 @@ def test_notion_search_reads_query_and_filter_by_their_types_like_real(
 
 
 def test_notion_search_filter_database_only(client, notion_h):
+    # From 2025-09-03 on there are no database objects in search: the
+    # filter narrows to the databases' data sources (#722).
     s = client.post(
         "/notion/v1/search",
         json={"query": "", "filter": {"property": "object", "value": "database"}},
         headers=notion_h,
     ).json()
-    assert s["results"] and all(r["object"] == "database" for r in s["results"])
-    assert any(r["id"] == synth.notion_id("nt-tasks-db") for r in s["results"])
+    assert s["results"] and all(r["object"] == "data_source" for r in s["results"])
+    assert any(r["id"] == synth.notion_data_source_id("nt-tasks-db") for r in s["results"])
+
+
+def test_notion_search_lists_databases_on_old_versions(client, notion_h):
+    # 2022-06-28 still lists databases, not data sources (#722).
+    s = client.post(
+        "/notion/v1/search",
+        json={"query": ""},
+        headers={**notion_h, "Notion-Version": "2022-06-28"},
+    ).json()
+    assert s["results"] and all(r["object"] in ("database", "page") for r in s["results"])
+    assert any(r["object"] == "database" for r in s["results"])
 
 
 def test_notion_users(client, notion_h):
