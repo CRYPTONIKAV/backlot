@@ -686,6 +686,18 @@ def test_hubspot_search_every_operator(client, admin_h):
     }
 
 
+def test_hubspot_search_eq_neq_in_ignore_case(client, admin_h):
+    """Measured (#567): real matches EQ/NEQ/IN values without regard to case."""
+    f = lambda **kw: _hs_filter(client, admin_h, **kw)  # noqa: E731
+    assert f(propertyName="name", operator="EQ", value="acme health") == {"Acme Health"}
+    assert f(propertyName="name", operator="EQ", value="ACME HEALTH") == {"Acme Health"}
+    assert f(propertyName="lifecyclestage", operator="IN", values=["EVALUATION"]) == {"Acme Health"}
+    assert f(propertyName="domain", operator="NEQ", value="ACME-HEALTH.COM") == {
+        "Borealis Clinics",
+        "Stealth Health Co",
+    }
+
+
 @pytest.mark.parametrize(
     "prop, value, want",
     [
