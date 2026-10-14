@@ -418,7 +418,8 @@ def _jira_segment_reads_as_id(segment: str) -> bool:
 
 def _jira_container_for_id(conn, token: str) -> str | None:
     """The container behind a project id, or None. The id is what `project/search` reports for
-    the project (`#702`); resolution is exact, leading zeros included (those read as a key)."""
+    the project (#702); only called for id-shaped segments, so leading-zero spellings never
+    reach it (those read as a key)."""
     for r in store.list_containers(conn, "jira"):
         if str(synth.github_user_id(r["name"])) == token:
             return r["name"]

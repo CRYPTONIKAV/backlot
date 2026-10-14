@@ -226,6 +226,10 @@ def test_jira_finds_a_project_by_its_id_on_the_role_routes(client, admin_h, rout
     missing = client.get(f"/atlassian/rest/api/3/project/0{pid}/{route}", headers=admin_h)
     assert missing.status_code == 404
     assert missing.json()["errorMessages"] == [f"No project could be found with key '0{pid}'."]
+    # An id-shaped segment naming no project says `id`, not `key`.
+    no_id = client.get("/atlassian/rest/api/3/project/4711949/" + route, headers=admin_h)
+    assert no_id.status_code == 404
+    assert no_id.json()["errorMessages"] == ["No project could be found with id '4711949'."]
     neither = client.get("/atlassian/rest/api/3/project/9999999999999999999/" + route)
     assert neither.status_code == 404
     assert neither.json()["errorMessages"] == [
