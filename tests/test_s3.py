@@ -2019,6 +2019,8 @@ _OBJECT_ORDER_ROWS = [
         ("versionId=a%00b", "<ArgumentValue>a&#0;b</ArgumentValue>"),
         ("versionId=a%1Fb", "<ArgumentValue>a&#31;b</ArgumentValue>"),
         ("versionId=a%09b", "<ArgumentValue>a\tb</ArgumentValue>"),
+        ("versionId=a%0Ab", "<ArgumentValue>a\nb</ArgumentValue>"),
+        ("versionId=a%0Db", "<ArgumentValue>a\rb</ArgumentValue>"),
         ("versionId=a%7Fb", "<ArgumentValue>a\x7fb</ArgumentValue>"),
     ],
 )
@@ -2043,6 +2045,7 @@ def test_s3_an_error_writes_control_characters_as_decimal_references(
         ("list-type=2&delimiter=d%1F", "<Delimiter>d&#x1f;</Delimiter>"),
         ("list-type=2&start-after=s%0B", "<StartAfter>s&#xb;</StartAfter>"),
         ("marker=m%0C", "<Marker>m&#xc;</Marker>"),
+        ("list-type=2&prefix=c%0Ad", "<Prefix>c\nd</Prefix>"),
         ("versions&key-marker=k%1F", "<KeyMarker>k&#x1f;</KeyMarker>"),
         ("versions&prefix=c%01", "<Prefix>c&#x1;</Prefix>"),
         ("uploads&key-marker=k%01", "<KeyMarker>k&#x1;</KeyMarker>"),
