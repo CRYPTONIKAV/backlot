@@ -432,6 +432,23 @@ def negative_not_allowed(name: str) -> AtlassianError:
     )
 
 
+def label_prefixes_not_converted(parts: list[str]) -> AtlassianError:
+    """`label`'s refusal of a `prefix` it cannot convert, naming every element it read
+    (``backlot.routers.atlassian._refuse_a_label_prefix`` says which). The body carries the `data`
+    object :func:`start_too_large` describes."""
+    return AtlassianError(
+        400,
+        {
+            "statusCode": 400,
+            "data": {"authorized": True, "valid": True, "errors": [], "successful": True},
+            "message": (
+                "com.atlassian.confluence.api.service.exceptions.api.BadRequestException: "
+                f"Could not convert label prefixes :[{', '.join(parts)}]"
+            ),
+        },
+    )
+
+
 def zero_limit_not_allowed() -> AtlassianError:
     """`label`'s refusal of `?limit=0`, which no other Confluence listing shares.
 
@@ -655,6 +672,18 @@ def reconcile_issues_null() -> AtlassianError:
             "message": 'Cannot invoke "java.util.List.stream()" because "reconcileIssues" is null',
             "status-code": 500,
             "stack-trace": "",
+        },
+        media_type=JIRA_JSON_MEDIA_TYPE,
+    )
+
+
+def reconcile_issues_too_many() -> AtlassianError:
+    """Jira's 400 for more than 50 `reconcileIssues`, measured 2026-10-12 on both GET and POST."""
+    return AtlassianError(
+        400,
+        {
+            "errorMessages": ["The max number of issues to reconcile is 50."],
+            "errors": {},
         },
         media_type=JIRA_JSON_MEDIA_TYPE,
     )
