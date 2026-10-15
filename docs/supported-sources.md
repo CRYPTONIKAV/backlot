@@ -24,7 +24,7 @@ Generated from `backlot/schemas/*.schema.json` and the app's own `/openapi.json`
 | `jira` | Jira | `/atlassian/rest/api` | 14 | [`jira.schema.json`](../backlot/schemas/jira.schema.json) | A Jira issue. |
 | `linear` | Linear | `/linear/graphql` | GraphQL (one `POST`) | [`linear.schema.json`](../backlot/schemas/linear.schema.json) | A Linear issue. |
 | `notion` | Notion | `/notion/v1` | 12 | [`notion.schema.json`](../backlot/schemas/notion.schema.json) | A Notion page or database. |
-| `s3` | Amazon S3 | `/s3` | 4 | [`s3.schema.json`](../backlot/schemas/s3.schema.json) | An S3 object. |
+| `s3` | Amazon S3 | `/s3` | 5 | [`s3.schema.json`](../backlot/schemas/s3.schema.json) | An S3 object. |
 | `slack` | Slack | `/slack/api` | 12 | [`slack.schema.json`](../backlot/schemas/slack.schema.json) | A Slack message. |
 <!-- generated:sources end -->
 
@@ -36,7 +36,7 @@ Ordered as the table above, by `source_type`.
 
 | Endpoint | Notes |
 |---|---|
-| `content` | `spaceKey`, `title` (the whole title, ignoring ASCII case) |
+| `content` | `spaceKey`, `type` (`page` or `blogpost`), `title` (the whole title, ignoring ASCII case). An unknown `spaceKey`, one the caller cannot reach and a repeated one are real's 404, and each other `type` gets real's answer (`backlot.routers.atlassian._CONTENT_TYPES`) |
 | `content/{id}` | |
 | `content/{id}/child/attachment` | always the empty page: a record states no attachment |
 | `content/{id}/child/comment` | |
@@ -44,7 +44,7 @@ Ordered as the table above, by `source_type`.
 | `content/{id}/label` | |
 | `content/{id}/restriction/byOperation` | |
 | `search` | CQL |
-| `space` | `expand=description,permissions` |
+| `space` | `spaceKey` (one or more keys, any case; a key naming no space lists nothing), `expand=description,permissions` |
 | `space/{key}` | `expand=description,permissions` |
 
 `expand=permissions` carries the space's permission roster on either read, one entry per ACL grant
@@ -99,7 +99,7 @@ Field names are snake_case, as Fireflies' own schema has them. Full introspectio
 | `user/repos` | The token's own reach. `visibility`, `sort`, `direction`; `type` and `affiliation` select on what the caller is to a repository, which a corpus does not state, and stay undeclared |
 | `rate_limit` | The windows the `x-ratelimit-*` headers report, `core`, `search` and `code_search`; a read of it does not count, and it answers with no credential at the anonymous limits, the one route here that does |
 | `repos/{o}/{r}` | |
-| `repos/{o}/{r}/issues[/{n}]` | `state` on the listing: `open`\|`closed`\|`all`; any other value is real's 422, and the repository is checked first, so an unknown repo is the 404 instead. `sort`, `direction`: real's enums and defaults, each order as measured |
+| `repos/{o}/{r}/issues[/{n}]` | `state` on the listing: `open`\|`closed`\|`all`; any other value is real's 422, and the repository is checked first, so an unknown repo is the 404 instead. `sort`, `direction`: real's enums and defaults, each order as measured. `labels`: comma-separated names, all required, matched without case; the last repeated parameter is read, and commas alone or whitespace alone filter nothing |
 | `repos/{o}/{r}/issues/{n}/comments` | |
 | `repos/{o}/{r}/issues/comments/{id}` | |
 | `repos/{o}/{r}/pulls[/{n}]` | `state` on the listing: `open`\|`closed`\|`all`; any other value is served as `open`, which is what real does here where the issue listing refuses it. `sort`, `direction` as on issues; `long-running` orders by creation and filters nothing, as it does on the wire |
@@ -149,16 +149,19 @@ runs out is refused, 403, with `used` pinned at `limit` across the five headers,
 version check, the 401 a route that needs a credential answers a caller without one, and routing
 alike, for a caller with no credential (measured against api.github.com 2026-09-17 and 2026-09-22)
 and for a token (2026-09-23) alike; a bearer that does not resolve still gets its own 401, window
-spent or not (2026-09-23). The refused request is not itself counted, which is why `used` holds at
-`limit` rather than climbing past it. The body differs by caller: two members (`message`,
-`documentation_url`) for a caller with no credential, three (`status` besides) for a token, each
-with its own `documentation_url`. `BACKLOT_GITHUB_ENFORCE_RATE_LIMITS` turns the refusal off (see
+spent or not (2026-09-23), when a space follows its scheme: after a tab it is counted in the window
+real shares among the `Authorization` values it cannot parse, and refused once that window is spent
+(2026-10-14). The refused request is not itself counted, which is why `used` holds at `limit` rather
+than climbing past it. The body differs by caller: two members (`message`, `documentation_url`) for
+a caller with no credential, three (`status` besides) for a token, each with its own
+`documentation_url`. `BACKLOT_GITHUB_ENFORCE_RATE_LIMITS` turns the refusal off (see
 [configuration](configuration.md#github)). `GET /rate_limit` reports the same windows, does not
 count, and is never refused — the one route a client reads its way out of a spent window with;
 `/rate_limit/` asked with no `Authorization` header is a plain-text `404 Not Found` that carries
 none of the five and counts nowhere, spent window or not (2026-09-23). Two answers carry none of the
-five and count nowhere, as real's do not: a credential that does not resolve, and a path no route
-matches asked by a caller that sent one (measured 2026-09-10 and 2026-09-21).
+five and count nowhere, as real's do not: a credential that does not resolve with a space after its
+scheme, and a path no route matches asked by a caller that sent one (measured 2026-09-10 and
+2026-09-21).
 
 An issue body and a pull body are the two distinct field sets real serves — a pull carries `_links`
 and its `*_url` siblings and none of the issue-only fields, `pull_request` included. A repository
@@ -190,7 +193,17 @@ default branch only; an older snapshot stays reachable at `contents/{path}?ref=`
 
 Message and thread ids are Gmail-shaped — 16 lowercase hex under 2^63, sharing one id space as the
 real API does — and map back to the corpus document; an id the real API could not parse is refused
-the same way.
+the same way. On both listings a `pageToken` that does not parse is real's 400 `Invalid pageToken`
+and an empty one is the first page, refused where each listing refuses it beside `maxResults`
+(`backlot.routers.google._gmail_page`). A credential, a `HEAD` and a trailing slash are answered as
+on Drive, in the section below. A user's token is held to its own mailbox, `me` in any case or its
+own address: another address is the 403 `Delegation denied for <the caller's own address>`, and a
+`userId` without text on both sides of an `@` the 403
+`Invalid user id specified in request/Delegation denied`, as on real, which also answers the second
+to some shapes with text on both sides (`a@b`, `a@b@c`;
+`backlot.routers.google._refuse_another_mailbox` lists those measured, and the refusals that come
+before both and after them). The admin token reads any mailbox. Measured against the live Gmail API
+on 2026-10-11 and 2026-10-12.
 
 ### Google Drive, Docs, Sheets, Slides — `/drive/v3` `/docs/v1` `/sheets/v4` `/slides/v1`
 
@@ -235,7 +248,7 @@ because that is where Google puts them.
 | Endpoint | Notes |
 |---|---|
 | `POST /oauth2/token` | Turns a Google-style client credential into a bearer token the rest of Backlot already understands. Two grants: `refresh_token`, where the refresh token *is* the user's token from `/_meta/users`, and a signed service-account JWT assertion, whose `sub` claim selects the impersonated user under domain-wide delegation. A bare service account with no `sub` resolves to the admin/service identity. Expiry is cosmetic — a re-refresh returns the same token, so a long crawl never breaks |
-| `POST /batch`, `POST /batch/{api}/{version}` | Google's `multipart/mixed` batch envelope: each part is an `application/http` sub-request, answered in order with its `Content-ID` preserved. The outer credential applies to any sub-request that does not carry its own, as real Google does. As in real's Drive batch, a Drive download (`files.export` with no `alt`, an empty one or `alt=media`, or `files.get` with `alt=media`) is a 302 to the same path under `/download`, which this server does not serve, after `$.xgafv` and after a `Bearer` credential the part carries (a part with none, on it or on the batch, is redirected too), and ahead of `callback` and the typed, lookup, `fields` and `mimeType` refusals; as in real's Sheets batch, a Sheets read is 501 `UNIMPLEMENTED` |
+| `POST /batch`, `POST /batch/{api}/{version}` | Google's `multipart/mixed` batch envelope: each part is an `application/http` sub-request, answered in order with its `Content-ID` preserved. The outer credential applies to any sub-request that does not carry its own, as real Google does. As in real's Drive batch, a Drive download (`files.export` with no `alt`, an empty one or `alt=media`, or `files.get` with `alt=media`) is a 302 to the same path under `/download`, which this server does not serve, after `$.xgafv` and after any credential on the part (a part with none, on it or on the batch, is redirected too), and ahead of `callback` and the typed, lookup, `fields` and `mimeType` refusals; as in real's Sheets batch, a Sheets read is 501 `UNIMPLEMENTED` |
 
 `/batch` is Google-shaped but not Google-scoped — sub-requests are dispatched against the whole
 app, so a batch may target any endpoint this server serves, not only Google Drive's.
@@ -252,8 +265,7 @@ array the entry follows the error: a typed value the proto layer refuses (an enu
 int32), an unknown member in a JSON body and a JSON body that is not an object are `reason: invalid`
 and carry no `domain`; under `domain: global`, a body the JSON parser refuses in its own words is
 `parseError`, an Office file read as a native document `failedPrecondition`, a data-filter read's
-500 `backendError` and everything else `badRequest`; and a missing credential — any anonymous POST,
-the two Sheets data-filter reads included, and a GET on Gmail, Docs and Slides — is the short
+500 `backendError` and everything else `badRequest`; and a missing credential is the short
 `Login Required.` at `location: Authorization`, which Gmail shows by default where the editor
 families show it only at `1`. Measured against the live Sheets, Docs and Drive APIs on 2026-09-12,
 against Slides and Gmail on 2026-09-14 through the errors a request with no Authorization header
@@ -281,29 +293,31 @@ answer into 503 `Backend Error` under `text/javascript; charset=UTF-8` with a bo
 (the `errors[]` entry inline and no trailing newline), while a name that cannot be called is that
 503 even where the download would have succeeded. A missing credential on one names the missing API
 key rather than the unregistered caller, and only after the download's `mimeType` and
-typed-parameter checks, so the order a byte-stream read answers in is `$.xgafv`, a `Bearer` token
-that does not resolve (that scheme, spelt exactly so), the `callback`, the parameters, then that
-403. Inside a batch a download is a 302 instead (the `/batch` row above). A SUCCESS body is wrapped
-and indented on the `/sheets/v4` routes only; the other four families honour `callback` on their
-errors and not yet on their 200s. Measured against the live Sheets, Docs, Drive, Gmail and Slides
-APIs on 2026-09-15, 2026-09-16 and 2026-09-17: the wrap, the indent and the charset first, the
-suppression across the four non-Sheets families next, and the escape set and the case-insensitive
-`alt` last; the download refusals on 2026-10-04, 2026-10-05, 2026-10-07 and 2026-10-08.
+typed-parameter checks, so the order a byte-stream read answers in is `$.xgafv`, a credential that
+does not resolve, the `callback`, the parameters, then that 403, or a 401 of the download server's
+own for a header that is no credential. Inside a batch a download is a 302 instead (the `/batch` row
+above). A SUCCESS body is wrapped and indented on the `/sheets/v4` routes only; the other four
+families honour `callback` on their errors and not yet on their 200s. Measured against the live
+Sheets, Docs, Drive, Gmail and Slides APIs on 2026-09-15, 2026-09-16 and 2026-09-17: the wrap, the
+indent and the charset first, the suppression across the four non-Sheets families next, and the
+escape set and the case-insensitive `alt` last; the download refusals on 2026-10-04, 2026-10-05,
+2026-10-07 and 2026-10-08.
 
 **A repeated query parameter is read from the end real reads it from**, which is the first for some
 parameters and the last for others. The first repeat decides `fields`, `q`, `pageSize`, `pageToken`
 and `orderBy` on Drive's `files.list`, `pageSize` and `pageToken` on `permissions.list`, `pageToken`
 on `drives.list`, `fields` on `files.get` and `about`, and `mimeType` on `files.export`, and on
 Sheets `fields` and `prettyPrint`, as it decides `callback` and `alt`; the last decides `$.xgafv`,
-`majorDimension`, `valueRenderOption` and `includeGridData`. An empty first repeat is read as the
-empty value, not skipped. Gmail's `q` and `pageToken` are read here from the last, and which end
-real reads is unmeasured; `maxResults` is parsed in every repeat and read from the last
-(`backlot.routers.google._gmail_max_results`). On a Sheets success, `prettyPrint` is compact at
+`majorDimension`, `valueRenderOption`, `includeGridData` and Gmail's `pageToken`. An empty first
+repeat is read as the empty value, not skipped. Gmail's `q` is read here from the last, and which
+end real reads is unmeasured; `maxResults` is parsed in every repeat and read from the last
+(`backlot.routers.google._gmail_page`). On a Sheets success, `prettyPrint` is compact at
 `false` and `0` and at none of the eighteen other spellings measured, `FALSE`, `no` and `f` among
 them. Measured against the live Drive, Sheets and Gmail APIs, each pair sent both ways round:
 `callback`, `alt` and the Sheets `$.xgafv` between 2026-09-15 and 2026-09-17, `includeGridData` and
 the Gmail `$.xgafv` on 2026-09-22, `pageToken` on the other two Drive listings on 2026-10-05 and
-2026-10-07, `pageSize` on `permissions.list` on 2026-10-08, and the rest on 2026-09-23.
+2026-10-07, `pageSize` on `permissions.list` on 2026-10-08, Gmail's `pageToken` on 2026-10-09, and
+the rest on 2026-09-23.
 
 **A typed query parameter is parsed in every repeat, and every value it cannot read is refused in
 one 400**: the message joins theirs with newlines and `details` carries a `google.rpc.BadRequest`
@@ -352,6 +366,34 @@ as `ROWS`. A data-filter body is written into the request message the way real's
 writes it: every value it cannot convert and every name the request message lacks is refused in one
 400, each named by its proto path where it has one. Measured against the live Sheets API on
 2026-10-04, and a non-ASCII letter's case on 2026-10-05.
+
+**A credential is `Bearer` or `OAuth`, spelt so, and a space before the token**, a token a space, a
+tab or a comma ends, or a closing `"` where it opens with one: `Bearer <t> x`, `Bearer <t>,x` and
+`Bearer "<t>"` are served, `Bearer<t>` is a bad token, and `bearer <t>`, `token <t>`, `Basic …` and
+a bare `Bearer` are no credential at all. With none, a request is answered by its operation rather
+than its family: an unregistered caller's 403 on an operation that takes API keys too (Drive's file
+and comment reads among them, and the three Sheets reads), a missing credential's 401 on the rest,
+and on a download the missing API key's 403 with no `Authorization` header, the download server's
+401 with one that is no credential. Each of the front end's 401s carries
+`WWW-Authenticate: Bearer realm="https://accounts.google.com/"`, with `error="invalid_token"` for a
+token that does not resolve, and the download server's names the realm without its trailing slash.
+An operation the two Google baselines acknowledge as `missing_operation` is refused the same way,
+after `$.xgafv` and `callback`, and a caller whose credential resolves gets the 404 or 405 its path
+gets. One of those operations, a revision read, is not answered as a download with `alt=media`:
+with no `Authorization`, an empty one or `Basic …` it is the missing credential's 401. Measured
+against the live Drive, Gmail, Sheets, Docs and Slides APIs on 2026-10-11, and the revision read on
+2026-10-14.
+
+**A `HEAD` on Drive or Gmail is the `GET` with the body left off**, status for status, and declares
+a `content-length` only on a download's 200, where it is the length of the bytes the `GET` serves;
+every other answer declares none, as real's chunked answers do. `callback` does not reach a `HEAD`
+but as the 503 a download answers beside an uncallable name. A `HEAD` on Docs, Sheets or Slides is
+the host's 400 with an empty `text/html; charset=utf-8` body, ahead of the credential and of
+`$.xgafv`; real Sheets answers some `HEAD`s with its HTML 404 page instead, which is not modelled
+(`backlot.errors.google.head_refusal`). Trailing slashes are not part of a path on any of the five
+families — `files/`, `labels///` and `spreadsheets/{id}/` each answer what the path without them
+answers — while a doubled slash mid-path is kept, as a segment no route matches. Measured against
+the live Drive, Gmail, Sheets, Docs and Slides APIs on 2026-10-11.
 
 ### HubSpot — `/hubspot/crm/v3` `/hubspot/crm/v4`
 
@@ -496,27 +538,41 @@ virtual-hosted client looks for `acme-artifacts.localhost:8000` and finds nothin
 | `ListMultipartUploads` | Always the empty page, since data enters through `backlot import` and no upload is ever in progress. `prefix`, `delimiter` and `key-marker` are echoed, `max-uploads` and `encoding-type` validated and echoed, as real does |
 | `ListObjects` | The bare bucket GET, and what any `list-type` other than `2` selects. `prefix`, `delimiter`, `marker`, `max-keys`, `encoding-type`; `Marker` echoed, `NextMarker` under a delimiter, an `Owner` on every object |
 | `ListObjectsV2` | Selected by `list-type=2`. `prefix`, `delimiter`, `start-after`, `continuation-token`, `max-keys`, `encoding-type`, `fetch-owner`; `KeyCount` and the continuation tokens, an `Owner` on every object only under `fetch-owner=true` |
-| `GetObject` | `Range`; `partNumber`, where part `1` is the whole object as the 206 of its range, a higher part real's 416 and a number outside 1 to 10000 or one beside a `Range` real's 400; `versionId=null`, the one version each key has, where any other `versionId` is real's 400; and checksum mode, where an answer holding the whole object carries its CRC-64/NVME and another mode is real's 400. A key in a bucket that does not exist, or that the caller cannot see, is `NoSuchBucket`, as on real |
+| `GetObject` | `Range`; `partNumber`, where part `1` is the whole object as the 206 of its range, a higher part real's 416 and a number outside 1 to 10000 or one beside a `Range` real's 400; `versionId=null`, the one version each key has, where any other `versionId` is real's 400; checksum mode, where an answer holding the whole object carries its CRC-64/NVME and another mode is real's 400; and `If-Match`, `If-Unmodified-Since`, `If-None-Match` and `If-Modified-Since`, read as real reads them and answered with its 304 or 412 ahead of the range and the part. A key in a bucket that does not exist, or that the caller cannot see, is `NoSuchBucket`, as on real |
 | `HeadObject` | |
 | `GetObjectAcl`, `GetObjectTagging`, `GetObjectAttributes` and the rest of an object's sub-resources | Each as real answers an object with no tags or annotations, written with no checksum header, in a bucket without Object Lock, byte for byte: `?acl` the owner's `FULL_CONTROL`, `?tagging` an empty `TagSet`, `?attributes` the ETag, checksum, storage class and size asked for, `?annotation` no annotations and `NoSuchAnnotation` for one named, `?legal-hold` and `?retention` real's 400 for a bucket without Object Lock, and `?torrent` real's 405 |
 | `ListParts` | Always `NoSuchUpload`, since no upload is ever in progress; `max-parts` and `part-number-marker` validated first, as real does |
+
+An object's GET and HEAD also read the six `response-*` query parameters, `response-content-type`,
+`response-content-language`, `response-expires`, `response-cache-control`,
+`response-content-disposition` and `response-content-encoding`: each sets the header it names on the
+200 and the 206, every one but `Content-Type` on a 304, and leaves the bytes as stored. Their names
+are case-sensitive, a repeated one is read from its first value, and a control character other than
+a tab comes back as a space. A value real cannot put in a header, a non-Latin-1 character or an
+unclosed quote, is its 400 `InvalidArgument`, at a bucket's path too, where an override sets
+nothing, and so is a name that starts with `response-` and is not one of the six; an override on an
+object's GET or HEAD sent unsigned is its 400 `InvalidRequest`, unless a sub-resource or a
+`versionId` other than `null` is beside it.
 
 The other sub-resources are answered as real answers them. `?session` is the listing: CreateSession
 is for directory buckets only and real S3 answers it with the listing on a general purpose bucket. A
 sub-resource whose operations are all on another method, `?delete` and a key's `?restore` and
 `?select` among them, is the 405 a GET or a HEAD naming it gets, and a key's `?uploads` on a GET is
 real's 400. A `?partNumber` at a bucket's path, which names a part of an object, is real's 400 on a
-GET, a HEAD, a `PUT`, a `POST`, a `DELETE` and a `PATCH`, and beside `?uploadId` it is UploadPart's
-405. At a bucket's path `?torrent` is real's 405 and `?uploadId` real's 400 once the bucket is
-found. At a key's path `?accelerate`, `?cors`, `?inventory`, `?lifecycle`, `?location`,
+GET, a HEAD, a `PUT`, a `POST`, a `DELETE`, a `PATCH` and an `OPTIONS`. Beside `?uploadId` an
+`OPTIONS` reaches the CORS preflight, while a GET, a HEAD, a `POST`, a `DELETE` and a `PATCH` get
+UploadPart's 405. At a bucket's path `?torrent` is real's 405 and `?uploadId` real's 400 once the
+bucket is found. At a key's path `?accelerate`, `?cors`, `?inventory`, `?lifecycle`, `?location`,
 `?notification`, `?policy`, `?replication`, `?requestPayment`, `?versioning` and `?website` are the
 bucket's answer whatever the key, and `?logging` and `?versions` real's 400s; a bucket's other
 sub-resources are ignored there, as on real. A `versionId` at a bucket's path is real's 400 on a GET
 and on the writes that refuse it there, and at a key's beside a selector whose operation takes none,
 a `?website` with a value real's 400 at either path, and an `annotationName` at a key without the
 `annotation` it belongs to real's 400, which most of real's front ends answer a GET with and a few
-answer as if it were absent. Two sub-resources at once are `InvalidArgument`, as on real S3, and an
-unknown query key is ignored, as on real S3.
+answer as if it were absent. An `annotation` with a value, `?annotation=x`, is GetObject, as on
+real, the one sub-resource a value turns into another operation; the rest of the query is read
+without it, an `annotationName` beside it ignored. Two sub-resources at once are `InvalidArgument`,
+as on real S3, and an unknown query key is ignored, as on real S3.
 
 A method no operation above serves answers what real answers: the 405 that names the method and
 whether the resource is a `BUCKET`, an `OBJECT` or the `SERVICE`, the 400 an `OPTIONS` without an
@@ -557,7 +613,12 @@ sub-resource, the conflict of two and the parameter refusals before the bucket. 
 sent and does not verify is refused ahead of each 405, with real's members naming the string this
 server signed and, for SigV4 and SigV4a, the canonical request it signed it over, and after the
 conflict and the parameter refusals, as on real. Each other credential refusal is real's own code
-and message too.
+and message too. The two annotation reads, a GET of `?annotation` at a key without or with an
+`annotationName` (ListObjectAnnotations, GetObjectAnnotation) and a HEAD of either, are the
+exception to the unsigned answer and to Signature Version 2: they take SigV4 or SigV4a alone, and
+one sent unsigned or with Signature Version 2 is real's 400 `InvalidRequest` asking for Signature
+Version 4, after the conflict of two, the parameter refusals before the bucket and a V2 credential's
+own shape, and ahead of the bucket, of the 405 a signed HEAD gets and of a V2 key or signature.
 
 ### Slack — `/slack/api`
 
@@ -589,6 +650,10 @@ A channel the caller cannot see is refused by id as well as hidden from the list
 answer an id that names nothing gets, so a private room's name, purpose and membership are not
 readable from its id alone. A required argument that was never sent is `invalid_arguments` rather
 than a `not_found` for something the caller never named.
+
+A POST with a body sent as `application/json` or `text/plain` with no charset is answered with
+real's `missing_charset` warning, and a form or multipart one that names a charset with
+`superfluous_charset`, each in `warning` and in `response_metadata.warnings`.
 
 ## Backlot's own endpoints
 

@@ -440,31 +440,64 @@ def rate_limit_caller(request: Request) -> tuple[str, bool]:
     with them read 23, 24, 25 at another, both at `limit: 60` (measured against api.github.com
     2026-09-21).
 
-    A bearer that does not resolve is keyed with the address here but never counted — see
-    :func:`refused_a_credential`. Callers that draw real's line themselves check `request.headers`
-    for the
-    presence of `Authorization` directly instead of asking `auth.bearer_token`, which is `None` for
-    a scheme it does not parse — see `refuse_a_trailing_slash_on_github`."""
+    A `Bearer` or `token` followed by a tab rather than a space is counted in that same window,
+    though it is answered as Bad credentials: `Digest x` and then `Bearer<TAB>nope` on
+    `/repos/psf/requests` read `used` 4 and 5, while the address's anonymous window stayed at 8
+    (2026-10-14). A bearer that does not resolve after a space is keyed with the address here but
+    never counted — see :func:`refused_without_a_window`. Callers that draw real's line themselves
+    check `request.headers` for the presence of `Authorization` directly instead of asking
+    `auth.bearer_token`, which is `None` for a scheme it does not parse — see
+    `refuse_a_trailing_slash_on_github`."""
     token = auth.bearer_token(request)
     if token is not None and auth.resolve_bearer(request) is not None:
         return f"token:{token}", True
     host = request.client.host if request.client is not None else "anonymous"
-    if token is None and "authorization" in request.headers:
+    if "authorization" in request.headers and (token is None or not _scheme_then_space(request)):
         return f"unparseable:{host}", False
     return f"host:{host}", False
+
+
+def _scheme_then_space(request: Request) -> bool:
+    """Whether the `Authorization` is `Bearer` or `token`, in any case, followed by a space: the
+    spelling real refuses with no `x-ratelimit-*` when the token does not resolve, where a tab
+    after the scheme (`Bearer<TAB>nope`, `Bearer<TAB> nope`) is counted as an unparseable one
+    (:func:`rate_limit_caller`)."""
+    scheme, space, _ = (request.headers.get("authorization") or "").partition(" ")
+    return bool(space) and scheme.lower() in ("bearer", "token")
 
 
 def refused_a_credential(request: Request) -> bool:
     """Whether a credential arrived and did not resolve — real's "Bad credentials" 401.
 
-    `Bearer` and `token` alike are refused with none of the five `x-ratelimit-*` headers and no
-    version echo, on `/repos/psf/requests` and on `/rate_limit`, and the address's `core` window
-    read `used: 13` before three of them and after — where an anonymous 401 on `/user/repos`
-    carries all five, counts, and echoes (measured against api.github.com 2026-09-21). A path no
-    route matches is answered the same way for a wider set of callers, see
+    `Bearer` and `token` separated from the token by a space are refused with none of the five
+    `x-ratelimit-*` headers and no version echo, on `/repos/psf/requests` and on `/rate_limit`, and
+    the address's `core` window read `used: 13` before three of them and after — where an anonymous
+    401 on `/user/repos` carries all five, counts, and echoes (measured against api.github.com
+    2026-09-21). A path no route matches is answered the same way for a wider set of callers, see
     ``backlot.main._some_github_route_matches``.
+
+    A tab after the scheme is still "Bad credentials" (`auth.bearer_token` accepts it) and still
+    carries no version echo: on 2026-10-14 `Bearer<TAB>nope` on `/rate_limit` and
+    `/repos/psf/requests`, with and without `X-GitHub-Api-Version: 2022-11-28`, and on
+    `/user/repos` with it, answered no `x-github-api-version-selected`. Which of these 401s carry
+    the five is :func:`refused_without_a_window`'s.
     """
     return auth.bearer_token(request) is not None and auth.resolve_bearer(request) is None
+
+
+def refused_without_a_window(request: Request) -> bool:
+    """Whether :func:`refused_a_credential` holds with a space after the scheme: the 401 real counts
+    in no window and answers with none of the five `x-ratelimit-*` headers.
+
+    After a tab, the same 401 carries the five of the window it is counted in, the unparseable one:
+    measured against api.github.com 2026-10-14 on `GET /rate_limit`, `Bearer<TAB>nope` and
+    `token<TAB>nope` each answered 401 with `limit: 60`, `remaining: 60`, `used: 0`,
+    `resource: core` and a `reset` an hour after `Date`, while `Bearer nope` and `token nope`
+    answered the same 401 with none of the five. Once that window was spent, `Bearer<TAB>nope` and
+    `token<TAB>nope` on `/repos/psf/requests` and `Bearer<TAB>nope` on `/user/repos` were its 403,
+    as `Digest x` was, where `Bearer nope` was still the 401.
+    """
+    return refused_a_credential(request) and _scheme_then_space(request)
 
 
 def rate_limit_headers(request: Request, status_code: int) -> dict[str, str]:
@@ -661,6 +694,8 @@ class GitHubIssueSearch(_Loose):
     total_count: int
     incomplete_results: bool
     items: list[GitHubIssue]
+    # After `items`, where real sends it; a response's members go out in the order declared here.
+    search_type: str
 
 
 class GitHubCodeHit(_Loose):
@@ -884,7 +919,9 @@ class _Ordering(NamedTuple):
 #: pull seen through this listing, its review comments: 5797 (`comments: 105`, `review_comments:
 #: 25`) sits between 2966 (211) and 1573 (122), which no single member orders. Ties keep the
 #: unsent order whatever the direction: `sort=comments&direction=asc` answers 7620, 7619, 7618,
-#: three rows at 0 comments, newest first.
+#: three rows at 0 comments, newest first, and on 2026-10-13 `labels=Bug&state=all&sort=updated`
+#: answered 1703 before 1642, 1755 before 1746 and 1029 before 639, each pair sharing one
+#: `updated_at`, with `direction=asc` and with `direction=desc`.
 _ISSUE_ORDERING = _Ordering(
     sorts=("created", "updated", "comments"),
     default="created",
@@ -905,7 +942,11 @@ _ISSUE_ORDERING = _Ordering(
 #: here. `direction=asc` alone 4, 8, 10. `sort=bogus` 4, 8, 10 and `sort=bogus&direction=desc`
 #: 7619, 7616, 7609, so an unknown sort is read as `created` with the direction honoured;
 #: `direction=bogus` alone the unsent order and `sort=updated&direction=bogus` 7025, 7026, 6675,
-#: the `direction=desc` order, so an unknown direction is `desc` with the sort kept.
+#: the `direction=desc` order, so an unknown direction is `desc` with the sort kept. Pulls that
+#: share an `updated_at` are ordered by number in the direction asked: on 2026-10-13, with
+#: `state=all&per_page=100`, the first page of `sort=updated` held 27 such groups, each lowest
+#: number first (192 before 196), and that of `sort=updated&direction=desc` 4, each highest number
+#: first (7543 before 7520).
 _PULL_ORDERING = _Ordering(
     sorts=("created", "updated", "popularity", "long-running"),
     default="created",
@@ -1007,15 +1048,20 @@ def _updated_ts(row) -> int:
     return row["updated_ts"] or _created_ts(row) + 3600
 
 
-def _issue_sort_keys(conn, repo: str, sort: str, ids) -> dict[str, Callable]:
+def _issue_sort_keys(
+    conn, repo: str, sort: str, ids, *, updated_keeps_unsent: bool = False
+) -> dict[str, Callable]:
     """The sort keys of the issue and pull listings, over the store's rows.
 
-    The timestamps are the ones the bodies serve (:func:`_shared_obj` reads the same two
-    functions), and the number breaks a tie the way real's monotonic ids do. `comments` and
-    `popularity` are one key: both order by the conversation and review comments added together,
-    which is the count real orders by (see :data:`_ISSUE_ORDERING`), read in one query for the
-    repository and only when asked for. `long-running` is `created` with no filter (see
-    :data:`_PULL_ORDERING`).
+    The timestamps are the ones the bodies serve (:func:`_shared_obj` reads the same two functions).
+    `created` breaks a same-second tie by number, and so does `updated` on the pull listing, so that
+    number reverses with the direction (see :data:`_PULL_ORDERING`). The issue listing passes
+    ``updated_keeps_unsent``, which makes `updated` the timestamp alone, so rows that share an
+    `updated_at` keep the unsent order, newest first, in either direction (see
+    :data:`_ISSUE_ORDERING`). `comments` and `popularity` are one key: both order by the
+    conversation and review comments added together, which is the count real orders by (see
+    :data:`_ISSUE_ORDERING`), read in one query for the repository and only when asked for.
+    `long-running` is `created` with no filter (see :data:`_PULL_ORDERING`).
 
     ``ids`` scopes that count to the comments the caller is served, so a row's position is the
     position its own served numbers put it in (see :func:`store.github_comment_counts`)."""
@@ -1027,7 +1073,10 @@ def _issue_sort_keys(conn, repo: str, sort: str, ids) -> dict[str, Callable]:
         return _created_ts(row), row["number"]
 
     def updated(row):
-        return _updated_ts(row), row["number"]
+        ts = _updated_ts(row)
+        if updated_keeps_unsent:
+            return ts
+        return ts, row["number"]
 
     def comments(row):
         return counts.get(row["number"], 0)
@@ -1247,7 +1296,15 @@ async def search_issues(
         for r in matched[start : start + per_page]
     ]
     _search_paged(request, response, q, page, per_page, len(matched))
-    return {"total_count": len(matched), "incomplete_results": False, "items": items}
+    # Real answers `lexical` to a search that does not ask for `search_type=semantic` or `hybrid`,
+    # an empty one included (measured 2026-10-10). This route ignores `search_type` and always
+    # matches lexically.
+    return {
+        "total_count": len(matched),
+        "incomplete_results": False,
+        "items": items,
+        "search_type": "lexical",
+    }
 
 
 # --- code search ----------------------------------------------------------------
@@ -1880,6 +1937,9 @@ async def list_issues(
     state: str = _state_param(_ISSUE_STATE_DESCRIPTION),
     sort: str = _enum_param("created", _ISSUE_SORT_DESCRIPTION, _ISSUE_ORDERING.sorts),
     direction: str = _enum_param("desc", _ISSUE_DIRECTION_DESCRIPTION, _DIRECTIONS),
+    labels: str = Query(
+        None, description="A list of comma separated label names. Example: `bug,ui,@high`"
+    ),
     page: PageParam = None,
     per_page: PageParam = None,
 ):
@@ -1907,9 +1967,29 @@ async def list_issues(
         for r in store.list_documents(conn, "github", repo, ids, limit=10_000, state=state_filter)
         if r["kind"] != "file"
     ]
+    # Measured on psf/requests, api.github.com, 2026-10-12 and 2026-10-13: an issue is served when
+    # its labels include every name the value lists, comma-separated and compared without case, and
+    # the last repeated parameter is the one read and the one a page link carries. A space is part
+    # of a name (`%20Bug` and `Bug%20` match nothing) and an empty name between two others is a name
+    # too (`Bug,,Documentation` matches nothing), but empty names at the end are dropped
+    # (`Bug,` is `Bug`). A value of commas alone (`,`) or of whitespace alone (`%20`, `%09`,
+    # `%C2%A0`, `%E3%80%80`) filters nothing; `%1C` to `%1F`, which `str.isspace` counts too, match
+    # nothing.
+    named = (labels or "").rstrip(",")
+    if named and not all(ch.isspace() and not 0x1C <= ord(ch) <= 0x1F for ch in labels):
+        wanted = {name.lower() for name in named.split(",")}
+        all_rows = [
+            row
+            for row in all_rows
+            if wanted <= {name.lower() for name in store.jcol(row, "labels")}
+        ]
     sort, descending = _order(request, _ISSUE_ORDERING)
     all_rows = _ordered(
-        all_rows, _issue_sort_keys(conn, repo, sort, ids), _ISSUE_ORDERING, sort, descending
+        all_rows,
+        _issue_sort_keys(conn, repo, sort, ids, updated_keeps_unsent=True),
+        _ISSUE_ORDERING,
+        sort,
+        descending,
     )
     asserted = page  # kept: the page urls carry the number the caller claimed, or none at all
     page, per_page = _clamp(page, per_page)
@@ -1930,7 +2010,7 @@ async def list_issues(
     return _paged_by_cursor(
         request,
         len(all_rows),
-        _echo(request, state=state, **_sent(request, "sort", "direction")),
+        _echo(request, state=state, **_sent(request, "sort", "direction", "labels")),
         body,
         link_page,
         per_page,
@@ -2362,7 +2442,18 @@ def _ref_exists(conn, owner: str, repo: str, ref: str, ids) -> bool:
         return bool(name) and name in _repo_tags(conn, repo)
     if head == "pull":
         number, _, kind = name.partition("/")
-        if kind not in ("head", "merge") or not number.isdigit():
+        # Only a pull's number in its own decimal spelling names its ref. Measured on
+        # octocat/Hello-World (api.github.com, 2026-10-11): `pull/11482/head` and `…/merge` are
+        # 200, and the same number in fullwidth, Arabic-Indic or Devanagari digits, with leading
+        # zeros or a sign, and `²` are each the 404 an unknown number gets. Nineteen digits hold
+        # every number SQLite stores (`store.github_by_number` misses one past 64 bits), and the
+        # bound keeps `int()` off a string longer than the 4,300 digits it converts.
+        if kind not in ("head", "merge") or not (
+            number.isascii()
+            and number.isdigit()
+            and len(number) <= 19
+            and str(int(number)) == number
+        ):
             return False
         row = store.github_by_number(conn, repo, int(number), ids)
         if row is None or row["kind"] != "pull_request":

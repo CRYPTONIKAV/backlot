@@ -523,6 +523,124 @@ def test_github_pulls_filtered_by_state(client, admin_h, org):
     assert [p["title"] for p in all_body] == ["Fix token-bucket refill off-by-one"]
 
 
+@pytest.fixture(scope="module")
+def gh_labelled(tmp_path_factory):
+    """One repository whose issues carry labels spelt in two cases, one of them a pull and one
+    private to hana, beside a labelled source file, for the issue listing's `labels` filter."""
+    rows = [
+        ("Bug", ["bug"], "issue", "public"),
+        ("Docs", ["documentation"], "issue", "public"),
+        ("Fix", ["BUG", "Documentation"], "pull_request", "public"),
+        ("Private bug", ["bug"], "issue", "private"),
+        ("Source", ["bug"], "file", "public"),
+    ]
+    records = [
+        {
+            "source_type": "github",
+            "doc_id": f"label-{i}",
+            "repo": "triage",
+            "title": title,
+            "labels": labels,
+            "subtype": kind,
+            "visibility": visibility,
+            "author_email": "hana@acme.com" if visibility == "private" else "bob@acme.com",
+            "state": "open",
+            **({"path": "src/main.py"} if kind == "file" else {}),
+        }
+        for i, (title, labels, kind, visibility) in enumerate(rows)
+    ]
+    with corpus_client(tmp_path_factory.mktemp("gh_labelled"), records) as (c, settings):
+        tokens = yaml.safe_load(settings.tokens_path.read_text())
+        org = c.get("/_meta/users").json()["org"]
+        yield (
+            c,
+            f"/github/repos/{org}/triage/issues",
+            {"Authorization": f"Bearer {settings.admin_token}"},
+            {"Authorization": f"Bearer {tok(tokens, 'bob@acme.com')}"},
+        )
+
+
+_LABELLED = {"Bug", "Docs", "Fix", "Private bug"}
+_BUG = {"Bug", "Fix", "Private bug"}
+
+
+@pytest.mark.parametrize(
+    "query, titles",
+    [
+        ("", _LABELLED),
+        ("labels=", _LABELLED),
+        ("labels=bug", _BUG),
+        ("labels=BUG", _BUG),
+        ("labels=documentation", {"Docs", "Fix"}),
+        ("labels=bug,documentation", {"Fix"}),
+        ("labels=Documentation,Bug", {"Fix"}),
+        ("labels=bug,bug", _BUG),
+        ("labels=bug,", _BUG),
+        ("labels=bug,,", _BUG),
+        ("labels=zzqq-no-such-label", set()),
+        ("labels=bug,zzqq-no-such-label", set()),
+        ("labels=%20bug", set()),
+        ("labels=bug%20", set()),
+        ("labels=bug,%20documentation", set()),
+        ("labels=bug,,documentation", set()),
+        # the last of a repeated parameter
+        ("labels=bug&labels=documentation", {"Docs", "Fix"}),
+        ("labels=documentation&labels=bug", _BUG),
+        ("labels=bug&labels=", _LABELLED),
+        # commas alone, or whitespace alone, filter nothing
+        ("labels=,", _LABELLED),
+        ("labels=,,", _LABELLED),
+        ("labels=%20", _LABELLED),
+        ("labels=%09", _LABELLED),
+        ("labels=%C2%A0", _LABELLED),
+        ("labels=%E3%80%80", _LABELLED),
+        ("labels=%1C", set()),
+        ("labels=%20,", set()),
+    ],
+)
+def test_github_the_issue_listing_serves_the_issues_carrying_every_named_label(
+    gh_labelled, query, titles
+):
+    """Each row is the answer real gave that spelling on psf/requests, transposed to this corpus
+    (the rule and its dates are in :func:`backlot.routers.github.list_issues`), asked by the admin
+    and by a token that cannot see the private issue. The pull is served like the issues, and the
+    source file never is."""
+    c, url, admin, scoped = gh_labelled
+    for headers, expected in ((admin, titles), (scoped, titles - {"Private bug"})):
+        r = c.get(f"{url}?{query}", headers=headers)
+        assert r.status_code == 200, r.text
+        assert {row["title"] for row in r.json()} == expected, headers is admin
+
+
+@pytest.mark.parametrize(
+    "query, titles, linked",
+    [
+        ("labels=BUG", _BUG, ["labels=BUG"]),
+        ("labels=documentation&labels=bug", _BUG, ["labels=bug"]),
+        ("labels=,", _LABELLED, ["labels=%2C"]),
+    ],
+)
+def test_github_the_issue_listing_filters_by_label_before_it_pages(
+    gh_labelled, query, titles, linked
+):
+    """The filter runs before the page is cut, so a walk of one-row pages serves each match once,
+    and every `next` carries `labels` once, the value the listing read, as it was spelt (see
+    :func:`backlot.routers.github.list_issues`). A separate walk rather than rows of the table
+    above, since what it reads is the page links."""
+    c, url, admin, _ = gh_labelled
+    r = c.get(f"{url}?{query}&per_page=1", headers=admin)
+    seen = []
+    while True:
+        assert r.status_code == 200, r.text
+        seen += [row["title"] for row in r.json()]
+        nxt = _link_rels(r.headers.get("Link", "")).get("next")
+        if nxt is None:
+            break
+        assert [p for p in nxt.partition("?")[2].split("&") if p.startswith("labels=")] == linked
+        r = c.get(nxt, headers=admin)
+    assert sorted(seen) == sorted(titles)
+
+
 def test_github_state_is_reals_enum_refused_on_issues_and_absorbed_on_pulls(tmp_path):
     """GitHub's OpenAPI description declares `state` on the issue and the pull listing as
     `{type: string, enum: [open, closed, all], default: open}`, described "Indicates the state of
@@ -1750,6 +1868,16 @@ def test_github_git_ref_resolves_a_pulls_own_ref(gh_client, gh_admin_h, gh_org):
         assert r.status_code == 200, suffix
         assert r.json()["ref"] == f"refs/pull/{num}/{suffix}"
     assert c.get(f"{base}/git/ref/pull/999999/head", headers=gh_admin_h).status_code == 404
+    # the same number in other digits, or with a leading zero, names no ref (see `_ref_exists`)
+    digits = str(num)
+    for spelling in (
+        digits.translate(str.maketrans("0123456789", "０１２３４５６７８９")),
+        digits.translate(str.maketrans("0123456789", "٠١٢٣٤٥٦٧٨٩")),
+        f"0{digits}",
+    ):
+        for suffix in ("head", "merge"):
+            r = c.get(f"{base}/git/ref/pull/{spelling}/{suffix}", headers=gh_admin_h)
+            assert r.status_code == 404, (spelling, suffix)
     # this repo states no tags and `/tags` says so, so a tag ref cannot resolve either
     assert c.get(f"{base}/git/ref/tags/v1", headers=gh_admin_h).status_code == 404
 
@@ -2188,6 +2316,7 @@ def test_github_documentation_url_names_the_route_that_failed(gh_client, gh_admi
             f"{missing}/collaborators",
             "rest/collaborators/collaborators#list-repository-collaborators",
         ),
+        (f"{missing}/issues/1", "rest/issues/issues#get-an-issue"),
         (f"{missing}/pulls/1/files", "rest/pulls/pulls#list-pull-requests-files"),
         # the two routes that take the rest of the path as one parameter still resolve
         (f"{missing}/git/ref/heads/release/2026-03", "rest/git/refs#get-a-reference"),
@@ -2399,23 +2528,53 @@ def test_github_pages_at_reals_thirty_and_caps_at_its_hundred(tmp_path):
         assert Settings.model_fields["max_page_size"].default == 1000
 
 
-def test_github_a_path_parameter_it_cannot_parse_is_the_route_s_404(gh_client, gh_admin_h, gh_org):
-    """Real has no route for `/issues/notanint`, so it answers the 404 that route's own anchor
-    names — measured: `Not Found`, `documentation_url: .../rest/issues/issues#get-an-issue`.
+@pytest.mark.parametrize(
+    "route",
+    [
+        "issues/{number}",
+        "issues/{number}/comments",
+        "issues/comments/{number}",
+        "pulls/{number}",
+        "pulls/{number}/reviews",
+        "pulls/{number}/comments",
+        "pulls/{number}/commits",
+        "pulls/{number}/files",
+        "pulls/comments/{number}",
+        "git/ref/pull/{number}/head",
+        "git/ref/pull/{number}/merge",
+    ],
+)
+@pytest.mark.parametrize(
+    "number",
+    [
+        "notanint",
+        "²",
+        "9223372036854775808",
+        "-9223372036854775809",
+        pytest.param("1" * 4301, id="4301-digits"),
+    ],
+)
+def test_github_a_path_number_it_cannot_read_is_the_unknown_number_404(
+    gh_client, gh_admin_h, gh_org, route, number
+):
+    """A path number that is not an integer (`²` included), or one outside 64 bits (see
+    store.github_by_number), gets the 404 an unknown number gets on that route, byte for byte, as
+    real answers both; `²` was measured on all eleven routes. A number of 4,301 digits, one more
+    than `int()` converts, gets that 404 too, where real answers a path that long with a 414 on
+    `issues/{number}` and the git refs, and with a 404 on `pulls/{number}`.
 
-    Backlot declares `number: int` and so matches the route and fails after, which is a difference
-    in how the two arrive rather than in what they answer. What it must not do is answer a 422:
-    `{"detail": [...]}` announced itself as the mock's own default, and an envelope does not — a
-    status real never sends would read as measured.
+    The routes that declare the number an `int` match `notanint` and then fail to validate it, and
+    that has to be the route's 404 rather than a 422: `{"detail": [...]}` would announce itself as
+    the mock's own default, and an envelope would not, so a status real never sends would read as
+    measured.
     """
     c, _ = gh_client
-    r = c.get(f"/github/repos/{gh_org}/codebase/issues/notanint", headers=gh_admin_h)
-    assert r.status_code == 404
-    assert r.json() == {
-        "message": "Not Found",
-        "documentation_url": "https://docs.github.com/rest/issues/issues#get-an-issue",
-        "status": "404",
-    }
+    base = f"/github/repos/{gh_org}/codebase/"
+    unknown = c.get(base + route.format(number="999999999"), headers=gh_admin_h)
+    actual = c.get(base + route.format(number=number), headers=gh_admin_h)
+    assert unknown.status_code == 404
+    assert actual.status_code == unknown.status_code
+    assert actual.content == unknown.content
 
 
 def test_github_a_wrong_method_is_not_dressed_as_a_measured_answer(gh_client, gh_admin_h, gh_org):
@@ -2812,6 +2971,25 @@ def test_github_a_page_url_omits_a_page_size_the_caller_did_not_send(
     assert nxt.endswith("?state=all&page=2") and "per_page" not in nxt
     sent = c.get(url, headers=gh_admin_h, params={"state": "all", "per_page": 1})
     assert "per_page=1&page=2" in _link_rels(sent.headers["Link"])["next"]
+
+
+@pytest.mark.parametrize(
+    "qs",
+    [
+        "q=extension:md&per_page=2&page=1",
+        "q=extension:md&page=1&per_page=2",
+        "per_page=2&q=extension:md",
+    ],
+)
+def test_github_code_search_page_links_write_page_before_per_page(gh_client, gh_admin_h, qs):
+    """Each order the request sends its parameters in links the same url, in the order
+    :func:`backlot.pagination.github_code_search_link_header` records."""
+    c, _ = gh_client
+    r = c.get(f"/github/search/code?{qs}", headers=gh_admin_h)
+    assert r.status_code == 200
+    rels = _link_rels(r.headers["Link"])
+    assert rels["next"].split("?", 1)[1] == "q=extension%3Amd&page=2&per_page=2"
+    assert rels["first"].split("?", 1)[1] == "q=extension%3Amd&page=1&per_page=2"
 
 
 @pytest.mark.parametrize(
@@ -4785,11 +4963,16 @@ def test_github_tree_truncates_at_the_real_caps(gh_client, gh_admin_h, gh_org, m
 # --- OpenAPI enrichment: github response fidelity ------------------------------------------
 
 
-def test_github_list_issues_documents_state_param(client):
+def test_github_list_issues_documents_its_filters(client):
     op = client.get("/openapi.json").json()["paths"]["/github/repos/{owner}/{repo}/issues"]["get"]
     params = {p["name"]: p for p in op.get("parameters", [])}
     assert "state" in params and {"page", "per_page"} <= set(params)
     assert params["state"]["schema"].get("default") == "open"
+    # `labels` as GitHub's OpenAPI description declares it
+    assert params["labels"]["description"] == (
+        "A list of comma separated label names. Example: `bug,ui,@high`"
+    )
+    assert params["labels"]["schema"]["type"] == "string"
 
 
 def test_github_the_statuses_listing_declares_the_page_parameters_real_accepts(client):
@@ -4805,9 +4988,31 @@ def test_github_the_statuses_listing_declares_the_page_parameters_real_accepts(c
     assert {"page", "per_page"} <= {p["name"] for p in op.get("parameters", [])}
 
 
-def test_github_search_still_filters_by_q(client, admin_h):
-    body = client.get("/github/search/issues", params={"q": "is:issue"}, headers=admin_h).json()
-    assert "items" in body and "total_count" in body
+@pytest.mark.parametrize(
+    "path, q, search_type",
+    [
+        ("/github/search/issues", "is:issue", "lexical"),
+        ("/github/search/issues", "is:pr", "lexical"),
+        ("/github/search/issues", "no-matching-issue-lexical-search", "lexical"),
+        ("/github/search/code", "extension:md", None),
+    ],
+)
+def test_github_search_envelope_members_and_their_order_match_real(
+    client, admin_h, path, q, search_type
+):
+    """Issue search sends `search_type` last, after `items`; code search sends no such member."""
+    response = client.get(path, params={"q": q}, headers=admin_h)
+    assert response.status_code == 200
+    members = ["total_count", "incomplete_results", "items"] + ["search_type"] * bool(search_type)
+    assert list(response.json()) == members
+    assert response.json().get("search_type") == search_type
+
+
+def test_github_issue_search_schema_requires_search_type(client):
+    spec = client.get("/openapi.json").json()
+    schema = spec["components"]["schemas"]["GitHubIssueSearch"]
+    assert "search_type" in schema["required"]
+    assert schema["properties"]["search_type"]["type"] == "string"
 
 
 def test_github_responses_unchanged_by_enrichment(client, admin_h):
@@ -5131,6 +5336,44 @@ def test_github_sort_and_direction_order_the_issue_and_pull_listings_as_measured
         assert _numbers(c, pulls, h, sort="created", per_page=1, page=2) == [4]
 
 
+def test_github_issues_updated_in_the_same_second_stay_newest_first(tmp_path):
+    """Under `sort=updated` the issue listing serves a tie newest first in either direction and the
+    pull listing serves it by number in the direction asked (see `_ISSUE_ORDERING` and
+    `_PULL_ORDERING`). Every document here shares one `updated_at`, so the whole answer is the tie.
+    """
+    updated = "2021-09-09T00:28:33Z"
+    docs = [
+        {
+            "source_type": "github",
+            "doc_id": f"tie-{n}",
+            "repo": "ties",
+            "subtype": "pull_request" if n > 3 else "issue",
+            "number": n,
+            "title": f"Document {n}",
+            "content": "x",
+            "author_email": "bob@acme.com",
+            "visibility": "public",
+            "state": "open",
+            "created": f"2020-01-0{n}T00:00:00Z",
+            "updated": updated,
+            **({"head": f"feat/{n}", "base": "main"} if n > 3 else {}),
+        }
+        for n in range(1, 7)
+    ]
+    settings = build_corpus(tmp_path, docs, name="ties.jsonl")
+    with client_for(settings, reload=True) as c:
+        h = {"Authorization": f"Bearer {settings.admin_token}"}
+        org = c.get("/_meta/users").json()["org"]
+        issues = f"/github/repos/{org}/ties/issues"
+        # 6 is newest; the issue listing includes the pulls, and both directions keep that order
+        assert _numbers(c, issues, h, sort="updated", direction="asc") == [6, 5, 4, 3, 2, 1]
+        assert _numbers(c, issues, h, sort="updated", direction="desc") == [6, 5, 4, 3, 2, 1]
+        pulls = f"/github/repos/{org}/ties/pulls"
+        assert _numbers(c, pulls, h, sort="updated", direction="asc") == [4, 5, 6]
+        assert _numbers(c, pulls, h, sort="updated") == [4, 5, 6]
+        assert _numbers(c, pulls, h, sort="updated", direction="desc") == [6, 5, 4]
+
+
 def test_github_type_visibility_sort_and_direction_on_the_repository_listings(tmp_path):
     """`GET /orgs/{org}/repos` takes `type`, `sort` and `direction` and `GET /user/repos`
     `visibility`, `sort` and `direction`, each declared in GitHub's OpenAPI description with an
@@ -5448,6 +5691,23 @@ def test_github_every_response_carries_the_five_ratelimit_headers_and_rate_limit
         # window — the address's, where it would have landed, stays put
         assert not any(n.startswith("x-ratelimit-") for n in refused.headers)
         assert "x-github-api-version-selected" not in refused.headers
+        for spelling in ("bearer nope", "TOKEN nope"):
+            other = c.get("/github/rate_limit", headers={"Authorization": spelling})
+            assert other.status_code == 401
+            assert not any(n.startswith("x-ratelimit-") for n in other.headers), spelling
+        # after a tab rather than a space, the same 401 carries the five of a window it has not
+        # used, and still no echo
+        for spelling in ("Bearer\tnope", "token\tnope", "Bearer\t nope"):
+            tab = c.get("/github/rate_limit", headers={"Authorization": spelling})
+            assert (tab.status_code, tab.json()) == (401, refused.json()), spelling
+            assert "x-github-api-version-selected" not in tab.headers, spelling
+            limits = _ratelimit(tab)
+            assert [limits[k] for k in ("limit", "remaining", "used", "resource")] == [
+                "60",
+                "60",
+                "0",
+                "core",
+            ], spelling
         assert c.get("/github/rate_limit").json()["resources"]["core"]["used"] == 2
 
         # a search endpoint's name carries `search` past the route it serves; an empty rest and a
@@ -5486,6 +5746,10 @@ def test_github_every_response_carries_the_five_ratelimit_headers_and_rate_limit
         assert (first["limit"], second["limit"]) == ("60", "60")
         assert int(second["used"]) == int(first["used"]) + 1
         assert int(first["used"]) < address  # its own window, not the address's
+        # and so is a bearer after a tab, though it is refused as Bad credentials
+        tab = c.get("/github/user/repos", headers={"Authorization": "Bearer\tnope"})
+        assert tab.json()["message"] == "Bad credentials"
+        assert int(_ratelimit(tab)["used"]) == int(second["used"]) + 1
         assert int(_ratelimit(c.get("/github/user/repos"))["used"]) == address + 1
 
         # a minute on, the two search windows are new ones where `core`'s is the one it was
@@ -5618,7 +5882,15 @@ def test_github_rate_limit_refuses_an_anonymous_caller_too_and_the_switch_turns_
             assert rate_limit_slash.text == "404 Not Found"
             assert not any(n.startswith("x-ratelimit-") for n in rate_limit_slash.headers)
 
-        # a bearer that does not resolve is its own 401 on the spent window, not the refusal
+        # a bearer after a tab is counted in the unparseable window instead, so it is that window's
+        # refusal once two `Digest x` have spent it (see `refused_without_a_window`)
+        for _ in range(2):
+            digest = c.get("/github/user/repos", headers={"Authorization": "Digest x"})
+            assert digest.status_code == 401
+        tab_spent = c.get("/github/user/repos", headers={"Authorization": "Bearer\tnope"})
+        assert (tab_spent.status_code, tab_spent.json()) == (403, refused.json())
+
+        # `Bearer nope` is its own 401 on both spent windows, not the refusal
         bad_bearer = c.get("/github/user/repos", headers={"Authorization": "Bearer nope"})
         assert bad_bearer.status_code == 401
         assert not any(n.startswith("x-ratelimit-") for n in bad_bearer.headers)

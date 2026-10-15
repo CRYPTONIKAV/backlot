@@ -24,7 +24,7 @@ import json
 import re
 from xml.sax.saxutils import escape
 
-from fastapi import HTTPException
+from fastapi import HTTPException, Request
 
 PREFIX = "/atlassian"
 WIKI = f"{PREFIX}/wiki"
@@ -187,7 +187,8 @@ def _instance(path: str) -> str:
 
 
 def integer_conversion_failure(path: str, name: str, values: list[str]) -> AtlassianError:
-    """The 400 either product answers for a query parameter it cannot read as an ``int``.
+    """The 400 either product answers for a query parameter it cannot read as an ``int``, which
+    Jira also answers for one it cannot read as a boolean.
 
     Measured on brekkylab.atlassian.net, 2026-09-14, on `GET /rest/api/3/issue/{key}/comment` and
     `GET /wiki/rest/api/space`. The two bodies share no key: Jira's is RFC 7807 naming the
@@ -263,6 +264,96 @@ def cql_required() -> AtlassianError:
     )
 
 
+def _service_refusal(status: int, exception: str, message: str) -> AtlassianError:
+    """A refusal Confluence's API service layer raises: `statusCode`, the `data` object it always
+    carries, and the exception's name before its message, as :func:`start_too_large` records."""
+    return AtlassianError(
+        status,
+        {
+            "statusCode": status,
+            "data": {"authorized": True, "valid": True, "errors": [], "successful": True},
+            "message": f"com.atlassian.confluence.api.service.exceptions.{exception}: {message}",
+        },
+    )
+
+
+def no_space_with_key(space_key: str) -> AtlassianError:
+    """`content`'s refusal of a space key naming no space, as sent: the key is not trimmed (`' '` is
+    named as a space), and a repeated one is its comma-join, which no key holds. Where it comes
+    among the route's other refusals is ``routers.atlassian._CONTENT_TYPES``'s."""
+    return _service_refusal(404, "api.NotFoundException", f"No space with key : {space_key}")
+
+
+def space_not_found(space_key: str) -> AtlassianError:
+    """``space/{key}``'s refusal of a key naming no space, with ``expand`` and without: two
+    members, the message naming the key as the path decodes it, in the case it was sent in
+    (``space/nosuch`` names ``nosuch``, ``space/NO%20SUCH`` names ``NO SUCH``). Measured on
+    Confluence Cloud, 2026-10-11 and 2026-10-12. ``content`` refuses the same key with
+    :func:`no_space_with_key`.
+    """
+    return AtlassianError(
+        404,
+        {
+            "statusCode": 404,
+            "message": (
+                "org.springframework.web.server.ResponseStatusException: "
+                f'404 NOT_FOUND "No space found with key : {space_key}"'
+            ),
+        },
+    )
+
+
+def unknown_content_type(type_value: str) -> AtlassianError:
+    """`content`'s refusal of a content type Confluence does not have, named as sent, when neither
+    a space nor a title is given. The types it has, and the measurement, are
+    ``routers.atlassian._CONTENT_TYPES``'s."""
+    return _service_refusal(
+        501,
+        "unchecked.NotImplementedServiceException",
+        f"Cannot find custom content type : {type_value}",
+    )
+
+
+def content_finder_cannot_fetch(content_type: str) -> AtlassianError:
+    """`content`'s 501 for `type=comment` and `type=folder`, measured 2026-10-10: the message names
+    the type in the plural."""
+    return _service_refusal(
+        501,
+        "unchecked.NotImplementedServiceException",
+        f"Cannot fetch {content_type}s with ContentFinder",
+    )
+
+
+def not_a_custom_content_type(content_type: str) -> AtlassianError:
+    """`content`'s 400 for `type=whiteboard`, `database` and `embed`, measured 2026-10-10: the bare
+    exception string, as :func:`negative_not_allowed` is."""
+    return AtlassianError(
+        400,
+        {
+            "statusCode": 400,
+            "message": (
+                f"java.lang.IllegalArgumentException: Type is not a custom content type : "
+                f"{content_type}"
+            ),
+        },
+    )
+
+
+def attachment_without_container() -> AtlassianError:
+    """`content`'s 500 for `type=attachment`, which real answers alone, beside a space and beside a
+    title alike (2026-10-10): a `NullPointerException` with no `data`."""
+    return AtlassianError(
+        500,
+        {
+            "statusCode": 500,
+            "message": (
+                'java.lang.NullPointerException: Cannot invoke "com.atlassian.confluence.api.model.'
+                'content.id.ContentId.asLong()" because "containerId" is null'
+            ),
+        },
+    )
+
+
 def start_too_large() -> AtlassianError:
     """`content`'s refusal of a `start` above 100000, which `space` does not share.
 
@@ -271,18 +362,11 @@ def start_too_large() -> AtlassianError:
     negative 400 above carry `statusCode` and `message` alone. `start=100000` is a 200, so the
     bound is inclusive.
     """
-    return AtlassianError(
+    return _service_refusal(
         400,
-        {
-            "statusCode": 400,
-            "data": {"authorized": True, "valid": True, "errors": [], "successful": True},
-            "message": (
-                "com.atlassian.confluence.api.service.exceptions.api.BadRequestException: "
-                "Start of this size is no longer supported. If you need to fetch this amount of "
-                "content, please use either the search endpoint or get the content by a space at "
-                "a time."
-            ),
-        },
+        "api.BadRequestException",
+        "Start of this size is no longer supported. If you need to fetch this amount of content, "
+        "please use either the search endpoint or get the content by a space at a time.",
     )
 
 
@@ -467,7 +551,7 @@ def refuse_a_media_type(
     Spring's check, and the first thing the operation does: ahead of the 401 a caller with no
     credential gets (:data:`JIRA_UNAUTHENTICATED`) and of the operation itself for one whose
     credential resolves, and behind the gateway's Connect-token 403. Measured on Jira Cloud on
-    2026-09-30, on the operations ``backlot/data/jira_unserved.json`` lists:
+    2026-09-30, on the operations ``backlot/data/jira_unserved.json`` listed that day:
 
     - the media type is compared without its parameters and whatever its case, and a type only a
       wildcard would cover (`application/*`, `*/*`, `*`) is refused where the operation does not
@@ -565,6 +649,46 @@ def unbounded_jql() -> AtlassianError:
     )
 
 
+def properties_null_element(index: int) -> AtlassianError:
+    """Jira's 500 for a `search/jql` body whose `properties` list holds a ``null``, measured
+    2026-10-10: the message names the first null's index (`["a", null]` names index 1), on the
+    same `application/json;charset=UTF-8` as the 400s.
+    """
+    return AtlassianError(
+        500,
+        {"message": f"at index {index}", "status-code": 500, "stack-trace": ""},
+        media_type=JIRA_JSON_MEDIA_TYPE,
+    )
+
+
+def reconcile_issues_null() -> AtlassianError:
+    """Jira's 500 for a `search/jql` body whose `reconcileIssues` is JSON ``null`` rather than
+    unsent, measured 2026-10-10: the message is the NPE the operation throws streaming the list,
+    verbatim, on the same `application/json;charset=UTF-8` as the 400s.
+    """
+    return AtlassianError(
+        500,
+        {
+            "message": 'Cannot invoke "java.util.List.stream()" because "reconcileIssues" is null',
+            "status-code": 500,
+            "stack-trace": "",
+        },
+        media_type=JIRA_JSON_MEDIA_TYPE,
+    )
+
+
+def reconcile_issues_too_many() -> AtlassianError:
+    """Jira's 400 for more than 50 `reconcileIssues`, measured 2026-10-12 on both GET and POST."""
+    return AtlassianError(
+        400,
+        {
+            "errorMessages": ["The max number of issues to reconcile is 50."],
+            "errors": {},
+        },
+        media_type=JIRA_JSON_MEDIA_TYPE,
+    )
+
+
 def max_results_out_of_range() -> AtlassianError:
     """Jira's 400 for `search/jql`'s `maxResults` outside 1-5000, on both methods and both
     placements — the query string and the POST body. Measured 2026-09-18 against Jira Cloud:
@@ -646,8 +770,10 @@ _JIRA_ALLOW_PATTERNS = tuple((route_regex(t), methods) for t, methods in _JIRA_A
 
 def jira_allow(path: str) -> str | None:
     """The `Allow` real sends on a 405 at ``path``, or ``None`` for a Jira route no row above
-    covers. ``path`` is Backlot's, prefix and all."""
-    vendor_path = _instance(path)
+    covers. ``path`` is Backlot's, prefix and all, and a trailing slash on it is dropped before
+    matching: it is the path a refusal echoes (``backlot.routers.atlassian._echoed_path``), and
+    no row above has one."""
+    vendor_path = _instance(path).rstrip("/")
     for pattern, methods in _JIRA_ALLOW_PATTERNS:
         if pattern.fullmatch(vendor_path):
             return ", ".join(methods)
@@ -874,9 +1000,9 @@ CONFLUENCE_SEARCH_OPTIONS_ALLOW = "OPTIONS,HEAD,GET"
 _CONFLUENCE_HEAD_NO_LENGTH = "/wiki/rest/api/search"
 
 
-def head_content_length(path: str, status_code: int) -> bool:
-    """Whether a `HEAD` at ``path`` declares the length of the body its `GET` would have carried,
-    as real does.
+def head_content_length(request: Request, status_code: int) -> bool:
+    """Whether real Jira or Confluence puts a `content-length` on a `HEAD` to this request's path
+    that answers ``status_code``.
 
     Measured with `curl -I` beside each `GET` the same minute. Confluence, 2026-09-22: every 200 but
     `search` declares it, to the byte (`space` 1103, `content` 1536, `content/{id}` 3909,
@@ -886,6 +1012,7 @@ def head_content_length(path: str, status_code: int) -> bool:
     credential with (:data:`JIRA_UNAUTHENTICATED`), which declares its 53 bytes, and the `HEAD`
     beside it declares the same (`myself`, 2026-09-30).
     """
+    path = request.url.path
     if not is_confluence(path):
         return status_code == 401
     if _instance(path) == _CONFLUENCE_HEAD_NO_LENGTH:

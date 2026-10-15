@@ -149,12 +149,15 @@ _P_CONTENT = {
     "parameters": [
         qp("expand"),
         qp("spaceKey"),
+        qp("type"),
         qp("title"),
         qp("limit", "integer"),
         qp("start", "integer"),
     ]
 }
-_P_SPACE = {"parameters": [qp("expand"), qp("limit", "integer"), qp("start", "integer")]}
+_P_SPACE = {
+    "parameters": [qp("expand"), qp("spaceKey"), qp("limit", "integer"), qp("start", "integer")]
+}
 # The four listings under `content/{id}`, which read the same pair with their own defaults and
 # caps. `child/page` is the one of them this router also reads an `expand` on.
 _P_CHILD_PAGE = {"parameters": [qp("expand"), qp("limit", "integer"), qp("start", "integer")]}
@@ -412,6 +415,12 @@ def _require_project(request: Request, conn, key: str) -> str:
     ecosystem.atlassian.net, whose `AA` is public, and brekkylab.atlassian.net, which has no such
     key, on 2026-09-04. An unreachable project is reported as an absent one, the way
     `issue/{key}` reports an issue the caller cannot see.
+
+    The 404 calls the segment an `id` when it is one to eighteen ASCII digits with no leading zero,
+    and a `key` otherwise. Measured against Jira Cloud on 2026-10-14, with and without a credential,
+    on `role` and `role/10002`: `1`, `10002` and `999999999999999999` are ids; `0`, `007`, `-1`,
+    `1000000000000000000` (nineteen digits, still a Java `long`) and `1２` (a full-width `２`) are
+    keys.
     """
     ids = auth.visible_ids(request, _jira_caller(request))
     container = _jira_container_for_key(conn, key, request)
@@ -423,7 +432,8 @@ def _require_project(request: Request, conn, key: str) -> str:
         ids is None or store.has_visible_document(conn, "jira", container, ids)
     ):
         return container
-    raise HTTPException(status_code=404, detail=f"No project could be found with key '{key}'.")
+    kind = "id" if re.fullmatch(r"[1-9][0-9]{0,17}", key) else "key"
+    raise HTTPException(status_code=404, detail=f"No project could be found with {kind} '{key}'.")
 
 
 @router.get("/rest/api/3/project/{key}/role")
@@ -453,10 +463,11 @@ async def jira_project_role(key: str, role_id: int, request: Request):
 
 
 # The `SearchAndReconcileRequestBean` fields real's POST form accepts, measured 2026-09-18 against
-# Jira Cloud: `fields`, `fieldsByKeys`, `expand`, `properties` and `reconcileIssues` are all read
-# without a refusal, alongside the three Backlot itself acts on. Backlot implements
-# none of the five, the same gap `_P_EXPAND`'s comment notes for the comment read, but they must
-# stay off the unknown-property refusal below or that refusal would catch a client using them.
+# Jira Cloud (`failFast` 2026-10-12): `fields`, `fieldsByKeys`, `failFast`, `expand`, `properties`
+# and `reconcileIssues` are all read without a refusal, alongside the three Backlot itself acts on.
+# Backlot implements none of the six, the same gap `_P_EXPAND`'s comment notes for the comment
+# read, but they must stay off the unknown-property refusal below or that refusal would catch a
+# client using them.
 _JIRA_SEARCH_BODY_KEYS = frozenset(
     {
         "jql",
@@ -464,6 +475,7 @@ _JIRA_SEARCH_BODY_KEYS = frozenset(
         "nextPageToken",
         "fields",
         "fieldsByKeys",
+        "failFast",
         "expand",
         "properties",
         "reconcileIssues",
@@ -530,6 +542,52 @@ def _jira_search_max_results(value) -> int:
     return int(n)
 
 
+_JIRA_BOOLEAN_TEXTS = frozenset({"", "null", "true", "True", "TRUE", "false", "False", "FALSE"})
+
+
+def _jira_bean_boolean_ok(value) -> bool:
+    """Whether a `fieldsByKeys` or a `failFast` binds to the bean's boolean. Jira Cloud bound
+    `fieldsByKeys` this way on 2026-10-10 and 2026-10-11, and the two alike, value for value, on
+    2026-10-13. `null`, a boolean and any integer bind. A string binds when, trimmed (see
+    :data:`_JAVA_TRIMMED`), it is empty, `null`, or `true` or `false` in lower, title or upper case:
+    `" TRUE "`, `"False"`, `""` and `"null"` bind, where `"tRuE"`, `"NULL"`, `"1"`, `"yes"` and a
+    `true` behind a no-break space do not. A float, a list and an object do not bind.
+    """
+    if value is None or isinstance(value, int):
+        return True
+    if isinstance(value, str):
+        return value.strip(_JAVA_TRIMMED) in _JIRA_BOOLEAN_TEXTS
+    return False
+
+
+def _jira_reconcile_issue_ok(value) -> bool:
+    """Whether one `reconcileIssues` element binds to the bean's Java `Long`, as measured against
+    Jira Cloud on 2026-10-10 and 2026-10-11. A null binds, as a null `Long`, where a bare null
+    `reconcileIssues` does not (see `jira_search`). An integer binds from -2**63 up to 2**63 - 1. A
+    float binds from -2**63 up to 2**63, both ends included, and is truncated: `1.5`, `9.2e18` and
+    `9223372036854775807.0` (2**63 as a double) bind, where `9.3e18`, `1e19` and the next double
+    past either end do not. A string binds when, trimmed (see :data:`_JAVA_TRIMMED`), it is empty,
+    `null`, or at most 1000 characters of a sign and decimal digits, in any script up to U+FFFF,
+    naming an integer in range: `" 1"`, `"+1"`, `"٥"` and a `1` behind 999 zeros bind, where
+    `"1.5"`, `"1_000"`, `"0x10"`, `"𝟓"`, a `1` behind 1000 zeros and a `1` behind a no-break space
+    do not. A boolean, a list and an object do not bind.
+    """
+    if value is None:
+        return True
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, float):
+        return -(2**63) <= value <= 2**63
+    if isinstance(value, str):
+        text = value.strip(_JAVA_TRIMMED)
+        if text in ("", "null"):
+            return True
+        if len(text) > 1000 or not re.fullmatch(r"[+-]?\d+", text) or max(map(ord, text)) > 0xFFFF:
+            return False
+        value = int(text)
+    return isinstance(value, int) and -(2**63) <= value < 2**63
+
+
 @router.api_route(
     "/rest/api/2/search/jql",
     methods=["GET", "POST"],  # atlassian-python-api uses v2
@@ -575,22 +633,67 @@ async def jira_search(request: Request):
             # an object is a body-wide invalid-payload refusal (measured 2026-10-06; the lists of
             # scalars and the bare string 2026-10-09).
             raise errors_atlassian.body_not_read(errors_atlassian.BODY_NOT_AN_OBJECT)
+        # The other five members Backlot does not act on still have their values bound by the bean
+        # (measured 2026-10-10 and 2026-10-11, `failFast` 2026-10-13): `expand` takes a scalar,
+        # `properties` a list of scalars, `reconcileIssues` a list of what
+        # `_jira_reconcile_issue_ok` accepts, and `fieldsByKeys` and `failFast` what
+        # `_jira_bean_boolean_ok` accepts. Anything else is the body-wide refusal, which real gives
+        # ahead of the 500s a null `properties` element and a null `reconcileIssues` draw further
+        # down.
+        if isinstance(body.get("expand"), (list, dict)):
+            raise errors_atlassian.body_not_read(errors_atlassian.BODY_NOT_AN_OBJECT)
+        if not _jira_bean_boolean_ok(body.get("fieldsByKeys")):
+            raise errors_atlassian.body_not_read(errors_atlassian.BODY_NOT_AN_OBJECT)
+        if not _jira_bean_boolean_ok(body.get("failFast")):
+            raise errors_atlassian.body_not_read(errors_atlassian.BODY_NOT_AN_OBJECT)
+        raw_properties = body.get("properties")
+        if raw_properties is not None and (
+            not isinstance(raw_properties, list)
+            or any(isinstance(prop, (list, dict)) for prop in raw_properties)
+        ):
+            raise errors_atlassian.body_not_read(errors_atlassian.BODY_NOT_AN_OBJECT)
+        raw_reconcile = body.get("reconcileIssues")
+        if raw_reconcile is not None and (
+            not isinstance(raw_reconcile, list)
+            or not all(_jira_reconcile_issue_ok(issue) for issue in raw_reconcile)
+        ):
+            raise errors_atlassian.body_not_read(errors_atlassian.BODY_NOT_AN_OBJECT)
         # A JSON null is the parameter unsent, not the string "None": real answers
         # `{"jql": null}` with the same unbounded-JQL refusal it gives `{}` (measured 2026-09-16).
         jql = "" if raw_jql is None else str(raw_jql)
         max_results_sent = "maxResults" in body
         limit = _jira_search_max_results(body["maxResults"]) if max_results_sent else default_size
+        if raw_properties is not None and None in raw_properties:
+            # Real answers this after the binding refusals above (measured beside `maxResults`,
+            # `reconcileIssues`, `expand`, `jql` and an unknown member) and ahead of every refusal
+            # below (measured 2026-10-11).
+            raise errors_atlassian.properties_null_element(raw_properties.index(None))
         token = raw_token
+        reconcile_null = "reconcileIssues" in body and raw_reconcile is None
+        reconcile_count = len(raw_reconcile) if isinstance(raw_reconcile, list) else 0
     else:
         jql = _str_param(request, "jql") or ""
         max_results_sent = _jira_max_results_was_sent(request)
         limit = _int_param(request, "maxResults", default_size)
+        # Each conversion is refused ahead of the page token, the range and the unbounded JQL:
+        # `maxResults` first, then `fieldsByKeys`, then `failFast`, then `reconcileIssues`,
+        # whichever order the query sends them in (measured 2026-10-12).
+        _bool_param(request, "fieldsByKeys")
+        _bool_param(request, "failFast")
+        _jira_long_list_param(request, "reconcileIssues")
         token = _str_param(request, "nextPageToken")
+        reconcile_null = False
+        reconcile_count = len(request.query_params.getlist("reconcileIssues"))
     # An undecodable token is refused before the project clause is resolved (measured
     # 2026-09-16; see test_jira_search_refuses_a_page_token_it_cannot_decode).
     offset = decode_cursor_or_none(None if token is None else str(token))
     if offset is None:
         raise errors_atlassian.bad_page_token()
+    if reconcile_count > 50:
+        # Real counts every value it was sent, a blank one on GET and a null element on POST
+        # included, and answers this after the page token and ahead of the range and the unbounded
+        # JQL (measured 2026-10-12, the null elements 2026-10-13).
+        raise errors_atlassian.reconcile_issues_too_many()
     if max_results_sent and not (
         _JIRA_SEARCH_MAX_RESULTS_RANGE[0] <= limit <= _JIRA_SEARCH_MAX_RESULTS_RANGE[1]
     ):
@@ -601,6 +704,10 @@ async def jira_search(request: Request):
     # 2026-09-16; see test_jira_search_refuses_no_jql_at_all).
     if not jql.strip():
         raise errors_atlassian.unbounded_jql()
+    if reconcile_null:
+        # Real answers this after the page token, the range and the JQL, and before it looks up
+        # the project (measured 2026-10-11).
+        raise errors_atlassian.reconcile_issues_null()
     container = _project_from_jql(conn, jql, request)
     if container is _JIRA_PROJECT_UNRESOLVED:
         # a project= clause was present but didn't match any project: strict 0 matches, not
@@ -1150,15 +1257,39 @@ def _export_view(content: str) -> str:
 
 
 def _space_container_for_key(conn, space_key: str) -> str | None:
-    """Resolve a Confluence ``spaceKey`` to its backing container name. Backlot models a space
-    by its corpus name, so both the synthesized key (``synth.confluence_space_key(name)``, the
+    """Resolve a Confluence ``spaceKey`` to its backing container name. Backlot models a space by
+    its corpus name, so both the synthesized key (``synth.confluence_space_key(name)``, the
     hash-suffixed value ``/space`` advertises) and the literal container name (e.g. ``"handbook"``,
-    a legitimate natural key) resolve. Anything else is unresolvable -> ``None`` (never a silent
-    fall-through to "no filter": callers must treat ``None`` as "0 results", not "everything")."""
-    for r in store.list_containers(conn, "confluence"):
-        if space_key == synth.confluence_space_key(r["name"]) or space_key == r["name"]:
-            return r["name"]
+    a legitimate natural key) resolve. Anything else is unresolvable -> ``None``, which no caller
+    reads as "no filter": a CQL search matches nothing, `content` 404s and `space` leaves it out.
+    Case does not decide whether a key resolves: real reads a key whatever its case (measured
+    2026-10-10, `space/mfs` and `space/MfS` answering the space `space/MFS` does), and the name half
+    is folded too because a natural key the corpus names may be typed in any case. The fold is
+    `str.lower`: real answers `space/MFſ` and `content?spaceKey=MFſ` with the 404 a key naming no
+    space gets (measured 2026-10-11), and `str.casefold` would read that `ſ` as `s`. An exact
+    spelling is tried first, so two spaces whose names differ only in case each keep their own
+    name."""
+    names = [r["name"] for r in store.list_containers(conn, "confluence")]
+    for fold in (str, str.lower):
+        for name in names:
+            if fold(space_key) in (fold(synth.confluence_space_key(name)), fold(name)):
+                return name
     return None
+
+
+def _content_space(conn, ids, space_key: str) -> str:
+    """The container `content?spaceKey=` filters by, or :func:`errors_atlassian.no_space_with_key`.
+
+    A space the caller reaches no page in is refused the same way as a key naming nothing, as
+    :func:`_require_space` refuses it on the space reads, so the listing does not confirm that the
+    space exists. Unmeasured for a scoped caller, see :func:`_reachable_spaces`. A repeated
+    `spaceKey` is one value with a comma in it (:func:`_str_param`), which no key holds."""
+    container = _space_container_for_key(conn, space_key)
+    if container is not None and (
+        ids is None or store.has_visible_document(conn, "confluence", container, ids)
+    ):
+        return container
+    raise errors_atlassian.no_space_with_key(space_key)
 
 
 def _reachable_spaces(conn, ids) -> list:
@@ -1176,13 +1307,31 @@ def _reachable_spaces(conn, ids) -> list:
     return [r for r in rows if store.has_visible_document(conn, "confluence", r["name"], ids)]
 
 
+def _space_keys(request: Request) -> list[str] | None:
+    """The keys `space?spaceKey=` narrows the listing to, or ``None`` for no narrowing.
+
+    Read the way Spring binds a list parameter, measured 2026-10-12 on Confluence Cloud. One value
+    is split at each comma and each piece trimmed as Java's `String.trim()` trims: `spaceKey=A,B`
+    names two spaces, `%20A` and `%09A` are `A`, and a no-break space is kept, so `%C2%A0A` names
+    nothing. Two or more values are taken as sent, neither split nor trimmed:
+    `spaceKey=NOSUCH&spaceKey=%20A` lists nothing, and `spaceKey=NOSUCH&spaceKey=A,B` lists nothing
+    either. An empty value alone is no narrowing at all, while a piece that trims to nothing names
+    no space, so `spaceKey=%20` and `spaceKey=%2C` list nothing.
+    """
+    values = request.query_params.getlist("spaceKey")
+    if len(values) == 1:
+        values = [v.strip(_JAVA_TRIMMED) for v in values[0].split(",")] if values[0] else []
+    return values or None
+
+
 def _require_space(request: Request, conn, key: str) -> str:
     """The container behind a space key the caller can reach — `_require_project` for Confluence.
 
-    Both space reads answer an unreachable key with the SAME ``404 {"message": "No space with the
-    given key exists"}`` a key naming nothing gets, so neither confirms the space exists — worth
-    withholding because ``?expand=permissions`` names a principal granted a space the caller cannot
-    open. Unmeasured for a scoped caller, see :func:`_reachable_spaces`.
+    Both space reads answer an unreachable key with the 404 a key naming nothing gets
+    (:func:`errors_atlassian.space_not_found`, which names only the key the caller sent), so neither
+    confirms the space exists — worth withholding because ``?expand=permissions`` names a principal
+    granted a space the caller cannot open. Unmeasured for a scoped caller, see
+    :func:`_reachable_spaces`.
     """
     ids = auth.visible_ids(request, _confluence_caller(request))
     container = _space_container_for_key(conn, key)
@@ -1193,7 +1342,7 @@ def _require_space(request: Request, conn, key: str) -> str:
         ids is None or store.has_visible_document(conn, "confluence", container, ids)
     ):
         return container
-    raise HTTPException(status_code=404, detail="No space with the given key exists")
+    raise errors_atlassian.space_not_found(key)
 
 
 # The thirteen keys real names under `_expandable` on a space, in real's own order. Measured on
@@ -1342,6 +1491,14 @@ async def confluence_spaces(request: Request):
     applied per space through :func:`_space` and carried into `next`/`prev`/`self` too.
 
     `limit` is capped at 1000, as real caps it.
+
+    `spaceKey` narrows the listing to the spaces it names (:func:`_space_keys`), each resolved as
+    every other reader resolves a key (:func:`_space_container_for_key`), and `total`, `next` and
+    `prev` count the narrowed listing. Measured 2026-10-12 on Confluence Cloud: the spaces come back
+    in the listing's own order whatever order the keys were sent in, a space named twice is listed
+    once, and a key naming no space is no refusal, so `spaceKey=NOSUCH` is a 200 with no results
+    where `content?spaceKey=NOSUCH` is a 404. The narrowing applies to the spaces the caller
+    reaches, so a key naming a space they reach no page in is left out as a key naming nothing is.
     """
     conn = auth.conn(request)
     ids = auth.visible_ids(request, _confluence_caller(request))
@@ -1350,13 +1507,23 @@ async def confluence_spaces(request: Request):
     # store.list_containers orders by name; real's own order is none of name, key or id (measured
     # 2026-09-17).
     reachable = _reachable_spaces(conn, ids)
+    keys = _space_keys(request)
+    if keys is not None:
+        named = {_space_container_for_key(conn, key) for key in keys}
+        reachable = [r for r in reachable if r["name"] in named]
     total = len(reachable)
     results = [
         _space(request, conn, r["name"], expand, listed=True)
         for r in reachable[start : start + limit]
     ]
     links = _confluence_envelope(
-        request, "/rest/api/space", start=start, limit=limit, size=len(results), total=total
+        request,
+        "/rest/api/space",
+        start=start,
+        limit=limit,
+        size=len(results),
+        total=total,
+        head=("spaceKey",),
     )
     return {
         "results": results,
@@ -1517,19 +1684,24 @@ async def confluence_content_list(request: Request):
     caller = _confluence_caller(request)
     ids = auth.visible_ids(request, caller)
     expand = _str_param(request, "expand", "") or ""
+    # The refusals in the order `_CONTENT_TYPES` records. An empty `type` is no type, and a
+    # repeated one is a single value with a comma in it, which names no type.
+    limit = _int_param(request, "limit", 25)
+    start = _int_param(request, "start", 0)
+    content_type = _str_param(request, "type") or "page"
+    answer = _CONTENT_TYPES.get(content_type)
+    if answer is not None and start > _CONTENT_START_BOUND:
+        raise errors_atlassian.start_too_large()
     space_key = _str_param(request, "spaceKey")
-    limit, start = _confluence_page_params(request, cap=1000, start_bound=_CONTENT_START_BOUND)
-    if space_key:
-        container = _space_container_for_key(conn, space_key)
-        if container is None:
-            # spaceKey given but unresolvable: real Confluence returns zero matches, never the
-            # unfiltered corpus — do not let this collapse to the "no spaceKey" (container=None) case.
-            links = _confluence_envelope(
-                request, "/rest/api/content", start=start, limit=limit, size=0, total=0
-            )
-            return {"results": [], "start": start, "limit": limit, "size": 0, "_links": links}
-    else:
-        container = None
+    container = _content_space(conn, ids, space_key) if space_key else None
+    if answer == "unfetchable":
+        raise errors_atlassian.content_finder_cannot_fetch(content_type)
+    _refuse_negative_page_params(limit, start)
+    limit = min(limit, 1000)
+    if answer == "not_custom":
+        raise errors_atlassian.not_a_custom_content_type(content_type)
+    if answer == "no_container":
+        raise errors_atlassian.attachment_without_container()
     # Measured on a Confluence Cloud tenant on 2026-10-03 and 2026-10-05: `title` answered the page
     # with that title whether spelled as stored, in lower case or in upper case, with or without
     # `spaceKey`, with no `next` when asked for one page at a time. A title no page has answered
@@ -1537,10 +1709,27 @@ async def confluence_content_list(request: Request):
     # space alone, and a repeated `title` in either order (`_str_param` joins it with a comma); an
     # empty `title` filters nothing.
     title = _str_param(request, "title") or None
-    total = store.count_documents(conn, "confluence", container, ids, title=title)
-    rows = store.list_documents(
-        conn, "confluence", container, ids, limit=limit, offset=start, title=title
-    )
+    if answer is None:
+        # A type Confluence does not have: refused on its own, and beside a space or a title the
+        # filter that matches nothing.
+        if container is None and title is None:
+            raise errors_atlassian.unknown_content_type(content_type)
+        total, rows = 0, []
+    else:
+        subtype = content_type if _str_param(request, "type") else None
+        total = store.count_documents(
+            conn, "confluence", container, ids, title=title, subtype=subtype
+        )
+        rows = store.list_documents(
+            conn,
+            "confluence",
+            container,
+            ids,
+            limit=limit,
+            offset=start,
+            title=title,
+            subtype=subtype,
+        )
     results = [_confluence_page(conn, request, r, expand) for r in rows]
     links = _confluence_envelope(
         request, "/rest/api/content", start=start, limit=limit, size=len(rows), total=total
@@ -2001,12 +2190,75 @@ def _int_param(
             raise ValueError(cleaned)
         n = int(cleaned)
     except ValueError:
-        raise errors_atlassian.integer_conversion_failure(request.url.path, name, values) from None
+        raise errors_atlassian.integer_conversion_failure(
+            _echoed_path(request), name, values
+        ) from None
     if not width[0] <= n <= width[1]:
         # Python's int is unbounded, so a page size computed from a timestamp or a byte count
         # flowed into the query where real answered 400.
-        raise errors_atlassian.integer_conversion_failure(request.url.path, name, values)
+        raise errors_atlassian.integer_conversion_failure(_echoed_path(request), name, values)
     return n
+
+
+# The words `_bool_param` reads, and the value each one stands for.
+_JIRA_QUERY_BOOLEANS = {
+    "true": True,
+    "on": True,
+    "yes": True,
+    "1": True,
+    "false": False,
+    "off": False,
+    "no": False,
+    "0": False,
+}
+
+
+def _bool_param(request: Request, name: str, default: bool | None = None) -> bool | None:
+    """One query parameter as a boolean, read the way Jira reads `search/jql`'s `fieldsByKeys` and
+    `failFast` (Jira Cloud, 2026-10-12 and 2026-10-13).
+
+    The first value is the one read. What Java's `String.trim` removes comes off it, every character
+    up to U+0020 at either end (`%01true` is read), and no character past U+0020 does (`%C2%A0true`
+    and `%E2%80%80true` are refused). What is left matches a key of :data:`_JIRA_QUERY_BOOLEANS` in
+    any case, compared the way Java's `equalsIgnoreCase` compares, which also reads `ſ` (U+017F) as
+    `s`. A lone empty value is the default. A value the trim empties is refused (`%20`, `%01`), and
+    so is an empty first value of a repeated parameter (`?fieldsByKeys=&fieldsByKeys=yes`).
+    """
+    values = request.query_params.getlist(name)
+    if not values or values == [""]:
+        return default
+    word = values[0].strip(_JAVA_TRIMMED).lower().replace("\u017f", "s")
+    if word not in _JIRA_QUERY_BOOLEANS:
+        raise errors_atlassian.integer_conversion_failure(_echoed_path(request), name, values)
+    return _JIRA_QUERY_BOOLEANS[word]
+
+
+def _jira_long_list_param(request: Request, name: str) -> list[int]:
+    """Every value of a repeated query parameter as a Java `long`, as Jira converts the
+    `reconcileIssues` of a `search/jql` GET (Jira Cloud, 2026-10-12).
+
+    `?reconcileIssues=1&reconcileIssues=2` is served, and a value that will not convert is refused
+    wherever it sits: `1&a` names the array as `a&1` does, where :func:`_int_param` reads the first
+    value alone. A value :func:`errors_atlassian.strip_java_whitespace` empties is passed over, as
+    in `?reconcileIssues=%20&reconcileIssues=1`. The rest convert by :func:`_int_param`'s rules, so
+    `1,2` is refused rather than split.
+    """
+    values = request.query_params.getlist(name)
+    numbers = []
+    for raw in values:
+        cleaned = errors_atlassian.strip_java_whitespace(raw)
+        if cleaned == "":
+            continue
+        try:
+            if "_" in cleaned or any(ch.isspace() for ch in cleaned):
+                raise ValueError(cleaned)
+            n = int(cleaned)
+        except ValueError:
+            n = None
+        if n is None or not JAVA_LONG[0] <= n <= JAVA_LONG[1]:
+            raise errors_atlassian.integer_conversion_failure(_echoed_path(request), name, values)
+        numbers.append(n)
+    return numbers
 
 
 def _reject_json_constant(value: str):
@@ -2088,7 +2340,7 @@ async def _jira_search_body(request: Request) -> dict:
     """
     content_type = request.headers.get("content-type")
     if (content_type or "").split(";")[0].strip().lower() != "application/json":
-        raise errors_atlassian.unsupported_media_type(request.url.path, content_type)
+        raise errors_atlassian.unsupported_media_type(_echoed_path(request), content_type)
     raw = await request.body()
     if not raw:
         raise errors_atlassian.body_not_read(errors_atlassian.BODY_EMPTY)
@@ -2146,15 +2398,15 @@ def _confluence_page_params(
     *,
     default: int = 25,
     cap: int | None = None,
-    start_bound: int | None = None,
     refuse_zero: bool = False,
 ) -> tuple[int, int]:
     """Confluence's `limit` and `start`, which refuse a negative where Jira's clamp one.
 
-    Measured on the six routes that call it, `content` and `space` on 2026-09-14, `child/page`,
-    `child/comment` and `label` on 2026-09-23 and `child/attachment` on 2026-10-10: `?limit=-1` and
-    `?start=-1` are 400. Unclamped, `content` would hand them to SQLite, which reads a negative
-    LIMIT as no limit at all and so would answer `?limit=-1` with the whole collection.
+    Measured on the five routes that call it, `space` on 2026-09-14, `child/page`, `child/comment`
+    and `label` on 2026-09-23 and `child/attachment` on 2026-10-10: `?limit=-1` and `?start=-1` are
+    400. Unclamped, a listing would hand them to SQLite, which reads a negative LIMIT as no limit at
+    all and so would answer `?limit=-1` with the whole collection. `content` reads the pair itself,
+    since it puts refusals of its own between these (``_CONTENT_TYPES``).
 
     Order is measured too, because both parameters can be wrong at once. Conversion comes first for
     BOTH — `?limit=-1&start=abc` is the conversion failure about `abc`, not the negative about
@@ -2163,11 +2415,6 @@ def _confluence_page_params(
 
     The CQL search reads its own pair (:func:`_cql_page_param`), JAX-RS-bound rather than Spring's,
     and shares :func:`_refuse_negative_page_params`, which is measured on that route too.
-
-    ``start_bound`` is `content`'s alone and sits between the two refusals above, measured with
-    both wrong at once: `?limit=abc&start=100001` is the conversion failure, `?limit=-1&
-    start=100001` the bound, and `?spaceKey=NOPE&start=100001` the bound rather than the unknown
-    space's 404.
 
     ``refuse_zero`` is `label`'s alone: it answers `?limit=0` with a 400 where every other listing
     answers an empty page (:func:`backlot.errors.atlassian.zero_limit_not_allowed`). It is reached
@@ -2183,8 +2430,6 @@ def _confluence_page_params(
     """
     limit = _int_param(request, "limit", default)
     start = _int_param(request, "start", 0)
-    if start_bound is not None and start > start_bound:
-        raise errors_atlassian.start_too_large()
     _refuse_negative_page_params(limit, start)
     if refuse_zero and limit == 0:
         raise errors_atlassian.zero_limit_not_allowed()
@@ -2300,6 +2545,26 @@ def _cql_position(matched: list, sort_value) -> int:
 # neighbours: an empty page on `space` and on `child/page`, and on the CQL search the page `start`
 # does not position (:func:`_cql_position`).
 _CONTENT_START_BOUND = 100_000
+# The types `content?type=` knows, and what each answers. Measured on a Confluence Cloud site on
+# 2026-10-10, each type alone, beside a known space, an unknown one and a title, and beside a
+# `limit` or `start` below zero and a `start` past `_CONTENT_START_BOUND`, matched as sent (`Page`,
+# `Blogpost` and `COMMENT` are no type). After the conversion 400, a known type refuses a `start`
+# past the bound, where a type Confluence does not have never reads it; then an unknown space is the
+# 404; then `comment` and `folder` are `content_finder_cannot_fetch`'s 501; then a negative `limit`
+# or `start` is the 400; then `whiteboard`, `database` and `embed` are `not_a_custom_content_type`'s
+# 400 and `attachment` is `attachment_without_container`'s 500, beside a space or a title as alone.
+# A type not in this table is `unknown_content_type`'s 501 alone, and an empty page beside a known
+# space or a title, whatever `start` is.
+_CONTENT_TYPES = {
+    "page": "listed",
+    "blogpost": "listed",
+    "comment": "unfetchable",
+    "folder": "unfetchable",
+    "whiteboard": "not_custom",
+    "database": "not_custom",
+    "embed": "not_custom",
+    "attachment": "no_container",
+}
 
 
 def _cql_cursor(served: list, matched: list, position: int) -> str | None:
@@ -2323,10 +2588,14 @@ def _cql_cursor(served: list, matched: list, position: int) -> str | None:
 
 
 def _confluence_carried(
-    request: Request, *, first: tuple[str, ...] = ("expand",), own: tuple[str, ...] = ()
-) -> tuple[str, str]:
-    """The request's other parameters, split into what leads `limit`/`start` in a page link and
-    what trails `start`.
+    request: Request,
+    *,
+    first: tuple[str, ...] = ("expand",),
+    own: tuple[str, ...] = (),
+    head: tuple[str, ...] = (),
+) -> tuple[str, str, str]:
+    """The request's other parameters, split into what leads everything else in a page link, what
+    leads `limit`/`start` and what trails `start`.
 
     Measured 2026-09-17 and 2026-09-22: `expand` leads `limit`/`start`, and on `prev` it leads the
     marker as well. Where a name real does not read lands is a Java map's iteration order rather
@@ -2334,14 +2603,23 @@ def _confluence_carried(
     each on its own request — so the names in ``first`` lead and everything else trails in the
     order the caller sent it, which reproduces the `cql` and `nonce` cases and not the other two.
 
+    ``head`` names what a route's links carry ahead of all of that, the marker and `expand`
+    included: `space` carries `spaceKey` there, on `next`, `prev` and `self` alike, whichever order
+    it was sent in beside `expand` (measured 2026-10-12).
+
     ``own`` names what the route writes into its links itself, so it is not carried as well.
     """
-    lead, trail = [], []
+    front, lead, trail = [], [], []
     for name, value in request.query_params.multi_items():
         if name in ("limit", "start", "next", "prev", *own):
             continue
-        (lead if name in first else trail).append(f"{name}={quote(str(value), safe='')}")
-    return ("&".join(lead) + "&" if lead else "", "&".join(trail))
+        pair = f"{name}={quote(str(value), safe='')}"
+        (front if name in head else lead if name in first else trail).append(pair)
+    return (
+        "&".join(front) + "&" if front else "",
+        "&".join(lead) + "&" if lead else "",
+        "&".join(trail),
+    )
 
 
 def _confluence_envelope(
@@ -2355,6 +2633,7 @@ def _confluence_envelope(
     cursor: str | None = None,
     sent_cursor: str | None = None,
     reached: int | None = None,
+    head: tuple[str, ...] = (),
 ) -> dict:
     """`_links` as every paged Confluence listing answers it: `base`, `context` and `self` on every
     page, plus `next`/`prev` from :func:`backlot.pagination.confluence_page_links`.
@@ -2370,9 +2649,13 @@ def _confluence_envelope(
     :func:`backlot.pagination.confluence_page_links` counts it. Measured 2026-09-23 following `next`
     three hops at `limit=0`, `1` and `2`: the sent one is not carried the way other parameters are,
     so `self` holds no cursor and `next` the new one alone, and `prev` is where it goes back out.
+
+    ``head`` is passed to :func:`_confluence_carried`, which says where those parameters ride.
     """
-    lead, trail = _confluence_carried(request, own=() if sent_cursor is None else ("cursor",))
-    query = "&".join(p for p in (lead.rstrip("&"), trail) if p)
+    front, lead, trail = _confluence_carried(
+        request, own=() if sent_cursor is None else ("cursor",), head=head
+    )
+    query = "&".join(p for p in (front.rstrip("&"), lead.rstrip("&"), trail) if p)
     links = {
         "base": f"{_site(request)}/wiki",
         "context": "/wiki",
@@ -2380,7 +2663,9 @@ def _confluence_envelope(
     }
     sent = quote(sent_cursor, safe="") if sent_cursor else None
     links.update(
-        confluence_page_links(route, start, limit, size, total, lead, trail, cursor, sent, reached)
+        confluence_page_links(
+            route, start, limit, size, total, lead, trail, cursor, sent, reached, head=front
+        )
     )
     return links
 
@@ -2586,7 +2871,8 @@ def _echoed_path(request: Request) -> str:
 
     Real collapses an interior run of slashes in what it echoes and keeps a trailing one, where
     routing ignores both (``backlot.main.normalise_the_slashes_in_an_atlassian_path``, which
-    stashes the collapsed spelling on the scope for this).
+    stashes the collapsed spelling on the scope for this). Measured 2026-10-10 on Jira's 415,
+    conversion 400 and 405, each of which keeps the trailing slash in `instance`.
     """
     return request.scope.get("atlassian_echo_path", request.url.path)
 
@@ -2766,7 +3052,7 @@ async def unmatched_path(request: Request, rest: str) -> Response:
     if _some_atlassian_route_matches(request):
         if request.method == "OPTIONS":
             return _options_answer(request)
-        raise errors_atlassian.method_not_allowed(request.url.path, request.method)
+        raise errors_atlassian.method_not_allowed(_echoed_path(request), request.method)
     path = request.url.path
     vendor_path = _vendor_path(path)
     anonymous = auth.atlassian_caller(request).is_anonymous
