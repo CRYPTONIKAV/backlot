@@ -846,9 +846,10 @@ def _website_refusal(q) -> Response | None:
     return None
 
 
-def _key_selected(q) -> list[str]:
-    """The selectors a GET or a HEAD at a key's path carries, `annotationName` among them when no
-    `annotation` names the operation it belongs to: alone, real refused it at a key with "Unexpected
+def _key_selected(q, selectors: frozenset[str] | None = None) -> list[str]:
+    """The selectors out of ``selectors`` a request at a key's path carries, a GET's and a HEAD's
+    unless the caller passes its own, `annotationName` among them when no `annotation` names the
+    operation it belongs to: alone, real refused it at a key with "Unexpected
     query string parameter" under `ResourceType` on a GET and with the 400 on a HEAD, and beside
     another selector it is the conflict (`acl, annotationName`), before the credential and the
     bucket (measured 2026-09-29). Not every front end of real's refuses it on a GET: asked one
@@ -859,6 +860,12 @@ def _key_selected(q) -> list[str]:
     listing, as real leaves it. `partNumber` beside a selector other than `uploadId` is the conflict
     too (`?partNumber=1&tagging` is "partNumber, tagging", same date); alone it is GetObject's
     (``_part_refusal``), and beside `uploadId` UploadPart.
+
+    Beside an `annotation` that names the operation and another selector or a `partNumber`,
+    `annotationName` is among them too: `?annotation&annotationName=x&acl` is the conflict "acl,
+    annotation, annotationName" and `?annotation&partNumber=1&annotationName=x` "annotation,
+    annotationName, partNumber", on a GET and on each write, where `?annotation&annotationName=x`
+    alone is the annotation's own operation (2026-10-17).
 
     `annotation` is read from its first value, as ``_first`` reads it, and names the operation
     only when that value is empty: `?annotation=x` is GetObject, so an `annotationName` beside it is
@@ -872,10 +879,13 @@ def _key_selected(q) -> list[str]:
     2026-10-14).
 
     An `OPTIONS` at a key's path reads them the same way (``_cors_preflight``)."""
-    selected = _selected(q, _OBJECT_READ_SELECTORS)
+    selected = _selected(q, _OBJECT_READ_SELECTORS if selectors is None else selectors)
     if "annotation" in selected and _first(q, "annotation") != "":
         selected.remove("annotation")
-    if "annotationName" in q and "annotation" not in q:
+    if "annotationName" in q and (
+        "annotation" not in q
+        or ("annotation" in selected and (len(selected) > 1 or "partNumber" in q))
+    ):
         selected = sorted([*selected, "annotationName"])
     if "partNumber" in q and selected and selected != ["uploadId"]:
         selected = sorted([*selected, "partNumber"])
@@ -3236,7 +3246,15 @@ async def object_method_refusal(request: Request, bucket: str, key: str) -> Resp
     and with `<x/>` and a bad `Content-MD5`, without and with `annotationName`; a V2 header with
     an unknown key and a V2 query got the same 400 at the public object. There, a bearer header,
     a V2 header lacking its date and an expired V2 query kept their credential refusals; beside
-    `acl` each was the conflict, as was `annotation&website=x` unsigned at both paths."""
+    `acl` each was the conflict, as was `annotation&website=x` unsigned at both paths.
+
+    A write reads its selectors as a GET does, through ``_key_selected``, and answers two of them
+    with the conflict ahead of a valued `website`: `acl&website=x` is "acl, website". Measured
+    2026-10-17 at the same two keys on `PUT`, `POST`, `DELETE` and `PATCH`: 17 queries naming
+    `annotationName` or `partNumber` answered the GET's 400 unsigned at both keys and signed with
+    Signature Version 4 at the public one, and nine of them, with `acl&website=x` and
+    `tagging&website=x`, did with a bearer header and with a V2 signature by an unknown key, a
+    garbage `Content-MD5` and a body."""
     method = request.method
     if method == "OPTIONS":
         selected = _key_selected(request.query_params)
@@ -3246,12 +3264,12 @@ async def object_method_refusal(request: Request, bucket: str, key: str) -> Resp
             return _argument_error("Unexpected query string parameter", "ResourceType", selected[0])
         return _cors_preflight(request, _CORS_DISABLED)
     q = request.query_params
-    selected = _selected(q, frozenset(_OBJECT_PATH_WRITE_SELECTORS))
-    if "annotation" in selected and _first(q, "annotation") != "":
-        selected.remove("annotation")
-    if "annotation" in selected:
-        if len(selected) > 1:
-            return _conflict(selected)
+    selected = _key_selected(q, frozenset(_OBJECT_PATH_WRITE_SELECTORS))
+    if len(selected) > 1:
+        return _conflict(selected)
+    if selected == ["annotationName"]:
+        return _argument_error("Unexpected query string parameter", "ResourceType", selected[0])
+    if selected == ["annotation"]:
         refused = _sigv4_only_refusal(request)
         if refused is not None:
             return refused

@@ -481,6 +481,7 @@ _OPTIONS_KEY_CONFLICTS = [
     *_OPTIONS_CONFLICTS,
     ("acl&retention", "acl, retention"),
     ("annotationName=x&acl", "acl, annotationName"),
+    ("annotation&annotationName=x&acl", "acl, annotation, annotationName"),
 ]
 _OPTIONS_QUERY_ROWS = [
     *[
@@ -2525,13 +2526,25 @@ def test_annotation_writes_keep_a_malformed_v2_credentials_refusal(live_server, 
         ("annotation=&annotation=x&acl", "acl, annotation"),
         ("annotation&max-annotation-results=abc", None),
         ("annotation=&annotation=x", None),
+        ("annotationName=x", "annotationName"),
+        ("annotationName=x&acl", "acl, annotationName"),
+        ("annotationName=x&website=x", "annotationName, website"),
+        ("annotation&annotationName=x&acl", "acl, annotation, annotationName"),
+        ("partNumber=1&acl", "acl, partNumber"),
+        ("partNumber=1&website=x", "partNumber, website"),
+        ("annotationName=x&partNumber=1", "annotationName, partNumber"),
+        ("annotation&partNumber=1", "annotation, partNumber"),
+        ("annotation&partNumber=1&annotationName=x", "annotation, annotationName, partNumber"),
+        ("annotation=v&annotationName=x&acl&tagging", "acl, tagging"),
+        ("acl&website=x", "acl, website"),
     ],
 )
-def test_annotation_write_conflicts_precede_credentials_and_body_checks(
+def test_annotation_and_part_write_refusals_precede_credentials_and_body_checks(
     live_server, method, credential, query, names
 ):
-    """``object_method_refusal`` records the conflict ahead of the credential and body checks;
-    the first annotation value selects it, and a write does not parse the listing's limit."""
+    """Real's answer on each write and credential here, as ``object_method_refusal`` records it:
+    ``names`` is the conflict's, a lone `annotationName` naming only itself, and None the
+    Signature Version 4 refusal."""
     import httpx
 
     base_url, settings = live_server
@@ -2551,7 +2564,9 @@ def test_annotation_write_conflicts_precede_credentials_and_body_checks(
     if names is not None:
         expected = {
             "Code": "InvalidArgument",
-            "Message": f"Conflicting query string parameters: {names}",
+            "Message": f"Conflicting query string parameters: {names}"
+            if ", " in names
+            else "Unexpected query string parameter",
             "ArgumentName": "ResourceType",
             "ArgumentValue": names.split(", ")[0],
         }
@@ -2591,12 +2606,13 @@ def test_a_valued_annotation_on_a_write_is_the_object_operation(live_server, met
 _FULL_RANGE = f"bytes 0-{len(OBJECT_TEXT) - 1}/{len(OBJECT_TEXT)}"
 _FIRST_TEN = f"bytes 0-9/{len(OBJECT_TEXT)}"
 # The object's own answer to a GET and a HEAD, as real answered its object (2026-09-29 and
-# 2026-09-30): the query, the headers sent, the status, the range the answer names (None: none) and
-# whether it carries the object's checksum.
+# 2026-09-30; the row with `annotation=v` is `_key_selected`'s): the query, the headers sent, the
+# status, the range the answer names (None: none) and whether it carries the object's checksum.
 _OBJECT_ANSWER_ROWS = [
     ("", {}, 200, None, False),
     ("versionId=null", {}, 200, None, False),
     ("partNumber=1", {}, 206, _FULL_RANGE, False),
+    ("annotation=v&annotationName=x&partNumber=1", {}, 206, _FULL_RANGE, False),
     ("partNumber=01", {}, 206, _FULL_RANGE, False),
     ("partNumber=1&versionId=null", {}, 206, _FULL_RANGE, False),
     ("", {"Range": "bytes=0-9"}, 206, _FIRST_TEN, False),
@@ -3350,6 +3366,13 @@ _PARAMETER_ROWS = [
     ("GET", "/s3/eng-artifacts/runbooks/oncall.md?annotationName=v&website=v", 400,
      "Conflicting query string parameters: annotationName, website",
      _argued("ResourceType", "annotationName")),
+    # ... and in the conflicts `_key_selected` counts it in beside `annotation`.
+    ("GET", "/s3/eng-artifacts/runbooks/oncall.md?annotation&annotationName=v&acl", 400,
+     "Conflicting query string parameters: acl, annotation, annotationName",
+     _argued("ResourceType", "acl")),
+    ("GET", "/s3/no-such-bucket/k.txt?annotation&partNumber=1&annotationName=v", 400,
+     "Conflicting query string parameters: annotation, annotationName, partNumber",
+     _argued("ResourceType", "annotation")),
     # ListObjectVersions' own, before the bucket and after it.
     ("GET", "/s3/no-such-bucket?versions&max-keys=abc", *_MAX_KEYS_ABC),
     ("GET", "/s3/no-such-bucket?versions&version-id-marker=x", *_MARKER_WITHOUT_KEY),
