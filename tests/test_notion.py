@@ -157,7 +157,7 @@ def test_notion_an_operation_notion_publishes_answers_the_credential(
     Backlot serves it, with `abc` in an id's place and with one trailing slash, where the same
     path under a method Notion does not publish for it is the URL's 400 (the rows above).
     A token and a version that clear both get the URL's 400 here, as Backlot has no operation to
-    run: the gap the baseline's `missing_operation` row acknowledges."""
+    run: the gap the baseline's `missing` operation acknowledges."""
     body = {} if method in ("POST", "PATCH") else None
     bare = client.request(method, path, json=body)
     assert bare.status_code == 401 and bare.json()["message"] == _NOT_A_BEARER, path
@@ -506,14 +506,83 @@ def test_notion_search_reads_query_and_filter_by_their_types_like_real(
         assert payload["request_id"] == r.headers["x-notion-request-id"]
 
 
-def test_notion_search_filter_database_only(client, notion_h):
+@pytest.mark.parametrize(
+    "version, value, kind, served_id",
+    [
+        ("2025-09-03", "data_source", "data_source", synth.notion_data_source_id("nt-tasks-db")),
+        ("2026-03-11", "data_source", "data_source", synth.notion_data_source_id("nt-tasks-db")),
+        ("2022-06-28", "data_source", "database", synth.notion_id("nt-tasks-db")),
+        ("2022-06-28", "database", "database", synth.notion_id("nt-tasks-db")),
+    ],
+)
+def test_notion_search_filter_keeps_the_databases_in_the_versions_shape(
+    client, admin_h, version, value, kind, served_id
+):
+    """The `data_source` and `database` filters at each version, as the comment in `search`
+    records."""
     s = client.post(
         "/notion/v1/search",
-        json={"query": "", "filter": {"property": "object", "value": "database"}},
-        headers=notion_h,
+        json={"query": "", "filter": {"property": "object", "value": value}},
+        headers={**admin_h, "Notion-Version": version},
     ).json()
-    assert s["results"] and all(r["object"] == "database" for r in s["results"])
-    assert any(r["id"] == synth.notion_id("nt-tasks-db") for r in s["results"])
+    assert {r["object"] for r in s["results"]} == {kind}
+    assert served_id in {r["id"] for r in s["results"]}
+
+
+@pytest.mark.parametrize(
+    "query, row_keys",
+    [
+        ("", {"title", "Status", "Priority"}),
+        ("?filter_properties=Status", {"Status"}),
+        ("?filter_properties=title", {"title"}),
+        ("?filter_properties=Status&filter_properties=Priority", {"Status", "Priority"}),
+        ("?filter_properties=nope", set()),
+        ("?filter_properties=", set()),
+        ("?filter_properties[]=Status", {"Status"}),
+        ("?filter_properties%5B%5D=Status", {"Status"}),
+        ("?filter_properties[20]=Status&filter_properties=Priority", {"Status", "Priority"}),
+        ("?filter_properties=Status&filter_properties[x]=Priority", {"Status"}),
+        ("?filter_properties=Status&filter_properties[0][x]=Priority", {"Status"}),
+        ("?filter_properties[0][x]=Status", set()),
+        ("?filter_properties[0]=Status&filter_properties[0]=Priority", set()),
+        ("?filter_properties[x]=Status", None),
+        ("?filter_properties[21]=Status", None),
+        ("?filter_properties[01]=Status", None),
+        ("?filter_properties[]=Status&filter_properties[x]=Priority", None),
+        ("?filter_properties[x]=Status&filter_properties=Priority", None),
+    ],
+)
+def test_notion_search_filter_properties_keeps_only_the_named_row_properties(
+    client, notion_h, query, row_keys
+):
+    """``row_keys`` of ``None`` is real's 400, answered ahead of the body's own error."""
+    body = {"query": "", "filter": {"property": "object", "value": "page"}}
+    r = client.post(
+        f"/notion/v1/search{query}",
+        json=body if row_keys is not None else {**body, "query": 5},
+        headers=notion_h,
+    )
+    if row_keys is None:
+        assert (r.status_code, r.json()["code"], r.json()["message"]) == (
+            400,
+            "validation_error",
+            'The value of "filter_properties" in query parameters must be a string or list of '
+            "strings",
+        )
+        # behind the credential and the version
+        anon = {"Notion-Version": notion_h["Notion-Version"]}
+        r = client.post(f"/notion/v1/search{query}", json=body, headers=anon)
+        assert (r.status_code, r.json()["code"]) == (401, "unauthorized")
+        unversioned = {"Authorization": notion_h["Authorization"]}
+        r = client.post(f"/notion/v1/search{query}", json=body, headers=unversioned)
+        assert (r.status_code, r.json()["code"]) == (400, "missing_version")
+        return
+    # A row outside a database is the workspace page and keeps its title.
+    results = r.json()["results"]
+    row = next(r for r in results if r["id"] == synth.notion_id("nt-task-1"))
+    assert set(row["properties"]) == row_keys
+    outside = next(r for r in results if r["parent"]["type"] == "workspace")
+    assert "title" in outside["properties"]
 
 
 def test_notion_users(client, notion_h):
@@ -521,8 +590,11 @@ def test_notion_users(client, notion_h):
     assert me["object"] == "user" and me["type"] == "bot"
     lst = client.get("/notion/v1/users", headers=notion_h).json()
     assert lst["results"] and all(u["object"] == "user" for u in lst["results"])
-    uid = lst["results"][0]["id"]
-    assert client.get(f"/notion/v1/users/{uid}", headers=notion_h).json()["id"] == uid
+    person = next(u for u in lst["results"] if u.get("type") == "person")
+    assert person["person"]["email_verified"] is True
+    uid = person["id"]
+    retrieved = client.get(f"/notion/v1/users/{uid}", headers=notion_h).json()
+    assert retrieved["id"] == uid and retrieved["person"]["email_verified"] is True
 
 
 def test_notion_unauth_is_401(client):
@@ -907,7 +979,8 @@ def test_notion_user_and_block_shape(tmp_path):
     conn = _notion_conn(tmp_path)
     u = _user_obj(conn, "ava@acme.com")
     assert u["object"] == "user" and u["type"] == "person"
-    assert u["person"]["email"] == "ava@acme.com"
+    assert list(u["person"]) == ["email", "email_verified"]
+    assert u["person"]["email"] == "ava@acme.com" and u["person"]["email_verified"] is True
     assert u["id"] == synth.notion_user_id("ava@acme.com")
     blocks = synth.notion_blocks("nf-page", "# On-call\n\nRoll back and page.")
     b = blocks[0]

@@ -1,6 +1,6 @@
 """Auth helpers shared by the vendor routers.
 
-Each vendor carries credentials differently (Slack bearer/query token, Google/GitHub
+Each vendor carries credentials differently (Slack bearer/form token, Google/GitHub
 bearer, Atlassian Basic email:api_token, Linear a scheme-less API key). These helpers
 extract the raw token, resolve it to a :class:`~backlot.acl.Caller` via the app's ACL, and
 compute the caller's visible principal set. Error *shaping* (Slack's ``ok:false`` vs a
@@ -43,6 +43,105 @@ def bearer_token(request: Request) -> str | None:
     if len(parts) == 2 and parts[0].lower() in ("bearer", "token"):
         return parts[1].strip()
     return None
+
+
+# An `Authorization` value as api.github.com splits it: the scheme, then everything after it.
+_GITHUB_SCHEME = re.compile(r"([^ \t,]*)(.*)", re.DOTALL)
+# A `Basic` value api.github.com reads as base64: four-character groups, the last of which may be
+# two characters and `==` or three and `=`. Written out rather than left to `base64.b64decode`,
+# whose `validate=True` reads `abcd=` as base64 on Python 3.11 and refuses it from 3.12 on.
+_GITHUB_BASE64 = re.compile(r"(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?")
+
+
+def github_credential(request: Request) -> str | None:
+    """The credential a GitHub request carries, read the way api.github.com reads ``Authorization``:
+    ``None`` for a request it serves as anonymous, and otherwise the string to resolve as a token:
+    what follows `Bearer` or `token`, so ``","`` for ``Bearer,``; the token a `Basic` value names;
+    or ``""`` for a `Basic` value refused with no token to look up, and for a request carrying more
+    than one `Authorization`.
+
+    Measured on `GET /rate_limit` on 2026-10-14 and 2026-10-16, each value on a URL of its own,
+    where an anonymous caller is served 200 and a credential that does not resolve is the 401 "Bad
+    credentials"::
+
+        Bearer or token, in any case, alone or followed by a space,      401
+          a tab or a comma and then anything
+        Basic, in any case, alone, followed by a comma, or followed       401
+          by a value that is not base64 once its spaces are dropped:
+          a, abcde, ====, Zm9vOmJhcg, -_-_, a=bc, abcd=, !!!!, ab<TAB>cd
+        Basic, a tab, and a value that is not base64, in a header         200
+          with no comma: <TAB>!!!!, <TAB>a, <TAB>abcd=, <TAB><TAB>!!!!
+        Basic, a tab, and a comma anywhere after it: <TAB>,!!!!,          401
+          <TAB> ,!!!!, <TAB>!!,!!, <TAB>!!!!,
+        Basic followed by base64 that names no token: abcd,               200
+          Zm9vOmJhcg==, +/+/, ab==, abc=, ab cd, a b c d, <TAB>Zm9v
+        any other first word, or none: nope, Digest, OAuth, Bear,         200
+          Bearerx, bearer:, Bearer=
+        a no-break space or NEL in place of a space: Bearer<NBSP>nope,    200
+          Bearer<NEL>, <NBSP>Bearer <t>, Basic<NBSP> and base64
+
+    And with a token that resolves: ``Bearer <t>``, ``bearer <t>``, ``token <t>``, a second space
+    or a tab before it are its 200, and so is ``Basic``, then a space or a tab, then the base64 of
+    ``x:<t>``, ``nope:<t>``, ``<t>:x-oauth-basic``, ``<t>:`` or ``<t>``; ``Bearer,<t>``,
+    ``Bearer ,<t>``, ``Bearer <t> x``, ``Bearer <t>,`` and ``Basic <t>`` are the 401; ``<t>`` alone
+    is served as anonymous, and so is ``Basic`` with the base64 of ``<t>:x``, ``<t>:nope``,
+    ``<t>:X-OAUTH-BASIC``, ``<t>:x-oauth-basic:`` or ``<t>: ``.
+
+    So real splits the scheme off at the first space, tab or comma, reads the password of a `Basic`
+    value that decodes, or its user when there is no colon or the password is empty or
+    `x-oauth-basic`, and serves one that names no token as no credential at all, as it does an
+    unknown scheme. A `Basic` value that does not decode is no credential either where
+    :func:`github_scheme_then_a_tab` holds. A space and a tab are the only whitespace it trims:
+    ``Bearer <NBSP>``, ``Bearer <t><NBSP>``, ``Bearer <NBSP><t>``, ``Bearer <t><NEL>``,
+    ``Bearer <t><0x1F>``, ``Basic <NBSP>`` and base64, and the base64 of ``x:<t>`` followed by a
+    no-break space were each the 401 (2026-10-16).
+
+    More than one `Authorization` header is the 401 whatever each holds, with none of the five
+    `x-ratelimit-*`: on `/rate_limit` and `/search/issues`, ``Bearer <t>`` with a second copy, and
+    with ``Bearer nope``, ``Digest x`` or an empty value in either order; on `/rate_limit`,
+    ``token <t>`` with ``Bearer <t>``, ``Digest x`` with ``Digest y`` and three copies of ``Bearer
+    <t>``; on eight operations Backlot does not serve (`GET /zen`, `PATCH /user`, ...), two copies
+    of ``Bearer <t>``, ``Digest x`` with ``Digest y`` and ``Bearer<TAB>nope`` with ``Bearer <t>``.
+    Two copies of ``Bearer <t>`` answered no version echo on each of those routes and on `/user`,
+    `/user/repos` and `/repos/psf/requests`, and five of them moved neither the token's window nor
+    the address's (2026-10-17).
+    """
+    if _repeated_authorization(request):
+        return ""
+    scheme, rest = github_scheme(request)
+    if scheme in ("bearer", "token"):
+        return rest.strip(" \t")
+    if scheme == "basic":
+        value = rest.lstrip(" \t").replace(" ", "")
+        if not value or not _GITHUB_BASE64.fullmatch(value):
+            return None if github_scheme_then_a_tab(request) else ""
+        user, _, password = base64.b64decode(value).decode("utf-8", "replace").partition(":")
+        token = user if password in ("", "x-oauth-basic") else password
+        return token if acl(request).resolve(token) is not None else None
+    return None
+
+
+def github_scheme(request: Request) -> tuple[str, str]:
+    """The `Authorization` value split by :data:`_GITHUB_SCHEME`, the scheme in lower case."""
+    scheme, rest = _GITHUB_SCHEME.fullmatch((_authorization(request) or "").strip(" \t")).groups()
+    return scheme.lower(), rest
+
+
+def github_scheme_then_a_tab(request: Request) -> bool:
+    """Whether a tab follows the scheme :func:`github_scheme` splits off, in the one `Authorization`
+    header a request carries, holding no comma: the spelling real reads apart from the rest, whose
+    rows are in :func:`github_credential`'s table."""
+    header = _authorization(request) or ""
+    return (
+        github_scheme(request)[1].startswith("\t")
+        and "," not in header
+        and not _repeated_authorization(request)
+    )
+
+
+def _repeated_authorization(request: Request) -> bool:
+    """Whether the request carries more than one `Authorization` header."""
+    return len(request.headers.getlist("authorization")) > 1
 
 
 def api_key_token(request: Request) -> str | None:
@@ -168,15 +267,38 @@ def slack_bearer_token(request: Request) -> str | None:
 
 
 def slack_token(request: Request) -> str | None:
-    """Slack accepts the token as a bearer header, query param, or form field. The official
-    slack-go SDK (and Slack's own clients) post it as the ``token`` form field, so fall back to
-    the form stashed on ``request.state._form`` by the slack-form middleware.
+    """The token real Slack reads from a request: the ``token`` form field, then the
+    ``Authorization: Bearer`` header (:func:`slack_bearer_token`).
 
-    Both names are case-sensitive too: ``?TOKEN=`` and a ``TOKEN`` form field are ``not_authed``
-    live, which the exact-key lookups below already answer."""
+    The form field is where the official slack-go SDK and Slack's own clients put the token; the
+    slack-form middleware stashes the form on ``request.state._form``, keeping a field's last
+    value. Real serves a bogus header beside a valid form token as the form token, and answers
+    ``invalid_auth`` to a valid header beside a bogus one. The last value is the one read
+    (``token=<valid>&token=<bogus>`` is ``invalid_auth``), an empty one is no field, and a space
+    is a token that resolves to nobody. A ``TOKEN`` form field is no field either. The query
+    string is not read here; :func:`slack_query_token_refused` answers for it, and its docstring
+    dates the measurement these answers come from."""
     form = getattr(request.state, "_form", None)
     form_field = form.get("token") if form else None
-    return slack_bearer_token(request) or request.query_params.get("token") or form_field
+    return form_field or slack_bearer_token(request)
+
+
+def slack_query_token_refused(request: Request) -> bool:
+    """Whether real Slack answers ``invalid_auth`` for the request's ``token`` query parameter.
+
+    Slack's changelog entry "No more tokens in querystrings for newly created apps"
+    (docs.slack.dev, November 1, 2020) closes that channel to apps created after February 24,
+    2021; Backlot answers as such an app. The user token of an app created on 2026-09-17 drew
+    these answers from slack.com/api on 2026-10-11 and 2026-10-13, on each method
+    ``routers.slack`` authenticates. The parameter's last value is the one read. A non-empty
+    value is refused whatever else the request carries, valid or bogus, and a space or a tab is
+    not empty. An empty one, or ``?token`` with no ``=``, is refused beside a token
+    :func:`slack_token` reads, from the bearer header or the form, and changes nothing otherwise:
+    alone it is ``not_authed``, and so it is beside a header :func:`slack_bearer_token` does not
+    read (``bearer <t>``, ``Basic <c>``). ``?TOKEN=<t>`` is not this parameter."""
+    if "token" not in request.query_params:
+        return False
+    return request.query_params["token"] != "" or slack_token(request) is not None
 
 
 def resolve_bearer(request: Request) -> Caller | None:
@@ -208,26 +330,32 @@ def atlassian_bearer_token(request: Request) -> str | None:
         Bearer <t>      read            bearer <t>      not read
         ' Bearer <t>'   read            BEARER <t>      not read
         Bearer <t>' '   read            token <t>       not read
-                                        OAuth <t>       not read
+        Bearer a<TAB>b  read            OAuth <t>       not read
                                         Bearer  <t>     not read
                                         Bearer<TAB><t>  not read
                                         Bearer<t>       not read
                                         Bearer          not read
+                                        Bearer a b      not read
 
-    The scheme is case-sensitive and separated from the token by exactly one space. Sharing
-    :func:`bearer_token` would authenticate five of those spellings — every "not read" row above
-    but ``OAuth <t>``, ``Bearer<t>`` and the bare ``Bearer`` — so a client sending
-    ``Authorization: token <t>`` would pass every test here and read nothing in production. Slack
-    refuses a different set: it takes the double space this refuses.
-
-    The leading ``strip`` is what serves the ``Bearer <t>' '`` row, so the token needs no second
-    one: nothing with trailing whitespace survives to reach it.
+    The scheme is case-sensitive and separated from the token by exactly one space, and the token
+    holds no space of its own: the `Bearer a b` row above was served anonymously on Jira Cloud on
+    2026-10-12, where a tab, a comma or a dot in the token was read and then refused. Any other byte
+    is the token's own wherever it stands, a tab, U+0085 and U+00A0 among them, and only a space or
+    a tab is trimmed from either end of the header, where Python's ``str.strip`` would take U+0085
+    and U+00A0 too. Measured on Jira Cloud on 2026-10-16 with each latin-1 byte but CR, LF and NUL
+    in four places: alone after `Bearer `, after `Bearer <t>`, before `Bearer <t>` and between
+    `Bearer ` and `<t>`; the control characters but the tab never reach this, the server in front
+    answering them with a 400 on real and here. Sharing :func:`bearer_token` would authenticate six
+    of those spellings — every "not read" row above but ``OAuth <t>``, ``Bearer<t>`` and the bare
+    ``Bearer`` — so a client sending ``Authorization: token <t>`` would pass every test here and
+    read nothing in production. Slack refuses a different set: it takes the double space this
+    refuses.
     """
-    hdr = (_authorization(request) or "").strip()
+    hdr = (_authorization(request) or "").strip(" \t")
     if not hdr.startswith("Bearer "):
         return None
     rest = hdr[len("Bearer ") :]
-    if not rest or rest[0].isspace():
+    if " " in rest:
         return None
     return rest
 
@@ -546,10 +674,11 @@ def resolve_sigv4(request: Request) -> tuple[Caller | None, SigV4Refusal | None]
     Returns ``(caller, None)`` on a valid signature, ``(ANONYMOUS, None)`` for a request carrying
     no credential at all, and ``(None, refusal)`` otherwise. Real S3 reads an unsigned request as
     an anonymous caller's rather than refusing it, and so does this: what an anonymous caller can
-    see is decided where every caller's is, and it can see nothing. A V4 presigned request is one
-    carrying `X-Amz-Algorithm` and a V2 one a request carrying `Signature`; an `X-Amz-Signature`
-    without the first and an `AWSAccessKeyId` without the second are unsigned on real (a public
-    bucket's listing answered the one and a bucket's own owner was refused the other as anonymous).
+    see is decided where every caller's is, and it can see nothing. The `?annotation` reads refuse
+    it instead (``backlot.routers.s3._sigv4_only_refusal``). A V4 presigned request is one carrying
+    `X-Amz-Algorithm` and a V2 one a request carrying `Signature`; an `X-Amz-Signature` without the
+    first and an `AWSAccessKeyId` without the second are unsigned on real (a public bucket's listing
+    answered the one and a bucket's own owner was refused the other as anonymous).
 
     Each refusal is real's own code, message and members, and they come in real's order: measured
     2026-09-29 against `s3.us-east-1.amazonaws.com`, one fault at a time and, where two could meet,

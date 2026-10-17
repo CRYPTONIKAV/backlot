@@ -24,7 +24,7 @@ import re
 from functools import lru_cache
 
 from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, ConfigDict
 
 from backlot import auth, store, synth
@@ -116,6 +116,7 @@ _B_SEARCH = {
     }
 }
 _B_BATCH = {
+    "parameters": [qp("archived", "boolean")],
     "requestBody": {
         "content": {
             "application/json": {
@@ -132,7 +133,7 @@ _B_BATCH = {
                 }
             }
         }
-    }
+    },
 }
 
 
@@ -142,6 +143,55 @@ _B_BATCH = {
 def _error(status: int, message: str, category: str = "VALIDATION_ERROR") -> JSONResponse:
     return JSONResponse(
         status_code=status, content={"status": "error", "message": message, "category": category}
+    )
+
+
+# Real's answer on the record route for an id that parses but names nothing visible: this page,
+# 197 bytes, under a Latin-1 content type although its own `<meta>` says utf-8. `contacts/1`,
+# `contacts/9223372036854775807` and `deals/{a contact's id}` answered it byte for byte the same
+# against api.hubapi.com on 2026-09-30, 2026-10-14 and 2026-10-15.
+_MISSING_RECORD_PAGE = (
+    b"<html>\n<head>\n"
+    b'<meta http-equiv="Content-Type" content="text/html;charset=utf-8"/>\n'
+    b"<title>Error 404 Not Found</title>\n</head>\n"
+    b"<body><h2>HTTP ERROR 404</h2>\n<p>Resource not found</p>\n</body>\n</html>\n"
+)
+
+
+def _missing_record() -> Response:
+    return Response(
+        _MISSING_RECORD_PAGE, status_code=404, media_type="text/html;charset=iso-8859-1"
+    )
+
+
+def _record_id(record_id: str) -> str | JSONResponse:
+    """The id to look up, or real's 404 for one it won't look up.
+
+    Measured on the record and v4 associations routes (api.hubapi.com, 2026-09-30, 2026-10-14):
+    `0<a contact's id>`, `1` and `9223372036854775807` are looked up; `0` and `-1` are
+    `objectId is usually positive.`; `+1`, `1.0`, U+0661, `abc`, `9223372036854775808` and
+    `99999999999999999999999` are `objectId are usually numeric.`, with two spaces. `context.id`
+    holds the id as sent. Those ids fit one reading, applied here to every id: ASCII digits, an
+    optional `-` and leading zeros, naming a signed 64-bit value, looked up above 0 and "positive"
+    otherwise, and anything that doesn't parse "numeric". Real's body also carries a
+    `correlationId`, which this one leaves out."""
+    # At most 19 significant digits, so `int` never meets a string too long for it to convert.
+    m = re.fullmatch(r"(-?)0*([0-9]{1,19})", record_id)
+    value = int(m[1] + m[2]) if m else None
+    if value is not None and -(2**63) <= value < 2**63:
+        if value > 0:
+            return str(value)
+        message = "Object not found. objectId is usually positive."
+    else:
+        message = "Object not found.  objectId are usually numeric."
+    return JSONResponse(
+        status_code=404,
+        content={
+            "status": "error",
+            "message": message,
+            "context": {"id": [record_id]},
+            "category": "OBJECT_NOT_FOUND",
+        },
     )
 
 
@@ -175,6 +225,16 @@ def _flag(raw) -> bool:
     return or no-break space) serve the active one. The Python client `hubspot-api-client` 12.0.0
     sends `True`/`False`, and the Node client `@hubspot/api-client` 14.0.1 sends `true`/`false`."""
     return str(raw or "").lower() == "true"
+
+
+def _hidden_archived(row, request: Request) -> bool:
+    """Whether ``row`` is archived and the request did not ask for archived records, reading
+    `archived` as the listing does (`_flag` of its first value). Measured against api.hubapi.com
+    over a portal with one archived contact (2026-09-30, 2026-10-09): `GET …/{id}` answers it with
+    the 404 a missing id gets, and batch/read with the not-found error a missing id gets, unless the
+    first `archived` is `true` in any letter case; an active contact is served by both whatever
+    `archived` is."""
+    return row["archived"] is not None and not _flag(_first_query(request.query_params, "archived"))
 
 
 def _first_query(qp, name: str):
@@ -341,6 +401,12 @@ _PLURAL = {plural: singular for singular, plural in _SINGULAR.items()}
 # Backlot cannot verify is a name it would be inventing; an unmapped id stays a 400 rather than
 # resolving to a guess.
 #
+# Three more are mapped from real's own answers rather than from that list (measured 2026-10-09
+# and 2026-10-15): `0-18`, `0-72` and `0-64` serve the same records as `communications`,
+# `deal_splits` and `quote_templates` on the listing, and `0-64` on a record, search and batch/read
+# too; `archived=true` on each id is the refusal its name gets, naming the same id; and the v4
+# associations route reads each id on either side as it reads the name.
+#
 # A custom object is a `2-<n>`, and its records are addressed here by the name the corpus gave it.
 # HubSpot's own alias for one is `p_<name>` (or the fully qualified `p<portalId>_<name>`), but both
 # forms answer 400 `Unable to infer object type from: <name>` on a portal that does not hold that
@@ -354,12 +420,15 @@ _TYPE_IDS = {
     "0-7": "products",
     "0-8": "line_items",
     "0-14": "quotes",
+    "0-18": "communications",
     "0-19": "feedback_submissions",
     "0-27": "tasks",
     "0-46": "notes",
     "0-47": "meetings",
     "0-48": "calls",
     "0-49": "emails",
+    "0-64": "quote_templates",
+    "0-72": "deal_splits",
 }
 # The shape of an objectTypeId, for telling "an id I do not know" apart from "not a type at all":
 # HubSpot answers those two with different messages.
@@ -371,13 +440,30 @@ _CANONICAL.update(_SINGULAR)
 _CANONICAL.update(_TYPE_IDS)
 
 
+# `_CANONICAL` keyed by each spelling in upper case, the form `_canonical` reads a segment in.
+_CANONICAL_UPPER = {spelling.upper(): name for spelling, name in _CANONICAL.items()}
+
+
+def _canonical(object_type: str) -> str | None:
+    """The canonical name of a standard object type, read in upper case as real reads the path
+    segment. Asked of api.hubapi.com (2026-09-30, 2026-10-12), `Contacts`, `CONTACT`, `Companies`
+    and `COMPANY` serve the type they spell, and so does a spelling whose upper case is a standard
+    one: `contact` followed by U+017F, the long s, upper-cases to `CONTACTS`, and `companies` with
+    U+0131, the dotless i, in place of its `i` to `COMPANIES`. The company spellings answered as
+    `companies` does on the listing, a record, search and batch/read. `tasks` with U+212A, the
+    Kelvin sign, in place of its `k` is `Unable to infer object type`, since that sign upper-cases
+    to itself. A custom object keeps its exact spelling: the portal measured holds no custom object
+    to ask for in another case."""
+    return _CANONICAL_UPPER.get(object_type.upper())
+
+
 def _aliases(object_type: str) -> list[str]:
     """Every spelling of this object type — plural, singular and objectTypeId — with the one the
     caller asked for first, so a corpus that states two of them keeps the caller's own.
 
     A type outside the standard set is its own only spelling: a custom object is whatever the corpus
     called it."""
-    canonical = _CANONICAL.get(object_type)
+    canonical = _canonical(object_type)
     if canonical is None:
         return [object_type]
     rest = [spelling for spelling in _CANONICAL if _CANONICAL[spelling] == canonical]
@@ -401,7 +487,7 @@ def _resolve_type(request: Request, object_type: str) -> list[str] | None:
     names = _aliases(object_type)
     if any(store.get_container(conn, "hubspot", name) is not None for name in names):
         return names
-    canonical = _CANONICAL.get(object_type)
+    canonical = _canonical(object_type)
     return [canonical] if canonical else None
 
 
@@ -538,6 +624,7 @@ _OPERATOR_INDEXES = frozenset(str(i) for i in range(len(_OPERATORS)))
 # it does not (measured 2026-10-06).
 _TRIM = "".join(map(chr, range(0x21)))
 _WS = re.compile(r"[ \t\n\r]*")
+_LINE_BREAK_RE = re.compile(r"\r\n|\r|\n")
 
 
 def _operator(f: dict):
@@ -547,11 +634,15 @@ def _operator(f: dict):
 def _token_at(raw: bytes, path: tuple) -> tuple[int, int]:
     """Where the value at `path` starts in the JSON body `raw`, as real reports a position: a
     1-based line and a 1-based column counted in UTF-8 bytes, so `ééé` before the value moves it
-    six columns and a CRLF line ending none (measured 2026-10-06). A key the body repeats resolves
-    to its last occurrence, the one `json.loads` keeps."""
-    text = raw.decode(json.detect_encoding(raw), "surrogatepass")
+    six columns and a CRLF line ending none (measured 2026-10-06), a lone CR is a line break and a
+    byte-order mark three columns of line 1 (2026-10-13). A key the body repeats resolves to its
+    last occurrence, the one `json.loads` keeps."""
+    encoding = json.detect_encoding(raw)
+    if encoding == "utf-8-sig":
+        encoding = "utf-8"
+    text = raw.decode(encoding, "surrogatepass")
     decoder = json.JSONDecoder()
-    pos = _WS.match(text).end()
+    pos = _WS.match(text, 1 if text.startswith("\ufeff") else 0).end()
     for step in path:
         pos = _WS.match(text, pos + 1).end()
         if isinstance(step, int):
@@ -569,12 +660,72 @@ def _token_at(raw: bytes, path: tuple) -> tuple[int, int]:
             if text[pos] == ",":
                 pos = _WS.match(text, pos + 1).end()
         pos = found
-    line_start = text.rfind("\n", 0, pos) + 1
+    return _position(text, pos)
+
+
+def _position(text: str, pos: int) -> tuple[int, int]:
+    """The offset `pos` into the decoded body `text` as `_token_at` reports a position."""
+    line_start = 0
+    line = 1
+    for m in _LINE_BREAK_RE.finditer(text[:pos]):
+        line_start = m.end()
+        line += 1
     column = len(text[line_start:pos].encode("utf-8", "surrogatepass")) + 1
-    return text.count("\n", 0, pos) + 1, column
+    return line, column
 
 
-def _refuse_an_operator(raw: bytes, body: dict) -> JSONResponse | None:
+# A JSON string, or one of the three number tokens `json.loads` reads and JSON does not have. A
+# string is matched so that a token spelled inside one is passed over.
+_NON_STANDARD_NUMBER = re.compile(r'"(?:[^"\\]|\\.)*"|-?Infinity|NaN')
+
+
+def _non_standard_number(raw: bytes) -> tuple[tuple[int, int], JSONResponse] | tuple[None, None]:
+    """Where the first `NaN`, `Infinity` or `-Infinity` in a POST body starts, and real's 400 for
+    it; `(None, None)` when the body holds none.
+
+    Measured against api.hubapi.com on 2026-10-12 and 2026-10-13, on `batch/read` and `search`: real
+    refuses the token wherever it stands, in a member it does not read and as the whole body too,
+    names it with its sign, and gives the column just past it, in an envelope with no `category`. It
+    reads the body in order and stops at the first value it cannot read, so a value
+    `_refuse_a_batch_read_shape` or `_refuse_an_operator` refuses is named instead when it starts
+    ahead of the token (`{"inputs":[5,NaN]}` names the `5`, `{"inputs":[NaN,5]}` the token); both
+    take the token's start as `before`. A byte that does not decode in the body's encoding stops
+    real too, with a 400 of its own that this router does not send, so only the text ahead of the
+    first such byte is scanned: a token there is named, and a body with none is left to the route.
+    `json.loads` reads the three as floats, so without this the routes answer for a float there."""
+    encoding = json.detect_encoding(raw)
+    if encoding == "utf-8-sig":
+        encoding = "utf-8"
+    try:
+        text = raw.decode(encoding, "surrogatepass")
+    except UnicodeDecodeError as e:
+        # `e.start` counts from past a UTF-8 byte-order mark, as `e.object` does and `raw` does not
+        text = e.object[: e.start].decode(encoding, "surrogatepass")
+    for found in _NON_STANDARD_NUMBER.finditer(text):
+        token = found[0]
+        if token.startswith('"'):
+            continue
+        line, column = _position(text, found.end())
+        return _position(text, found.start()), JSONResponse(
+            status_code=400,
+            content={
+                "status": "error",
+                "message": f"Invalid input JSON on line {line}, column {column}: Non-standard "
+                f"token '{token}': enable `JsonReadFeature.ALLOW_NON_NUMERIC_NUMBERS` to allow",
+            },
+        )
+    return None, None
+
+
+def _ahead(raw: bytes, path: tuple, before: tuple[int, int] | None) -> bool:
+    """Whether the value at `path` starts ahead of `before`, as every value does when `before` is
+    None."""
+    return before is None or _token_at(raw, path) < before
+
+
+def _refuse_an_operator(
+    raw: bytes, body: dict, before: tuple[int, int] | None = None
+) -> JSONResponse | None:
     """Real's 400 for the first filter, in body order, whose operator it cannot read, or None.
 
     An operator that trims to nothing is named by its path in the body; one that trims to anything
@@ -582,27 +733,134 @@ def _refuse_an_operator(raw: bytes, body: dict) -> JSONResponse | None:
     reads the body in order and stops at the first operator of either kind, an unreadable one
     included when the filter repeats `operator` with a readable one after it. It reads an integer
     operator as an index too, answers a boolean, float, object or array operator with a different
-    400, and refuses a filter with no operator. This router models none of those cases."""
-    for i, group in enumerate(body.get("filterGroups") or []):
+    400, and refuses a filter with no operator. This router models none of those cases. `before` is
+    where `_non_standard_number` found a token, and an operator from there on is left to it."""
+    groups = body.get("filterGroups")
+    for i, group in enumerate(groups if isinstance(groups, list) else ()):
         if not isinstance(group, dict):
             continue
-        for j, f in enumerate(group.get("filters") or []):
+        filters = group.get("filters")
+        for j, f in enumerate(filters if isinstance(filters, list) else ()):
             if not isinstance(f, dict) or not isinstance(f.get("operator"), str):
                 continue
             op = f["operator"].strip(_TRIM)
+            if op in _OPERATORS or op in _OPERATOR_INDEXES:
+                continue
+            path = ("filterGroups", i, "filters", j, "operator")
+            if not _ahead(raw, path, before):
+                return None
             if op == "":
                 return _error(
                     400,
                     "Invalid input JSON: unable to deserialize field "
                     f'"filterGroups[{i}].filters[{j}].operator". Invalid value: ',
                 )
-            if op not in _OPERATORS and op not in _OPERATOR_INDEXES:
-                line, column = _token_at(raw, ("filterGroups", i, "filters", j, "operator"))
+            line, column = _token_at(raw, path)
+            return _error(
+                400,
+                f"Invalid input JSON on line {line}, column {column}: "
+                f"Enum type must be one of: [{', '.join(_OPERATORS)}]",
+            )
+    return None
+
+
+def _java_double(x: float) -> str:
+    """``x`` as real echoes it, in the form of Java's `Double.toString`: plain from 10^-3 up to
+    10^7, and otherwise with one digit before the point (`1.0E7`, `1.23456789125E8`, `1.0E-4`)."""
+    if x == 0 or 1e-3 <= abs(x) < 1e7:
+        return repr(x)
+    if abs(x) == float("inf"):
+        return "Infinity" if x > 0 else "-Infinity"
+    digits = repr(abs(x)).split("e")[0].replace(".", "").strip("0")
+    mantissa, exponent = format(x, f".{max(len(digits) - 1, 1)}e").split("e")
+    return f"{mantissa}E{int(exponent)}"
+
+
+def _not_a_list(value) -> str:
+    """Real's text for a batch/read member it reads as a list when the body holds something else
+    there, naming the JSON value it found."""
+    if isinstance(value, bool):
+        kind, token = "Boolean", "VALUE_TRUE" if value else "VALUE_FALSE"
+    elif isinstance(value, int):
+        kind, token = "Integer", "VALUE_NUMBER_INT"
+    elif isinstance(value, float):
+        kind, token = "Floating-point", "VALUE_NUMBER_FLOAT"
+    elif isinstance(value, str):
+        kind, token = "String", "VALUE_STRING"
+    else:
+        kind, token = "Object", "START_OBJECT"
+    return f"Cannot deserialize value of type <>` from {kind} value (token `JsonToken.{token}`)"
+
+
+def _not_an_input(item) -> str:
+    """Real's text for an element of `inputs` that is an array, a boolean or a number. For an
+    integer it names the narrowest of Java's int, long and BigInteger that holds the value."""
+    if isinstance(item, list):
+        return "Cannot deserialize value of type  from Array value (token `JsonToken.START_ARRAY`)"
+    if isinstance(item, bool):
+        arg, shown = "boolean/Boolean", f"boolean value ({str(item).lower()})"
+    elif isinstance(item, float):
+        arg, shown = "double/Double", f"Number value ({_java_double(item)})"
+    elif -(2**31) <= item < 2**31:
+        arg, shown = "int/Int", f"Number value ({item})"
+    elif -(2**63) <= item < 2**63:
+        arg, shown = "long/Long", f"Number value ({item})"
+    else:
+        arg, shown = "BigInteger", f"Number value ({item})"
+    return (
+        "Cannot construct instance of  (although at least one Creator exists): "
+        f"no {arg}-argument constructor/factory method to deserialize from {shown}"
+    )
+
+
+def _invalid_at(raw: bytes, path: tuple, text: str) -> JSONResponse:
+    line, column = _token_at(raw, path)
+    return _error(400, f"Invalid input JSON on line {line}, column {column}: {text}")
+
+
+def _refuse_a_batch_read_shape(
+    raw: bytes, body: dict, before: tuple[int, int] | None = None
+) -> JSONResponse | None:
+    """Real's 400 for a batch/read body it cannot read, or None. Measured against api.hubapi.com on
+    2026-10-09, 2026-10-11 and 2026-10-12: real reads `inputs`, `properties` and
+    `propertiesWithHistory` in body order and stops at the first that is neither null nor a list, or
+    at the first element of `inputs` that is neither an object nor a string, naming where that value
+    starts. A string `properties` or `propertiesWithHistory` is echoed trimmed (`_TRIM`), and one
+    that trims to nothing is named by its field alone. A null element of `inputs` is refused only
+    once the rest of the body has been read, in an envelope with no `category`. The elements of
+    `properties` and the members of an object in `inputs` are not checked here. With a `before`
+    from `_non_standard_number`, a value from there on and a null element are left to the token."""
+    null_input = False
+    for key, value in body.items():
+        if key not in ("inputs", "properties", "propertiesWithHistory") or value is None:
+            continue
+        if not isinstance(value, list):
+            if not _ahead(raw, (key,), before):
+                return None
+            if key == "inputs" or not isinstance(value, str):
+                return _invalid_at(raw, (key,), _not_a_list(value))
+            if not value.strip(_TRIM):
                 return _error(
-                    400,
-                    f"Invalid input JSON on line {line}, column {column}: "
-                    f"Enum type must be one of: [{', '.join(_OPERATORS)}]",
+                    400, f'Invalid input JSON: unable to deserialize field "{key}". Invalid value: '
                 )
+            return _invalid_at(
+                raw,
+                (key,),
+                "Cannot construct instance of  (although at least one Creator exists): no "
+                "String-argument constructor/factory method to deserialize from String value "
+                f"('{value.strip(_TRIM)}')",
+            )
+        for i, item in enumerate(value if key == "inputs" else ()):
+            if item is None:
+                null_input = True
+            elif not isinstance(item, (str, dict)):
+                if not _ahead(raw, ("inputs", i), before):
+                    return None
+                return _invalid_at(raw, ("inputs", i), _not_an_input(item))
+    if null_input and before is None:
+        return JSONResponse(
+            status_code=400, content={"status": "error", "message": "Input IDs must be non-null."}
+        )
     return None
 
 
@@ -801,7 +1059,7 @@ async def list_objects(object_type: str, request: Request):
     if err is not None:
         return err
     archived = _flag(_first_query(qp, "archived"))
-    type_label = _NO_ARCHIVED_PAGING.get(_CANONICAL.get(object_type, object_type))
+    type_label = _NO_ARCHIVED_PAGING.get(_canonical(object_type))
     if archived and type_label is not None:
         return _error(
             400,
@@ -827,12 +1085,24 @@ async def get_object(object_type: str, record_id: str, request: Request):
     caller = _caller(request)
     if caller is None:
         return _error(401, "Authentication credentials not found.", "INVALID_AUTHENTICATION")
+    # The type is resolved ahead of the record: on api.hubapi.com, `/crm/v3/objects/nosuch/{id}`
+    # answered `Unable to infer object type from: nosuch` for a contact's id (2026-09-30) and for a
+    # non-numeric and a negative one (2026-10-12).
+    if _resolve_type(request, object_type) is None:
+        return _unknown_type(object_type)
+    record_id = _record_id(record_id)
+    if isinstance(record_id, JSONResponse):
+        return record_id
     # One ACL-scoped query, not a resolve followed by a get_document refetch of the same row:
     # `id` is the PRIMARY KEY, so the ACL clause can only narrow "found" to "not found", never
     # redirect to a different row (see store.hubspot_by_id).
     row = store.hubspot_by_id(auth.conn(request), record_id, auth.visible_ids(request, caller))
-    if row is None or row["object_type"] not in _aliases(object_type):
-        return _error(404, "resource not found", "OBJECT_NOT_FOUND")
+    if (
+        row is None
+        or row["object_type"] not in _aliases(object_type)
+        or _hidden_archived(row, request)
+    ):
+        return _missing_record()
     return _record(row, _keep(request.query_params.get("properties")))
 
 
@@ -847,9 +1117,10 @@ async def search_objects(object_type: str, request: Request):
     if spellings is None:
         return _unknown_type(object_type)
     body = await json_body(request)
+    before, refused = _non_standard_number(await request.body())
     # Before `after`: real refuses the operator first when the cursor is one it can parse but
     # names no record (measured 2026-10-06).
-    refused = _refuse_an_operator(await request.body(), body)
+    refused = _refuse_an_operator(await request.body(), body, before) or refused
     if refused is not None:
         return refused
     limit = _clamp(body.get("limit"), 10, _PAGE_MAX)
@@ -912,15 +1183,24 @@ async def batch_read(object_type: str, request: Request):
     if spellings is None:
         return _unknown_type(object_type)
     body = await json_body(request)
+    before, refused = _non_standard_number(await request.body())
+    refused = _refuse_a_batch_read_shape(await request.body(), body, before) or refused
+    if refused is not None:
+        return refused
     conn, visible = auth.conn(request), auth.visible_ids(request, caller)
     keep = _keep(body.get("properties"))
     results, errors = [], []
     for item in body.get("inputs") or []:
-        rid = str(item.get("id"))
+        # A string in `inputs` is answered as `{"id": <that string>}` is (measured 2026-10-11).
+        rid = item if isinstance(item, str) else str(item.get("id"))
         # One ACL-scoped query, not a resolve followed by a get_document refetch of the same
         # row -- see get_object's comment for why the collapse is safe.
         row = store.hubspot_by_id(conn, rid, visible)
-        if row is None or row["object_type"] not in _aliases(object_type):
+        if (
+            row is None
+            or row["object_type"] not in _aliases(object_type)
+            or _hidden_archived(row, request)
+        ):
             errors.append(
                 {
                     "status": "error",
@@ -954,22 +1234,34 @@ async def list_associations(
     caller = _caller(request)
     if caller is None:
         return _error(401, "Authentication credentials not found.", "INVALID_AUTHENTICATION")
+    # In the order real answers them (api.hubapi.com, 2026-09-30 for the types and the empty page,
+    # 2026-10-12 and 2026-10-14 for the rest): a type real cannot infer is its 400 on either side of
+    # the path, the source's when both are; a record id it won't look up is the 404 `_record_id`
+    # describes; then the `after` cursor; then a record that does not exist, or is of another type,
+    # is an empty page, not the record route's HTML 404. The target is read under any of its
+    # spellings (`company` and `0-2` answer as `companies`).
+    for name in (object_type, to_object_type):
+        if _resolve_type(request, name) is None:
+            return _unknown_type(name)
+    record_id = _record_id(record_id)
+    if isinstance(record_id, JSONResponse):
+        return record_id
     conn, visible = auth.conn(request), auth.visible_ids(request, caller)
-    # One ACL-scoped query, not a resolve followed by a get_document refetch of the same row --
-    # see get_object's comment for why the collapse is safe.
-    row = store.hubspot_by_id(conn, record_id, visible)
-    if row is None or row["object_type"] not in _aliases(object_type):
-        return _error(404, "resource not found", "OBJECT_NOT_FOUND")
     limit = _clamp(request.query_params.get("limit"), _ASSOC_PAGE_MAX, _ASSOC_PAGE_MAX)
     after_to, err = _resolve_cursor(request, request.query_params.get("after"))
     if err is not None:
         return err
+    # One ACL-scoped query, not a resolve followed by a get_document refetch of the same row --
+    # see get_object's comment for why the collapse is safe.
+    row = store.hubspot_by_id(conn, record_id, visible)
+    if row is None or row["object_type"] not in _aliases(object_type):
+        return {"results": []}
     # limit+1 for the same reason listings do it: the extra row is the only evidence of a further
     # page, and without paging here every association past the first page would be unreachable.
     rows = store.hubspot_associations(
         conn,
         row["id"],
-        to_object_type,
+        _aliases(to_object_type),
         after_to_id=after_to,
         visible_ids=visible,
         limit=limit + 1,
