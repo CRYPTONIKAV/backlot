@@ -10,6 +10,7 @@ up — so ``_caller_or_error`` decides it once for every method here.
 
 from __future__ import annotations
 
+import math
 import re
 
 from fastapi import APIRouter, Request
@@ -137,15 +138,19 @@ def _slack_types(request: Request):
 
 
 def _slack_ts(value: str | None) -> float | None | bool:
-    """A Slack timestamp argument as a float; ``False`` marks one that does not parse. Unguarded
-    ``float()`` made a bad argument a 500, and a 5xx is retried by clients that back off on it —
-    so a request that can never succeed burned the whole retry budget."""
+    """A Slack timestamp argument as a float; ``False`` marks one that does not parse and one
+    ``float()`` reads as infinite or NaN, which no window can be built from. Measured against the
+    live API on 2026-10-10, ``inf``, ``-inf``, ``nan``, ``Infinity``, ``-Infinity`` and ``NaN`` each
+    answer the same ``invalid_ts_oldest``/``invalid_ts_latest`` a string that does not parse does. A
+    spelling with digits that ``float()`` overflows is not one of them: real reads ``1e999`` as 1999
+    and answers a window, where any non-finite reading is refused here."""
     if value is None or value == "":
         return None
     try:
-        return float(value)
+        ts = float(value)
     except ValueError:
         return False
+    return ts if math.isfinite(ts) else False
 
 
 def _caller_or_error(request: Request) -> tuple[Caller | None, dict | None]:
@@ -153,14 +158,18 @@ def _caller_or_error(request: Request) -> tuple[Caller | None, dict | None]:
 
     Measured against the live API: a token that is merely unknown answers the same as a malformed
     one, so "malformed" is not a category this has to recognise — what matters is only whether a
-    credential was presented at all, and Slack recognises exactly three ways to present one:
-    an `Authorization: Bearer <t>` header, a `token` query param, or a `token` form field.
+    credential was presented at all, and Slack recognises two ways to present one: a `token` form
+    field, read first, and an `Authorization: Bearer <t>` header (`auth.slack_token`). A `token`
+    query parameter is answered before either is resolved, by the rule
+    `auth.slack_query_token_refused` records.
 
-        no header, no `token` param      -> not_authed
-        `Authorization: Bearer ` (empty) -> not_authed
-        `token=` (empty)                 -> not_authed
-        any other header scheme          -> not_authed
-        any non-empty token that fails   -> invalid_auth
+        no credential, no `token` query param       -> not_authed
+        `Authorization: Bearer ` (empty)            -> not_authed
+        `token=` (empty) on its own                 -> not_authed
+        any other header scheme                     -> not_authed
+        any non-empty token that fails              -> invalid_auth
+        a non-empty `token` query param             -> invalid_auth
+        an empty `token` query param + a credential -> invalid_auth
 
     "any other header scheme" is the whole of the rest, not just the obvious `Basic`: the scheme is
     case-SENSITIVE live, so `bearer` and `BEARER` land here too, as does GitHub's legacy `token <t>`
@@ -168,7 +177,7 @@ def _caller_or_error(request: Request) -> tuple[Caller | None, dict | None]:
     `auth.bearer_token` — see its docstring for why the two cannot be one parser.
 
     ``auth.slack_token`` returns None for every case in the first group: an unrecognised scheme
-    parses to nothing, and an empty query or form value is falsy.
+    parses to nothing, and an empty form value is falsy.
 
     A resolved token whose person a roster marks ``deactivated: true`` is answered Slack's own
     ``account_inactive`` instead of the caller it would otherwise resolve to; this is the one place
@@ -179,6 +188,8 @@ def _caller_or_error(request: Request) -> tuple[Caller | None, dict | None]:
     using a bot token", where Backlot's per-person tokens are user tokens). An admin or anonymous
     caller has no email, so it is never one of these people.
     """
+    if auth.slack_query_token_refused(request):
+        return None, _err("invalid_auth")
     token = auth.slack_token(request)
     caller = auth.acl(request).resolve(token)
     if caller is None:
@@ -219,6 +230,47 @@ def _missing_argument(request: Request, *names: str) -> JSONResponse | None:
     return None
 
 
+def post_charset_warning(content_type: str | None, has_body: bool) -> str | None:
+    """The warning real Slack adds to a POST's answer for the charset its Content-Type names, or
+    None: `missing_charset` for `application/json` or `text/plain` that names none and carries a
+    body, `superfluous_charset` for `application/x-www-form-urlencoded` or `multipart/form-data`
+    that names one, an empty body included.
+
+    Matched as sent, measured against slack.com/api on 2026-10-07 and 2026-10-10: an upper-case
+    media type draws neither warning, and `CHARSET=utf-8`, `charset =utf-8`, `charset= utf-8` and
+    an empty value (`charset=`, `charset=""`, `charset=" "`) name no charset.
+    """
+    if not content_type:
+        return None
+    media_type, *params = (p.strip() for p in content_type.split(";"))
+    has_charset = any(
+        name == "charset" and value[:1] != " " and value.strip('" ')
+        for name, _, value in (p.partition("=") for p in params)
+    )
+    if media_type in ("application/json", "text/plain"):
+        return "missing_charset" if has_body and not has_charset else None
+    if media_type in ("application/x-www-form-urlencoded", "multipart/form-data"):
+        return "superfluous_charset" if has_charset else None
+    return None
+
+
+def attach_warning(payload: dict, warning: str) -> dict:
+    """Add `warning` and `response_metadata.warnings` to a Slack answer where real puts them:
+    `warning` after the method's own keys, `response_metadata` after it, and `warnings` after
+    whatever `response_metadata` already holds (`next_cursor`, `messages`). Real does so on each
+    of the twelve methods Backlot serves (slack.com/api, 2026-10-10)."""
+    meta = payload.pop("response_metadata", None)
+    payload["warning"] = warning
+    if meta is not None:
+        warnings = meta.setdefault("warnings", [])
+        if warning not in warnings:
+            warnings.append(warning)
+        payload["response_metadata"] = meta
+    else:
+        payload["response_metadata"] = {"warnings": [warning]}
+    return payload
+
+
 # `sort_dir` is an enum on search.messages, search.all and search.files, matched as sent: measured
 # on 2026-10-03 and 2026-10-05, `ASC` and `bogus` answer this on all three and `Desc`, ` asc` and
 # `asc ` on search.messages, while `asc` and `desc` are served. An empty `sort_dir` is served on
@@ -226,20 +278,7 @@ def _missing_argument(request: Request, *names: str) -> JSONResponse | None:
 # by its last value. A missing `query` is answered before this and an empty one after it. `sort`
 # has no such check, `sort=bogus` is served.
 _SORT_DIRS = {"asc", "desc"}
-_SORT_DIR_ERROR = {
-    "ok": False,
-    "error": "invalid_arguments",
-    "response_metadata": {
-        "messages": ["[ERROR] must be a valid enum value [json-pointer:/sort_dir]"]
-    },
-}
-
-
-def _bad_sort_dir(request: Request, *, empty_ok: bool) -> JSONResponse | None:
-    value = _param(request, "sort_dir")
-    if value is None or value in _SORT_DIRS or (empty_ok and value == ""):
-        return None
-    return JSONResponse(_SORT_DIR_ERROR)
+_SORT_DIR_LINE = "[ERROR] must be a valid enum value [json-pointer:/sort_dir]"
 
 
 def _channel_core(request: Request, conn, name: str, caller: Caller) -> dict:
@@ -463,8 +502,12 @@ async def auth_test(request: Request):
         "url": f"https://{get_settings().org_name}.slack.com/",
         "team": get_settings().org_name,
         "user": who,
-        "user_id": "USERVICE0" if caller.is_admin else synth.slack_user_id(caller.email),
         "team_id": TEAM_ID,
+        "user_id": "USERVICE0" if caller.is_admin else synth.slack_user_id(caller.email),
+        # Measured against slack.com on 2026-10-09 and 2026-10-11 with a user token, on a workspace
+        # outside any Enterprise organization: every `ok: true` answer, over GET and POST, has these
+        # members in this order and ends with `"is_enterprise_install": false`.
+        "is_enterprise_install": False,
     }
 
 
@@ -477,6 +520,9 @@ async def auth_test(request: Request):
 async def conversations_list(request: Request):
     conn = auth.conn(request)
     caller, err = _caller_or_error(request)
+    if err is not None:
+        return err
+    limit, err = _limit(request)
     if err is not None:
         return err
     types = _slack_types(request)
@@ -495,7 +541,6 @@ async def conversations_list(request: Request):
         want_private = "private_channel" in types
         names = [n for n in names if _is_private(request, conn, n) is want_private]
 
-    limit = _limit(request)
     page = [_listed_channel(request, conn, n, caller) for n in names[offset : offset + limit]]
     cursor = next_cursor(offset, len(page), len(names))
     return {"ok": True, "channels": page, "response_metadata": {"next_cursor": cursor}}
@@ -547,6 +592,9 @@ async def conversations_history(request: Request):
         return err
     if err := _missing_argument(request, "channel"):
         return err
+    limit, err = _limit(request)
+    if err is not None:
+        return err
     name = _channel_name(conn, _param(request, "channel") or "")
     ids = auth.visible_ids(request, caller)
     # A channel this caller cannot see is `channel_not_found`, exactly as in conversations.info —
@@ -561,17 +609,24 @@ async def conversations_history(request: Request):
     # fewer than requested. A client that asks for 1000 (korotovsky) would make the client resolve
     # ~1000 roots x their authors/reply_users via users.info — slow. has_more/next_cursor still let
     # it paginate for more.
-    limit = min(_limit(request), _HISTORY_MAX_ROOTS)
-    offset = decode_cursor_or_none(_param(request, "cursor"))
-    if offset is None:
-        return _err("invalid_cursor")
+    limit = min(limit, _HISTORY_MAX_ROOTS)
     # Slack history returns only top-level messages (thread roots + standalone);
     # replies live under conversations.replies.
     lo, hi = _slack_ts(_param(request, "oldest")), _slack_ts(_param(request, "latest"))
-    if lo is False:
-        return _err("invalid_ts_oldest")
+    # Real reads `latest` before `oldest`, and either timestamp before the cursor, so the errors
+    # answer in that order: measured against slack.com/api on 2026-10-10, `oldest=abc&latest=abc`
+    # answers `invalid_ts_latest`, and an unreadable timestamp beside an undecodable cursor answers
+    # the timestamp's error, never `invalid_cursor`. On 2026-10-12 the same answers came back with
+    # the three in every query order, and in a POST form body; an empty `latest` or `oldest` was
+    # read as none, leaving `invalid_cursor` beside an undecodable cursor; and a channel that names
+    # nothing answered `channel_not_found` ahead of all three.
     if hi is False:
         return _err("invalid_ts_latest")
+    if lo is False:
+        return _err("invalid_ts_oldest")
+    offset = decode_cursor_or_none(_param(request, "cursor"))
+    if offset is None:
+        return _err("invalid_cursor")
     if lo is not None or hi is not None:  # time-bounded (e.g. a single day): filter, then paginate
         inclusive = _param(request, "inclusive") in ("1", "true", "True")
 
@@ -723,6 +778,9 @@ async def conversations_members(request: Request):
         return err
     if err := _missing_argument(request, "channel"):
         return err
+    limit, err = _limit(request)
+    if err is not None:
+        return err
     name = _channel_name(conn, _param(request, "channel") or "")
     # Membership is derived from who has spoken in the channel, so this list is a projection of the
     # very messages the ACL withholds — behind the same `channel_not_found` conversations.info
@@ -733,7 +791,6 @@ async def conversations_members(request: Request):
     offset = decode_cursor_or_none(_param(request, "cursor"))
     if offset is None:
         return _err("invalid_cursor")
-    limit = _limit(request)
     # A channel's members are the people who have spoken in it — the only per-channel signal the
     # corpus carries. Never the whole roster: real Slack's membership differs per channel, and it
     # paginates this method.
@@ -755,6 +812,9 @@ async def users_list(request: Request):
     caller, err = _caller_or_error(request)
     if err is not None:
         return err
+    limit, err = _limit(request)
+    if err is not None:
+        return err
     # The roster is the registered user principals — the employee directory plus internal mail/doc
     # authors. Slack transcript speakers are NOT added, and that is a limitation of the upstream
     # dataset rather than a modelling choice, so it is stated plainly here and in the README.
@@ -772,7 +832,6 @@ async def users_list(request: Request):
     if offset is None:
         return _err("invalid_cursor")
     emails = store.all_user_emails(conn)
-    limit = _limit(request)
     page = emails[offset : offset + limit]
     members = [_user_obj(conn, e, caller) for e in page]
     cursor = next_cursor(offset, len(page), len(emails))
@@ -852,7 +911,8 @@ def _messages_block(request: Request, *, empty_sort_dir_ok: bool):
         return err, None
     if err := _missing_argument(request, "query"):
         return err, None
-    if err := _bad_sort_dir(request, empty_ok=empty_sort_dir_ok):
+    counts, err = _numbers(request, ("count", 20), ("page", 1), sort_dir_ok=empty_sort_dir_ok)
+    if err is not None:
         return err, None
     query = _param(request, "query") or ""
     # A query that arrived with nothing in it has its own error, measured live on all three search
@@ -861,8 +921,8 @@ def _messages_block(request: Request, *, empty_sort_dir_ok: bool):
         return _err("no_query"), None
     terms, container, phrase = _parse_slack_query(query)
     ids = auth.visible_ids(request, caller)  # results are scoped to the caller's ACL
-    count = _int(request, "count", 20)
-    page = max(1, _int(request, "page", 1))
+    count = counts["count"]
+    page = max(1, counts["page"])
     offset = (page - 1) * count
     # Honor Slack's sort: "score" (default) = relevance; "timestamp" = by message time. sort_dir
     # defaults to desc (newest first). Previously Backlot always ranked by relevance regardless.
@@ -930,12 +990,13 @@ async def search_files(request: Request):
         return err
     if err := _missing_argument(request, "query"):
         return err
-    if err := _bad_sort_dir(request, empty_ok=False):
+    counts, err = _numbers(request, ("count", 20), ("page", 1), sort_dir_ok=False)
+    if err is not None:
         return err
     query = _param(request, "query") or ""
     if not query.strip():
         return _err("no_query")
-    count = _int(request, "count", 20)
+    count = counts["count"]
     empty = {
         "total": 0,
         "matches": [],
@@ -1274,18 +1335,74 @@ def _param(request: Request, key: str) -> str | None:
     return form.get(key) if form else None
 
 
-def _limit(request: Request) -> int:
-    """The page size a paged method serves. A `limit` of zero is read as no `limit` at all: on
-    `conversations.list`, `users.list`, `conversations.members` and `conversations.history`, `0`
-    (measured 2026-10-03 and 2026-10-05) and `00` (2026-10-05) answered what the same request
-    without `limit` answers, every item and an empty `next_cursor`, on collections of 8 to 21."""
+# How real reads the numbers a paged method takes, measured against slack.com/api from 2026-10-10
+# to 2026-10-12 on each method that reads them. `count` and `page` take ASCII digits, a leading
+# zero included, and a minus sign only before a digit other than zero (`-1` is read, `-0` and
+# `-01` are refused), within the signed 64-bit range. `limit` takes a decimal with an optional
+# fraction and exponent (`2.9`, `.5`, `2e0`, `20e-1`), but no `+` before it or before the
+# exponent, no `2.` and no `1.e1`, and serves its integer part. One trailing newline is read on
+# `limit` and on neither of the others. Anything else, padding, an empty value, `0x10`, `1_0` and
+# digits outside ASCII included, is refused with one line naming the field. What a negative
+# `limit` or one past 2**63 serves is outside this rule: real's answer to it differs by method.
+_SLACK_INTEGER = re.compile(r"[0-9]+|-[1-9][0-9]*")
+_SLACK_NUMBER = re.compile(r"-?(?:[0-9]+(?:[.][0-9]+)?|[.][0-9]+)(?:[eE]-?[0-9]+)?\n?")
+
+
+def _slack_number(key: str, raw: str) -> int | None:
+    """The value of one numeric argument by the rule on `_SLACK_INTEGER`, or None where real
+    refuses it. A `limit` is its integer part (`1.5` is 1, `3.99999` is 3), and one too large for a
+    float (`1e400`) is zero, which `_limit` serves as no `limit`, as real served every item."""
+    if key == "limit":
+        if not _SLACK_NUMBER.fullmatch(raw):
+            return None
+        x = float(raw)
+        return int(x) if math.isfinite(x) else 0
+    if not _SLACK_INTEGER.fullmatch(raw):
+        return None
+    n = int(raw)
+    return n if -(2**63) <= n < 2**63 else None
+
+
+def _numbers(
+    request: Request, *params: tuple[str, int], sort_dir_ok: bool | None = None
+) -> tuple[dict[str, int], JSONResponse | None]:
+    """The numeric arguments `params` names as `(key, default)`, each read by `_slack_number` and
+    capped at `max_page_size`, and the `invalid_arguments` that names every one real refuses.
+
+    Real puts one line per refused field in one answer, in the order `params` lists them
+    whichever was sent first, and on the search methods an unknown `sort_dir` adds its line after
+    them, all of it ahead of an empty query (measured 2026-10-11 and 2026-10-12 on search.messages
+    with the query sent first or last, search.all and search.files). `sort_dir_ok` is the
+    `empty_ok` half of the rule on `_SORT_DIRS`; None leaves `sort_dir` unread."""
+    values: dict[str, int] = {}
+    messages: list[str] = []
+    for key, default in params:
+        raw = _param(request, key)
+        n = default if raw is None else _slack_number(key, raw)
+        if n is None:
+            messages.append(f"[ERROR] must provide a number [json-pointer:/{key}]")
+            n = default
+        values[key] = min(n, get_settings().max_page_size)
+    if sort_dir_ok is not None:
+        value = _param(request, "sort_dir")
+        if value is not None and value not in _SORT_DIRS and not (sort_dir_ok and value == ""):
+            messages.append(_SORT_DIR_LINE)
+    if not messages:
+        return values, None
+    return values, JSONResponse(
+        {"ok": False, "error": "invalid_arguments", "response_metadata": {"messages": messages}}
+    )
+
+
+def _limit(request: Request) -> tuple[int, JSONResponse | None]:
+    """The page size a paged method serves, and the refusal for a `limit` real does not read.
+
+    Each handler answers the refusal after its missing-argument check and before it resolves the
+    channel, `types`, `latest` or cursor, where real answers it (measured 2026-10-10 and
+    2026-10-11). A `limit` read as zero is read as no `limit` at all: on `conversations.list`,
+    `users.list`, `conversations.members` and `conversations.history`, `0` (measured 2026-10-03
+    and 2026-10-05) and `00` (2026-10-05) answered what the same request without `limit`
+    answers, every item and an empty `next_cursor`, on collections of 8 to 21."""
     default = get_settings().default_page_size
-    return _int(request, "limit", default) or default
-
-
-def _int(request: Request, key: str, default: int) -> int:
-    v = _param(request, key)
-    try:
-        return min(int(v), get_settings().max_page_size) if v else default
-    except ValueError:
-        return default
+    values, err = _numbers(request, ("limit", default))
+    return values["limit"] or default, err

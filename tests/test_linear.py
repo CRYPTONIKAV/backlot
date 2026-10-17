@@ -371,7 +371,7 @@ def test_linear_the_hand_written_examples_query_still_validates(client, admin_h)
 
     from tests.conftest import REPO_ROOT
 
-    text = (REPO_ROOT / "examples/using-llamaindex-readers/linear.py").read_text()
+    text = (REPO_ROOT / "examples/using-llamaindex-readers/linear.py").read_text(encoding="utf-8")
     document = re.search(r'^QUERY = """(.*?)"""', text, re.S | re.M)
     assert document, "no QUERY literal found -- fix this extractor, not the assertion"
 
@@ -2255,7 +2255,7 @@ def _linear_client(tmp_path):
 
 
 # --- schema drift against api.linear.app (issue #101) --------------------------------------------
-# Every type below started as what introspection of https://api.linear.app/graphql reported on
+# Every type below is what introspection of https://api.linear.app/graphql reported, the oldest on
 # 2026-09-03, copied here as literals so the suite runs offline; a literal moves when a later
 # measurement finds the vendor has moved. `IntegrationService` has gained two members that way
 # since that date, and the enum in `backlot/graphql/linear.graphql` carries their dates.
@@ -2307,6 +2307,7 @@ LINEAR_TYPES = {
     "UserSortInput.name": "UserNameSort",
     # selected by `@linear/sdk`'s own Team and Project fragments
     "Team.initiativesEnabled": "Boolean!",
+    "Team.viewerCanJoin": "Boolean!",
     "Project.resourceCount": "Int!",
     # non-null where Backlot was nullable
     "Issue.sharedAccess": "IssueSharedAccess!",
@@ -2455,16 +2456,20 @@ def test_counts_are_served_as_json_integers(fclient):
 
 
 def test_fields_the_sdk_fragments_select_resolve_to_what_backlot_serves(fclient):
-    """Both are non-null, so a declaration with nothing behind it voids the whole result. A real
-    team answers `initiativesEnabled: false` (measured 2026-09-07); Backlot serves no project
-    resources, so `resourceCount` is a count rather than a stand-in."""
+    """All three are non-null, so a declaration with nothing behind it voids the whole result. A
+    real team answers `initiativesEnabled: false` (measured 2026-09-07), and `_team` gives the
+    reason `viewerCanJoin` is `false`; Backlot serves no project resources, so `resourceCount` is
+    a count rather than a stand-in."""
     r = post(
         fclient,
-        '{ issue(id: "ENG-2") { team { initiativesEnabled } project { resourceCount } } }',
+        '{ issue(id: "ENG-2") { team { initiativesEnabled viewerCanJoin }'
+        " project { resourceCount } } }",
     ).json()
     assert "errors" not in r, r.get("errors")
     d = r["data"]["issue"]
-    assert (d["team"]["initiativesEnabled"], d["project"]["resourceCount"]) == (False, 0)
+    team = d["team"]
+    served = (team["initiativesEnabled"], team["viewerCanJoin"], d["project"]["resourceCount"])
+    assert served == (False, False, 0)
 
 
 def test_enum_fields_serve_a_member_of_the_vendors_enum(fclient):
@@ -2832,6 +2837,60 @@ def _linear_identifiers(client, authorization):
     """``authorization`` verbatim, not a Bearer-wrapped token — these tests assert on the scheme."""
     r = gql(client, "{ issues { nodes { identifier } } }", {"Authorization": authorization})
     return r.status_code, r.json()
+
+
+@pytest.mark.parametrize(
+    "caller, unassigned",
+    [
+        ("mia@acme.com", "mia/eng-2-rotate-the-signing-keys"),
+        # the admin token has no address, so there is no user segment
+        ("admin", "eng-2-rotate-the-signing-keys"),
+    ],
+)
+def test_an_unassigned_issue_branch_name_starts_with_the_callers_handle(
+    tmp_path, caller, unassigned
+):
+    """An issue with no assignee takes the caller's email local part as its branch prefix.
+    An assigned issue keeps the assignee's local part in front of the same slug."""
+    records = [
+        {
+            "source_type": "linear",
+            "doc_id": "assigned",
+            "team": "engineering",
+            "title": "Rotate the signing keys",
+            "identifier": "ENG-1",
+            "content": "Keys expire in March.",
+            "state": "Todo",
+            "author_email": "mia@acme.com",
+            "assignee": "raj@acme.com",
+            "created": "2026-02-01T09:00:00Z",
+        },
+        {
+            "source_type": "linear",
+            "doc_id": "unassigned",
+            "team": "engineering",
+            "title": "Rotate the signing keys",
+            "identifier": "ENG-2",
+            "content": "Keys expire in March.",
+            "state": "Todo",
+            "author_email": "mia@acme.com",
+            "created": "2026-02-01T09:00:00Z",
+        },
+    ]
+    with corpus_client(tmp_path, records) as (client, settings):
+        users = client.get("/_meta/users").json()["users"]
+        if caller == "admin":
+            token = settings.admin_token
+        else:
+            token = next(u["token"] for u in users if u["email"] == caller)
+        body = gql(
+            client,
+            "{ issues { nodes { identifier branchName } } }",
+            {"Authorization": token},
+        ).json()
+        assert "errors" not in body, body.get("errors")
+        got = {n["identifier"]: n["branchName"] for n in body["data"]["issues"]["nodes"]}
+        assert got == {"ENG-1": "raj/eng-1-rotate-the-signing-keys", "ENG-2": unassigned}
 
 
 def test_an_issue_with_no_recorded_edit_is_filtered_on_the_updatedAt_it_serves(tmp_path):

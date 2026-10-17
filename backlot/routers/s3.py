@@ -9,8 +9,10 @@ request is the anonymous caller's, who sees no bucket (``_auth``). A method this
 serve, and a GET or a HEAD naming a selector it cannot take, is refused before the bucket and
 whether or not a credential is sent, as real refuses them, but after a signature that was sent and
 does not verify (``_method_refusal``, ``_read_refusal``); a write resolves the credential and the
-bucket first. Responses are S3 XML (namespace ``http://s3.amazonaws.com/doc/2006-03-01/``) or raw
-object bytes; errors use the S3 ``<Error>`` envelope.
+bucket first. The ``?annotation`` operations refuse an unsigned caller and an unverified V2 key or
+signature ahead of the bucket and of the method's selector refusal (``_sigv4_only_refusal``).
+Responses are S3 XML (namespace ``http://s3.amazonaws.com/doc/2006-03-01/``) or raw object bytes;
+errors use the S3 ``<Error>`` envelope.
 
 S3 dispatches on the query string: ``?acl``, ``?versioning``, ``?tagging`` and the rest each select
 a different operation at the same path. Every one of a bucket's is answered, as real answers a
@@ -38,13 +40,14 @@ import contextvars
 import hashlib
 import re
 import zlib
+from datetime import datetime, timezone
 from xml.etree import ElementTree
 from xml.sax.saxutils import escape
 
 import xxhash
 from fastapi import APIRouter, Request, Response
 
-from backlot import auth, sigv4, store, synth
+from backlot import auth, sigv2, sigv4, store, synth
 from backlot.openapi import qp
 
 router = APIRouter(prefix="/s3", tags=["s3"])
@@ -473,6 +476,59 @@ _CONFIGURATION_LISTS = {
 # --------------------------------------------------------------------------- helpers
 
 
+def _etag_matches(sent: list[str], etag: str) -> bool:
+    """Whether the values of an `If-Match` or an `If-None-Match`, every line of it, name an object
+    whose unquoted ETag is ``etag``, as real S3 matched them (us-east-1, 2026-10-13): split at each
+    `"`, `,`, space and tab, they match where a piece is the ETag, case and all, or `*`. So
+    `W/"<etag>"`, `w/"<etag>"`, `"*"`, `"0000" "<etag>"` and `"0000";"<etag>"` match, where
+    `W/<etag>`, `W/*`, `'<etag>'`, `"0000";<etag>` and an empty value do not."""
+    pieces = re.split(r'[", \t]+', ",".join(sent))
+    return etag in pieces or "*" in pieces
+
+
+def _http_date(value: str) -> datetime | None:
+    """A condition's date as real S3 read an `If-Modified-Since` and an `If-Unmodified-Since`
+    (us-east-1, 2026-10-13), or ``None`` where it read none and left the condition out: as
+    ``sigv2.parse_date`` reads a `Date`, except that the ISO 8601 basic form an `x-amz-date` takes
+    is no date here, and neither is a year past 9999, which a `Date` is a 500 for."""
+    if value[:1].isdigit():
+        return None
+    try:
+        return sigv2.parse_date(value)
+    except sigv2.DateOutOfRange:
+        return None
+
+
+def _precondition(request, etag: str, last_modified: datetime):
+    """Return ("412", condition_name), ("304", None) or None. Order follows RFC 9110 section
+    13.2.2, which matches the measured rows (us-east-1, 2026-10-11 to 2026-10-13). Every line of an
+    ETag condition is read, and the first line of a date."""
+    h = request.headers
+    if_match = h.getlist("if-match")
+    if if_match:
+        if not _etag_matches(if_match, etag):
+            return ("412", "If-Match")
+    else:
+        since = h.get("if-unmodified-since")
+        if since is not None:
+            d = _http_date(since)
+            if d is not None and last_modified > d:
+                return ("412", "If-Unmodified-Since")
+
+    none_match = h.getlist("if-none-match")
+    if none_match:
+        if _etag_matches(none_match, etag):
+            return ("304", None)
+    else:
+        since = h.get("if-modified-since")
+        if since is not None:
+            d = _http_date(since)
+            now = datetime.now(timezone.utc)
+            if d is not None and d <= now and last_modified <= d:
+                return ("304", None)
+    return None
+
+
 def _xml(
     body: str,
     status: int = 200,
@@ -680,10 +736,12 @@ def _signature_refusal(request: Request) -> auth.SigV4Refusal | None:
     ``None`` as well when no credential is sent: that is an anonymous caller's request, on real and
     here (``backlot.auth.resolve_sigv4``), and real gives it the method and selector refusals a
     signed request gets, where a signature that fails and an access key AWS does not know are each
-    refused first. Measured 2026-09-29 against `s3.us-east-1.amazonaws.com`: twelve selector
-    refusals across a GET and a HEAD at a bucket and at a key, each sent signed, unsigned, signed
-    over a bad secret and with an unknown key, and ten method refusals at a bucket, a key and the
-    service root, which the bad secret and the unknown key each turned into their 403.
+    refused first, but for the `?annotation` reads, which turn an unsigned request and a V2 key or
+    signature away themselves (``_sigv4_only_refusal``). Measured 2026-09-29 against
+    `s3.us-east-1.amazonaws.com`: twelve selector refusals across a GET and a HEAD at a bucket and
+    at a key, each sent signed, unsigned, signed over a bad secret and with an unknown key, and ten
+    method refusals at a bucket, a key and the service root, which the bad secret and the unknown
+    key each turned into their 403.
     """
     return auth.resolve_sigv4(request)[1]
 
@@ -736,10 +794,10 @@ def _read_refusal(
     at a bucket and at a key, on a GET and a HEAD, and in a bucket that does not exist, with the 400
     whether each was signed, unsigned, signed over a bad secret or sent with an unknown key
     (2026-09-29). So is a bucket's `partNumber` (``_bucket_selected``). Then ``first``, what the
-    caller refuses before the credential — the parses, a `versionId`, a valued `website`
-    (``_version_id_refusal``, ``_website_refusal``) — and after it one selector is refused on a
-    HEAD whatever it is (``_head_refusal``) and on a GET when the GET cannot take it (``refused``,
-    the type its 405 names), once a signature that was sent verifies (``_signature_refusal``).
+    caller refuses before ``_auth``, in the order ``head_bucket``, ``bucket_get`` and
+    ``_object_parse`` build it, and after it one selector is refused on a HEAD whatever it is
+    (``_head_refusal``) and on a GET when the GET cannot take it (``refused``, the type its 405
+    names), once a signature that was sent verifies (``_signature_refusal``).
     """
     head = request.method == "HEAD"
     if len(selected) > 1:
@@ -800,8 +858,23 @@ def _key_selected(q) -> list[str]:
     refusal is what most of them give and what a HEAD gets. At a bucket's path it is left to the
     listing, as real leaves it. `partNumber` beside a selector other than `uploadId` is the conflict
     too (`?partNumber=1&tagging` is "partNumber, tagging", same date); alone it is GetObject's
-    (``_part_refusal``), and beside `uploadId` UploadPart."""
+    (``_part_refusal``), and beside `uploadId` UploadPart.
+
+    `annotation` is read from its first value, as ``_first`` reads it, and names the operation
+    only when that value is empty: `?annotation=x` is GetObject, so an `annotationName` beside it is
+    ignored rather than refused as it is on its own (the check reads ``q``, not ``selected``), a
+    `max-annotation-results` is not parsed, a second selector is that selector's operation alone,
+    and a version id, a part number and a response override are read as GetObject reads them;
+    `?annotation=x&annotation=` is GetObject where `?annotation=&annotation=x` is the listing. No
+    other selector picks its operation by its value: `?acl=x`, `?tagging=x`, `?attributes=x`,
+    `?torrent=x`, `?uploads=x`, `?legal-hold=x` and `?retention=x` at a key and `?acl=x`,
+    `?versioning=x` and `?location=x` at a bucket each got the selector's own answer (us-east-1,
+    2026-10-14).
+
+    An `OPTIONS` at a key's path reads them the same way (``_cors_preflight``)."""
     selected = _selected(q, _OBJECT_READ_SELECTORS)
+    if "annotation" in selected and _first(q, "annotation") != "":
+        selected.remove("annotation")
     if "annotationName" in q and "annotation" not in q:
         selected = sorted([*selected, "annotationName"])
     if "partNumber" in q and selected and selected != ["uploadId"]:
@@ -1022,6 +1095,7 @@ _ALLOW_OBJECT = "GET, HEAD"
 
 
 @router.head("/{bucket}")
+@router.head("/{bucket}/")
 async def head_bucket(request: Request, bucket: str):
     """HeadBucket — 200 if the caller can see this bucket, 404 if they cannot (an unsigned caller
     sees none), and a refused credential's own status, 403 or 400, as its status alone.
@@ -1039,7 +1113,7 @@ async def head_bucket(request: Request, bucket: str):
     and a valued `website` are the 400 ahead of a selector's 405, as on real (same date)."""
     q = request.query_params
     selected = _bucket_selected(q, _BUCKET_READ_SELECTORS)
-    first = _version_id_refusal(q, selected) or _website_refusal(q)
+    first = _response_override_refusal(q) or _version_id_refusal(q, selected) or _website_refusal(q)
     refused = _read_refusal(request, selected, _BUCKET_GET_REFUSALS, _BUCKET_GETS, first)
     if refused is not None:
         return refused
@@ -1066,6 +1140,7 @@ async def head_bucket(request: Request, bucket: str):
 
 
 @router.get("/{bucket}", openapi_extra={"parameters": _P_BUCKET_GET})
+@router.get("/{bucket}/", openapi_extra={"parameters": _P_BUCKET_GET})
 async def bucket_get(request: Request, bucket: str):
     """ListObjects or ListObjectsV2 — one page of the keys in this bucket that the caller can read.
 
@@ -1084,8 +1159,8 @@ async def bucket_get(request: Request, bucket: str):
     # The parses come before the credential as well as the bucket: an unsigned request and one
     # signed over a bad secret get the same 400 for `?uploads&max-uploads=abc`, `?max-keys=abc` and
     # `?versions&max-keys=abc` (measured 2026-09-29), and so do the conflict, a bucket's
-    # `partNumber` and, after the parses, a `versionId` and a valued `website` (``_read_refusal``).
-    # What is refused once the bucket is found comes after the signature.
+    # `partNumber` and, after the parses, the rest of ``first`` below. What is refused once the
+    # bucket is found comes after the signature.
     first = None
     if selected == ["uploads"]:
         # Before the bucket is looked up: `?uploads&max-uploads=abc` on a bucket that does not exist
@@ -1097,7 +1172,12 @@ async def bucket_get(request: Request, bucket: str):
         max_keys, first = _versions_parse(q)
     elif not selected:
         max_keys, first = _listing_parse(q, v2)
-    first = first or _version_id_refusal(q, selected) or _website_refusal(q)
+    first = (
+        first
+        or _response_override_refusal(q)
+        or _version_id_refusal(q, selected)
+        or _website_refusal(q)
+    )
     refused = _read_refusal(request, selected, _BUCKET_GET_REFUSALS, _BUCKET_GETS, first)
     if refused is not None:
         return refused
@@ -1758,6 +1838,98 @@ def _configuration_list(q, selector: str) -> Response:
     )
 
 
+# The query parameters an object's GET and HEAD set a response header with, and the header each one
+# sets, on the 200 and the 206 and not on a sub-resource's answer or a refusal (real S3, us-east-1,
+# measured 2026-10-11). The bytes, the ETag and the length stay the object's. A 304 carries each
+# header but `Content-Type` (2026-10-13).
+_RESPONSE_HEADERS = {
+    "response-content-type": "Content-Type",
+    "response-content-language": "Content-Language",
+    "response-expires": "Expires",
+    "response-cache-control": "Cache-Control",
+    "response-content-disposition": "Content-Disposition",
+    "response-content-encoding": "Content-Encoding",
+}
+# What an override's value carries in place of a control character: a space, for each one below
+# U+0020 but the tab, and for U+007F (measured 2026-10-13).
+_SPACED_CONTROLS = {c: " " for c in (*range(0x09), *range(0x0A, 0x20), 0x7F)}
+
+
+def _java_map_slot(name: str) -> int:
+    """The slot of 64 a Java `HashMap` puts ``name`` in: `String.hashCode` over its UTF-16 code
+    units, spread as Java 8 spreads it, `h ^ (h >>> 16)`."""
+    h = 0
+    units = name.encode("utf-16-be")
+    for i in range(0, len(units), 2):
+        h = (31 * h + int.from_bytes(units[i : i + 2], "big")) & 0xFFFFFFFF
+    return (h ^ h >> 16) & 63
+
+
+def _response_override_refusal(q) -> Response | None:
+    """Real's 400 for a `response-` parameter it refuses, or ``None``: a name that starts with the
+    lower-case `response-` and is not one of ``_RESPONSE_HEADERS``, or one of them whose value no
+    header can carry, at a key's path and at a bucket's, where an override sets nothing.
+
+    A name is matched as written, so `response-Content-Type` is refused as a name and
+    `Response-Content-Type` is not read, and named beside its first value, an empty one for a bare
+    name. A value holding a character past U+00FF is refused, a percent-encoded byte that is not
+    UTF-8 among them, and so is one holding a `"` that opens a quoted span it does not close, where
+    a backslash escapes the character after it inside the quotes or out: `a"b` and `"a\\"` are
+    refused, `"a"b` and `a\\"b` are not.
+
+    Real checks the parameters one at a time, a name and then its value, in the order of their
+    ``_java_map_slot`` and, within a slot, as sent: `?response-foo=x&response-content-type=a%22b` is
+    the value's refusal and `?response-aaa=x&response-content-type=a%22b` the name's. Of 840
+    answers to two to thirty such parameters where that order and code-point order part, 665
+    followed that order, 167 code-point order and 8 neither, and one request sent twice to one
+    front-end address got the same order 116 times in 180, as often as two independent draws would
+    (us-east-1, 2026-10-13).
+
+    Real refused both after the conflict of two selectors, a bucket's `partNumber` and the parses
+    each path makes before the bucket, and ahead of a `versionId`, a valued `website`, a bucket or a
+    key that does not exist, a `partNumber`, a `Range`, a checksum mode, a condition's 304 or 412, a
+    selector's answer or 405 and an unsigned request's 400, and ahead of a signature or a key it
+    refused in 34 of 36 requests for a value and 12 of 17 for a name (us-east-1, 2026-10-13).
+    """
+    names = (name for name in q.keys() if name.startswith("response-"))
+    for name in sorted(names, key=_java_map_slot):
+        value = _first(q, name)
+        if name not in _RESPONSE_HEADERS:
+            return _argument_error(
+                f"{name} is not in the set of overridable response headers. Please refer to the "
+                "S3 API documentation for a complete list of overridable response headers.",
+                name,
+                value,
+            )
+        if any(ord(ch) > 0xFF for ch in value):
+            return _argument_error(
+                "Header value cannot be represented using ISO-8859-1.", name, value
+            )
+        quoted = escaped = False
+        for ch in value:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                quoted = not quoted
+        if quoted:
+            return _argument_error("Header value contained an open quoted span.", name, value)
+    return None
+
+
+def _response_overrides(q) -> dict[str, str]:
+    """The headers the `response-*` overrides set, once ``_response_override_refusal`` has passed
+    them: each name matched as written and read from its first value, so
+    `?response-content-type=a/b&response-content-type=c/d` sets `a/b` (measured 2026-10-13), with
+    the control characters ``_SPACED_CONTROLS`` names as spaces."""
+    return {
+        header: value.translate(_SPACED_CONTROLS)
+        for name, header in _RESPONSE_HEADERS.items()
+        if (value := _first(q, name, None)) is not None
+    }
+
+
 @router.api_route("/{bucket}/{key:path}", methods=["GET", "HEAD"])
 async def object_get(request: Request, bucket: str, key: str):
     """GetObject — the object's bytes, or its metadata headers alone for a HEAD.
@@ -1781,27 +1953,33 @@ async def object_get(request: Request, bucket: str, key: str):
         # UploadPart, which real refuses a GET and a HEAD of with the 405 naming `PART`, before the
         # bucket (measured 2026-09-29).
         selected = ["PART"]
-    first = _website_refusal(q)
-    if selected == ["annotationName"]:
-        first = _argument_error("Unexpected query string parameter", "ResourceType", selected[0])
-    first = first or _object_parse(request, selected, head)
+    first = _object_parse(request, selected, head)
     # `_OBJECT_GETS`, not `_BUCKET_GETS`: on a GET a key's path serves only the bucket selectors
     # `_KEY_BUCKET_SELECTORS` names, `?logging` and `?versions` apart, so its HEAD refusal names no
     # method for the others.
     refused = _read_refusal(request, selected, _OBJECT_GET_REFUSALS, _OBJECT_GETS, first)
     if refused is not None:
         return refused
-    if selected == ["uploadId"]:
-        # ListParts' own integers parse before the credential and the bucket, as the listing's do:
-        # `?uploadId=x&max-parts=abc` is the 400 in a bucket that does not exist, unsigned and over
-        # a bad secret, where `max-parts=-1` is left to the upload (measured 2026-09-29).
-        for name in ("max-parts", "part-number-marker"):
-            _, err = _int32_param(q, name, 0)
-            if err:
-                return err
     caller, visible, err = _auth(request)
     if err:
         return err
+    # An unsigned GET or HEAD of an object with an override is real's 400, naming no bucket or key,
+    # on a key the bucket holds and on one it does not, with no version or the null one; beside a
+    # sub-resource or another version it is not (us-east-1, 2026-10-13). Real answers a bucket
+    # nobody has with `NoSuchBucket`; here every name gets the 400, so the answer does not tell an
+    # anonymous caller which names the corpus holds (``_auth``).
+    if (
+        not selected
+        and caller.is_anonymous
+        and any(name in q for name in _RESPONSE_HEADERS)
+        and _first(q, "versionId", None) in (None, "null")
+    ):
+        if head:
+            return _head(400)
+        return _error(
+            "InvalidRequest",
+            "Request specific response headers cannot be used for anonymous GET requests.",
+        )
     conn = auth.conn(request)
     if not _bucket_visible(conn, bucket, visible):
         return _head(404) if head else _no_such_bucket(bucket)
@@ -1873,6 +2051,35 @@ async def object_get(request: Request, bucket: str, key: str):
 
     data = row["content"].encode("utf-8")
     total = len(data)
+    ts = row["updated_ts"] or row["created_ts"]
+    etag = synth.s3_etag(row["key"], row["content"])
+    last_modified = synth.s3_http_date(ts)
+
+    # Conditional headers. Real S3 (us-east-1, 2026-10-11 and 2026-10-12) answers the 304 and the
+    # 412 after a key's sub-resources, which read no condition, and ahead of the part-number refusal
+    # and the Range parse, GET and HEAD alike, but a bad checksum mode is refused ahead of both.
+    verdict = _precondition(request, etag.strip('"'), _http_date(last_modified))
+    if verdict is not None:
+        if _checksum_mode(request) is None:
+            return _head(400) if head else _error("InvalidRequest", _BAD_CHECKSUM_MODE)
+        kind, condition = verdict
+        if kind == "304":
+            # ETag, Last-Modified and the overrides `_RESPONSE_HEADERS` puts on a 304; the
+            # request-id pair comes from the /s3 middleware.
+            carried = _response_overrides(q)
+            carried.pop("Content-Type", None)
+            return Response(
+                status_code=304,
+                headers={"ETag": etag, "Last-Modified": last_modified, **carried},
+            )
+        if head:
+            return _head(412)
+        return _error(
+            "PreconditionFailed",
+            "At least one of the pre-conditions you specified did not hold",
+            f"<Condition>{condition}</Condition>",
+        )
+
     if number is not None and number > 1:
         # Every object here is one part. The part is named as parsed, `02` as `2` (2026-09-29).
         if head:
@@ -1883,11 +2090,13 @@ async def object_get(request: Request, bucket: str, key: str):
             f"<PartNumberRequested>{number}</PartNumberRequested>"
             "<ActualPartCount>1</ActualPartCount>",
         )
-    ts = row["updated_ts"] or row["created_ts"]
     headers = {
-        "ETag": synth.s3_etag(row["key"], row["content"]),
-        "Last-Modified": synth.s3_http_date(ts),
+        "ETag": etag,
+        "Last-Modified": last_modified,
         "Accept-Ranges": "bytes",
+        # SSE-S3, the default `_ANSWERED["encryption"]` declares, which real names on an object's
+        # own 200 and 206, GET and HEAD alike (measured in us-east-1 on 2026-10-11).
+        "x-amz-server-side-encryption": "AES256",
     }
     ctype = row["content_type"] or "text/plain"
     # Set Content-Type via the headers dict, not the `media_type=` kwarg: Starlette auto-appends
@@ -1927,6 +2136,7 @@ async def object_get(request: Request, bucket: str, key: str):
 
     length = end - start + 1
     headers["Content-Length"] = str(length)
+    headers.update(_response_overrides(q))
     if head:
         return Response(status_code=status, headers=headers)
     return Response(content=data[start : end + 1], status_code=status, headers=headers)
@@ -1975,21 +2185,24 @@ def _part_refusal(request: Request, part: str) -> Response | None:
 
 
 def _object_parse(request: Request, selected: list[str], head: bool) -> Response | None:
-    """What a GET at a key refuses before the credential and the bucket, as real refused it,
-    unsigned, over a bad secret and in a bucket nobody owns (measured 2026-09-29 and 2026-09-30):
-    a `versionId`, `null` included, beside a selector whose operation takes none
-    (``_KEY_VERSIONLESS``), "This operation does not accept a version-id."; an empty `versionId`,
-    "Version id cannot be the empty string"; an `x-amz-object-attributes` naming an attribute there
-    is none of, read as ``_attribute_names`` reads it and naming the first such name; and on a GET
-    ListObjectAnnotations' `max-annotation-results`, parsed as `max-keys` is and then held to 1 to
-    1000, naming it as sent. A HEAD is refused each of the others as its status alone, where
-    `?annotation&max-annotation-results=abc` is the selector's 405."""
+    """What a GET at a key refuses before the bucket, and before the credential but for its last
+    step, in the order real refused them, unsigned, over a bad secret and in a bucket nobody owns
+    (measured 2026-09-29, 2026-09-30, 2026-10-13 and 2026-10-14): `annotationName` without
+    `annotation`, "Unexpected query string parameter" under `ResourceType`; an
+    `x-amz-object-attributes` naming an attribute there is none of, read as ``_attribute_names``
+    reads it and naming the first such name; on a GET ListObjectAnnotations'
+    `max-annotation-results`, parsed as `max-keys` is and then held to 1 to 1000, naming it as sent,
+    and ListParts' own integers, where `max-parts=-1` is left to the upload; then a `response-`
+    parameter and a valued `website` (``_response_override_refusal``, ``_website_refusal``); then a
+    `versionId`, `null` included, beside a selector whose operation takes none
+    (``_KEY_VERSIONLESS``), "This operation does not accept a version-id.", and an empty
+    `versionId`, "Version id cannot be the empty string"; then an annotation operation sent unsigned
+    or with Signature Version 2 (``_sigv4_only_refusal``). A HEAD is refused each of the others as
+    its status alone, where `?uploadId=x&max-parts=abc` is the selector's 405, and so is
+    `?annotation&max-annotation-results=abc` signed with SigV4."""
     q = request.query_params
-    version = _first(q, "versionId", None)
-    if version is not None and selected and selected[0] in _KEY_VERSIONLESS:
-        return _argument_error(_NO_VERSION_ID, "versionId", version)
-    if version == "":
-        return _argument_error("Version id cannot be the empty string", "versionId", "")
+    if selected == ["annotationName"]:
+        return _argument_error("Unexpected query string parameter", "ResourceType", selected[0])
     sent = request.headers.get("x-amz-object-attributes")
     if selected == ["attributes"] and sent is not None:
         for name in _attribute_names(sent):
@@ -2008,7 +2221,55 @@ def _object_parse(request: Request, selected: list[str], head: bool) -> Response
                 "max-annotation-results",
                 _first(q, "max-annotation-results"),
             )
+    if not head and selected == ["uploadId"]:
+        for name in ("max-parts", "part-number-marker"):
+            _, err = _int32_param(q, name, 0)
+            if err:
+                return err
+    refused = _response_override_refusal(q) or _website_refusal(q)
+    if refused is not None:
+        return refused
+    version = _first(q, "versionId", None)
+    if version is not None and selected and selected[0] in _KEY_VERSIONLESS:
+        return _argument_error(_NO_VERSION_ID, "versionId", version)
+    if version == "":
+        return _argument_error("Version id cannot be the empty string", "versionId", "")
+    if selected == ["annotation"]:
+        return _sigv4_only_refusal(request)
     return None
+
+
+_SIGV4_ONLY = (
+    "The authorization mechanism you have provided is not supported. "
+    "Please use Signature Version 4."
+)
+
+
+def _sigv4_only_refusal(request: Request) -> Response | None:
+    """Real's 400 for ListObjectAnnotations and GetObjectAnnotation (``?annotation`` as
+    ``_key_selected`` reads it, with or without an ``annotationName``) sent unsigned or signed with
+    Signature Version 2, or ``None``. The write methods apply the same check
+    (``object_method_refusal``).
+
+    Unsigned is what ``backlot.auth.resolve_sigv4`` reads as no credential, an empty `Authorization`
+    and the two lone query parameters it names among them, and Signature Version 2 is the header's
+    or the query's. Real refused each of those at an object, the unsigned request and the V2 header
+    in a bucket that does not exist too, and a HEAD unsigned or with a V2 header with its status
+    alone; a V2 header or query with an access key AWS does not know and one whose signature does
+    not verify got the 400 as well, so real checks neither first (us-east-1, 2026-10-13 and
+    2026-10-14). A V2 credential real refuses for its own shape is refused as that instead, which is
+    everything ``backlot.auth.resolve_sigv4`` checks before ``backlot.auth._verify_v2`` reads the
+    key; of those, `Authorization: AWS` with no space, `AWS garbage`, a query `Signature` without
+    `Expires` or past it, a V2 header with no date or a skewed one, and a V2 header beside a
+    presigned query were each that refusal on real, as was `Bearer x`, which is neither unsigned nor
+    V2."""
+    caller, refusal = auth.resolve_sigv4(request)
+    v2 = auth.signed_with_v2(request)
+    if refusal is None:
+        refused = v2 or caller.is_anonymous
+    else:
+        refused = v2 and refusal.code in ("InvalidAccessKeyId", "SignatureDoesNotMatch")
+    return _error("InvalidRequest", _SIGV4_ONLY) if refused else None
 
 
 def _attribute_names(sent: str | None) -> list[str]:
@@ -2313,7 +2574,17 @@ def _method_type(method: str, resource_type: str) -> str:
 
 
 def _cors_preflight(request: Request, message: str) -> Response:
-    """Real's answer to an `OPTIONS`, which its CORS front end gives before anything reads the path.
+    """Real's answer to an `OPTIONS` whose query is not refused first.
+
+    Three queries are refused ahead of it with the 400 a GET gets, with or without an `Origin` and
+    ahead of the 400 for an `Access-Control-Request-Method` real does not take: two selectors or
+    more at a bucket's path or a key's, a bucket's `partNumber` and a key's `annotationName` without
+    `annotation`. One selector otherwise, a key's `partNumber` and `partNumber` beside `uploadId`
+    at either path are this answer, and so was each query sent to the service root. Measured
+    2026-10-13 against s3.amazonaws.com (us-east-1), path-style, at `noaa-ghcn-pds`, a bucket name
+    nobody owns, a key in each and the service root: every selector of `_BUCKET_WRITE_SELECTORS`
+    and `_OBJECT_WRITE_SELECTORS` alone and beside `acl` at both paths unsigned, and the three
+    refusals signed and over a bad secret as well.
 
     Without an `Origin`, or with an empty one, it is the same 400 on a bucket, a key and the service
     root; with one it is a 403 whose message says which way the lookup failed, whose `ResourceType`
@@ -2896,16 +3167,23 @@ _VERSION_AFTER_THE_BUCKET = frozenset({("PUT", "acl"), ("POST", "restore")})
 @router.api_route(
     "/{bucket}", methods=["PUT", "POST", "DELETE", "PATCH", "OPTIONS"], include_in_schema=False
 )
+@router.api_route(
+    "/{bucket}/", methods=["PUT", "POST", "DELETE", "PATCH", "OPTIONS"], include_in_schema=False
+)
 async def bucket_method_refusal(request: Request, bucket: str) -> Response:
     """Without a selector, `PUT` creates the bucket on real, `DELETE` removes it and `POST` is a
     form upload, and `PATCH` is a refusal of real's own; with one, the selector decides. Real's
     refusals are answered as real answers them, and its writes are the ones this server refuses
     instead."""
     method = request.method
-    if method == "OPTIONS":
-        return _cors_preflight(request, _CORS_DISABLED)
     q = request.query_params
     selected = _bucket_selected(q, frozenset(_BUCKET_WRITE_SELECTORS))
+    if method == "OPTIONS":
+        if len(selected) > 1:
+            return _conflict(selected)
+        if selected == ["partNumber"]:
+            return _error("InvalidRequest", _KEY_REQUIRED)
+        return _cors_preflight(request, _CORS_DISABLED)
     late = len(selected) == 1 and (method, selected[0]) in _VERSION_AFTER_THE_BUCKET
     if len(selected) <= 1 and selected != ["partNumber"]:
         skip = late or (method == "POST" and not selected)
@@ -2947,12 +3225,36 @@ async def bucket_method_refusal(request: Request, bucket: str) -> Response:
 )
 async def object_method_refusal(request: Request, bucket: str, key: str) -> Response:
     """Without a selector a key path takes `PUT` and `DELETE` on real, both writes, and refuses
-    `PATCH` and `POST` with the 405 that names `OBJECT`; with one, the selector decides."""
+    `PATCH` and `POST` with the 405 that names `OBJECT`; with one, the selector decides.
+
+    An empty first `annotation` value selects the annotation operation, as on a GET; a valued
+    first one is the object's own operation. On `PUT`, `POST`, `DELETE` and `PATCH`, real refuses
+    an unsigned or V2 annotation credential with ``_sigv4_only_refusal``'s 400, after a selector
+    conflict and before the bucket, body or `Content-MD5` checks. A write does not parse
+    `max-annotation-results`. Measured 2026-10-14 against s3.amazonaws.com (us-east-1), path-style,
+    at `noaa-ghcn-pds/readme.txt` and a key in a bucket nobody owns: unsigned, with an empty body
+    and with `<x/>` and a bad `Content-MD5`, without and with `annotationName`; a V2 header with
+    an unknown key and a V2 query got the same 400 at the public object. There, a bearer header,
+    a V2 header lacking its date and an expired V2 query kept their credential refusals; beside
+    `acl` each was the conflict, as was `annotation&website=x` unsigned at both paths."""
     method = request.method
     if method == "OPTIONS":
+        selected = _key_selected(request.query_params)
+        if len(selected) > 1:
+            return _conflict(selected)
+        if selected == ["annotationName"]:
+            return _argument_error("Unexpected query string parameter", "ResourceType", selected[0])
         return _cors_preflight(request, _CORS_DISABLED)
     q = request.query_params
     selected = _selected(q, frozenset(_OBJECT_PATH_WRITE_SELECTORS))
+    if "annotation" in selected and _first(q, "annotation") != "":
+        selected.remove("annotation")
+    if "annotation" in selected:
+        if len(selected) > 1:
+            return _conflict(selected)
+        refused = _sigv4_only_refusal(request)
+        if refused is not None:
+            return refused
     if selected == ["uploadId"] and "partNumber" in q:
         selected = ["PART"]
     refused = _website_refusal(q)
