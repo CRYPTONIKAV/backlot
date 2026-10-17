@@ -263,7 +263,7 @@ def test_github_a_directory_readme_is_that_directorys_and_acl_scoped(tmp_path):
     with client_for(s, reload=True) as c:
         admin = {"Authorization": f"Bearer {s.admin_token}"}
         org = c.get("/_meta/users", headers=admin).json()["org"]
-        tokens = yaml.safe_load(s.tokens_path.read_text())["users"]
+        tokens = yaml.safe_load(s.tokens_path.read_text(encoding="utf-8"))["users"]
         outsider = next(u["token"] for u in tokens if u["email"] == "outsider@x.com")
         url = f"/github/repos/{org}/scoped/readme/docs"
         got = c.get(url, headers=admin).json()
@@ -330,7 +330,7 @@ def test_github_the_redirect_does_not_precede_the_repository(tmp_path):
     with client_for(s, reload=True) as c:
         admin = {"Authorization": f"Bearer {s.admin_token}"}
         org = c.get("/_meta/users", headers=admin).json()["org"]
-        tokens = yaml.safe_load(s.tokens_path.read_text())["users"]
+        tokens = yaml.safe_load(s.tokens_path.read_text(encoding="utf-8"))["users"]
         outsider = next(u["token"] for u in tokens if u["email"] == "outsider@x.com")
 
         def slash(owner_repo, headers):
@@ -521,6 +521,124 @@ def test_github_pulls_filtered_by_state(client, admin_h, org):
         f"/github/repos/{org}/gateway/pulls", headers=admin_h, params={"state": "all"}
     ).json()
     assert [p["title"] for p in all_body] == ["Fix token-bucket refill off-by-one"]
+
+
+@pytest.fixture(scope="module")
+def gh_labelled(tmp_path_factory):
+    """One repository whose issues carry labels spelt in two cases, one of them a pull and one
+    private to hana, beside a labelled source file, for the issue listing's `labels` filter."""
+    rows = [
+        ("Bug", ["bug"], "issue", "public"),
+        ("Docs", ["documentation"], "issue", "public"),
+        ("Fix", ["BUG", "Documentation"], "pull_request", "public"),
+        ("Private bug", ["bug"], "issue", "private"),
+        ("Source", ["bug"], "file", "public"),
+    ]
+    records = [
+        {
+            "source_type": "github",
+            "doc_id": f"label-{i}",
+            "repo": "triage",
+            "title": title,
+            "labels": labels,
+            "subtype": kind,
+            "visibility": visibility,
+            "author_email": "hana@acme.com" if visibility == "private" else "bob@acme.com",
+            "state": "open",
+            **({"path": "src/main.py"} if kind == "file" else {}),
+        }
+        for i, (title, labels, kind, visibility) in enumerate(rows)
+    ]
+    with corpus_client(tmp_path_factory.mktemp("gh_labelled"), records) as (c, settings):
+        tokens = yaml.safe_load(settings.tokens_path.read_text(encoding="utf-8"))
+        org = c.get("/_meta/users").json()["org"]
+        yield (
+            c,
+            f"/github/repos/{org}/triage/issues",
+            {"Authorization": f"Bearer {settings.admin_token}"},
+            {"Authorization": f"Bearer {tok(tokens, 'bob@acme.com')}"},
+        )
+
+
+_LABELLED = {"Bug", "Docs", "Fix", "Private bug"}
+_BUG = {"Bug", "Fix", "Private bug"}
+
+
+@pytest.mark.parametrize(
+    "query, titles",
+    [
+        ("", _LABELLED),
+        ("labels=", _LABELLED),
+        ("labels=bug", _BUG),
+        ("labels=BUG", _BUG),
+        ("labels=documentation", {"Docs", "Fix"}),
+        ("labels=bug,documentation", {"Fix"}),
+        ("labels=Documentation,Bug", {"Fix"}),
+        ("labels=bug,bug", _BUG),
+        ("labels=bug,", _BUG),
+        ("labels=bug,,", _BUG),
+        ("labels=zzqq-no-such-label", set()),
+        ("labels=bug,zzqq-no-such-label", set()),
+        ("labels=%20bug", set()),
+        ("labels=bug%20", set()),
+        ("labels=bug,%20documentation", set()),
+        ("labels=bug,,documentation", set()),
+        # the last of a repeated parameter
+        ("labels=bug&labels=documentation", {"Docs", "Fix"}),
+        ("labels=documentation&labels=bug", _BUG),
+        ("labels=bug&labels=", _LABELLED),
+        # commas alone, or whitespace alone, filter nothing
+        ("labels=,", _LABELLED),
+        ("labels=,,", _LABELLED),
+        ("labels=%20", _LABELLED),
+        ("labels=%09", _LABELLED),
+        ("labels=%C2%A0", _LABELLED),
+        ("labels=%E3%80%80", _LABELLED),
+        ("labels=%1C", set()),
+        ("labels=%20,", set()),
+    ],
+)
+def test_github_the_issue_listing_serves_the_issues_carrying_every_named_label(
+    gh_labelled, query, titles
+):
+    """Each row is the answer real gave that spelling on psf/requests, transposed to this corpus
+    (the rule and its dates are in :func:`backlot.routers.github.list_issues`), asked by the admin
+    and by a token that cannot see the private issue. The pull is served like the issues, and the
+    source file never is."""
+    c, url, admin, scoped = gh_labelled
+    for headers, expected in ((admin, titles), (scoped, titles - {"Private bug"})):
+        r = c.get(f"{url}?{query}", headers=headers)
+        assert r.status_code == 200, r.text
+        assert {row["title"] for row in r.json()} == expected, headers is admin
+
+
+@pytest.mark.parametrize(
+    "query, titles, linked",
+    [
+        ("labels=BUG", _BUG, ["labels=BUG"]),
+        ("labels=documentation&labels=bug", _BUG, ["labels=bug"]),
+        ("labels=,", _LABELLED, ["labels=%2C"]),
+    ],
+)
+def test_github_the_issue_listing_filters_by_label_before_it_pages(
+    gh_labelled, query, titles, linked
+):
+    """The filter runs before the page is cut, so a walk of one-row pages serves each match once,
+    and every `next` carries `labels` once, the value the listing read, as it was spelt (see
+    :func:`backlot.routers.github.list_issues`). A separate walk rather than rows of the table
+    above, since what it reads is the page links."""
+    c, url, admin, _ = gh_labelled
+    r = c.get(f"{url}?{query}&per_page=1", headers=admin)
+    seen = []
+    while True:
+        assert r.status_code == 200, r.text
+        seen += [row["title"] for row in r.json()]
+        nxt = _link_rels(r.headers.get("Link", "")).get("next")
+        if nxt is None:
+            break
+        assert [p for p in nxt.partition("?")[2].split("&") if p.startswith("labels=")] == linked
+        r = c.get(nxt, headers=admin)
+    assert sorted(seen) == sorted(titles)
 
 
 def test_github_state_is_reals_enum_refused_on_issues_and_absorbed_on_pulls(tmp_path):
@@ -1056,7 +1174,7 @@ def gh_org(gh_client):
 @pytest.fixture(scope="module")
 def gh_user_tokens(gh_client):
     _, settings = gh_client
-    data = yaml.safe_load(settings.tokens_path.read_text())
+    data = yaml.safe_load(settings.tokens_path.read_text(encoding="utf-8"))
     return {"admin": data["admin_token"], **{u["email"]: u["token"] for u in data["users"]}}
 
 
@@ -1750,6 +1868,16 @@ def test_github_git_ref_resolves_a_pulls_own_ref(gh_client, gh_admin_h, gh_org):
         assert r.status_code == 200, suffix
         assert r.json()["ref"] == f"refs/pull/{num}/{suffix}"
     assert c.get(f"{base}/git/ref/pull/999999/head", headers=gh_admin_h).status_code == 404
+    # the same number in other digits, or with a leading zero, names no ref (see `_ref_exists`)
+    digits = str(num)
+    for spelling in (
+        digits.translate(str.maketrans("0123456789", "０１２３４５６７８９")),
+        digits.translate(str.maketrans("0123456789", "٠١٢٣٤٥٦٧٨٩")),
+        f"0{digits}",
+    ):
+        for suffix in ("head", "merge"):
+            r = c.get(f"{base}/git/ref/pull/{spelling}/{suffix}", headers=gh_admin_h)
+            assert r.status_code == 404, (spelling, suffix)
     # this repo states no tags and `/tags` says so, so a tag ref cannot resolve either
     assert c.get(f"{base}/git/ref/tags/v1", headers=gh_admin_h).status_code == 404
 
@@ -2122,9 +2250,9 @@ def test_github_401_says_which_credential_failed(gh_client, gh_admin_h, gh_org):
     is "Requires authentication". A client telling "I forgot the token" from "my token is wrong"
     read one answer for both before this.
 
-    An `Authorization` real cannot parse is the second case, not the first: real ignores the header
-    and serves the request anonymously (`Basic …` and a scheme-less value both answer 200 on a
-    public repo), so the caller arrives with no credential rather than a rejected one.
+    Which `Authorization` values real reads as a credential is
+    :func:`backlot.auth.github_credential`'s table; one it does not is the second case, not the
+    first (see :func:`backlot.routers.github._require`).
 
     Both carry the bare `https://docs.github.com/rest`, which is what real answers on the routes a
     Backlot caller can meet a 401 on — a 404's route-specific anchor is not used here.
@@ -2138,18 +2266,26 @@ def test_github_401_says_which_credential_failed(gh_client, gh_admin_h, gh_org):
         "documentation_url": "https://docs.github.com/rest",
         "status": "401",
     }
-    for unparseable in ("Basic Zm9vOmJhcg==", "just-a-value", "Bearer"):
-        r = c.get(url, headers={"Authorization": unparseable})
+    for no_credential in ("Basic Zm9vOmJhcg==", "just-a-value"):
+        r = c.get(url, headers={"Authorization": no_credential})
         assert r.status_code == 401 and r.json()["message"] == "Requires authentication", (
-            unparseable
+            no_credential
         )
-    bad = c.get(url, headers={"Authorization": "Bearer usr-not-a-real-token"})
-    assert bad.status_code == 401
-    assert bad.json() == {
-        "message": "Bad credentials",
-        "documentation_url": "https://docs.github.com/rest",
-        "status": "401",
-    }
+    for value in (
+        "Bearer usr-not-a-real-token",
+        "Bearer",
+        "token",
+        "Bearer,",
+        "Basic",
+        "Basic !!!!",
+    ):
+        bad = c.get(url, headers={"Authorization": value})
+        assert bad.status_code == 401
+        assert bad.json() == {
+            "message": "Bad credentials",
+            "documentation_url": "https://docs.github.com/rest",
+            "status": "401",
+        }, value
     # a bad bearer still wins over an unsupported version — see _validate_bad_credential
     bad_and_unversioned = c.get(
         url,
@@ -2188,6 +2324,7 @@ def test_github_documentation_url_names_the_route_that_failed(gh_client, gh_admi
             f"{missing}/collaborators",
             "rest/collaborators/collaborators#list-repository-collaborators",
         ),
+        (f"{missing}/issues/1", "rest/issues/issues#get-an-issue"),
         (f"{missing}/pulls/1/files", "rest/pulls/pulls#list-pull-requests-files"),
         # the two routes that take the rest of the path as one parameter still resolve
         (f"{missing}/git/ref/heads/release/2026-03", "rest/git/refs#get-a-reference"),
@@ -2399,30 +2536,60 @@ def test_github_pages_at_reals_thirty_and_caps_at_its_hundred(tmp_path):
         assert Settings.model_fields["max_page_size"].default == 1000
 
 
-def test_github_a_path_parameter_it_cannot_parse_is_the_route_s_404(gh_client, gh_admin_h, gh_org):
-    """Real has no route for `/issues/notanint`, so it answers the 404 that route's own anchor
-    names — measured: `Not Found`, `documentation_url: .../rest/issues/issues#get-an-issue`.
+@pytest.mark.parametrize(
+    "route",
+    [
+        "issues/{number}",
+        "issues/{number}/comments",
+        "issues/comments/{number}",
+        "pulls/{number}",
+        "pulls/{number}/reviews",
+        "pulls/{number}/comments",
+        "pulls/{number}/commits",
+        "pulls/{number}/files",
+        "pulls/comments/{number}",
+        "git/ref/pull/{number}/head",
+        "git/ref/pull/{number}/merge",
+    ],
+)
+@pytest.mark.parametrize(
+    "number",
+    [
+        "notanint",
+        "²",
+        "9223372036854775808",
+        "-9223372036854775809",
+        pytest.param("1" * 4301, id="4301-digits"),
+    ],
+)
+def test_github_a_path_number_it_cannot_read_is_the_unknown_number_404(
+    gh_client, gh_admin_h, gh_org, route, number
+):
+    """A path number that is not an integer (`²` included), or one outside 64 bits (see
+    store.github_by_number), gets the 404 an unknown number gets on that route, byte for byte, as
+    real answers both; `²` was measured on all eleven routes. A number of 4,301 digits, one more
+    than `int()` converts, gets that 404 too, where real answers a path that long with a 414 on
+    `issues/{number}` and the git refs, and with a 404 on `pulls/{number}`.
 
-    Backlot declares `number: int` and so matches the route and fails after, which is a difference
-    in how the two arrive rather than in what they answer. What it must not do is answer a 422:
-    `{"detail": [...]}` announced itself as the mock's own default, and an envelope does not — a
-    status real never sends would read as measured.
+    The routes that declare the number an `int` match `notanint` and then fail to validate it, and
+    that has to be the route's 404 rather than a 422: `{"detail": [...]}` would announce itself as
+    the mock's own default, and an envelope would not, so a status real never sends would read as
+    measured.
     """
     c, _ = gh_client
-    r = c.get(f"/github/repos/{gh_org}/codebase/issues/notanint", headers=gh_admin_h)
-    assert r.status_code == 404
-    assert r.json() == {
-        "message": "Not Found",
-        "documentation_url": "https://docs.github.com/rest/issues/issues#get-an-issue",
-        "status": "404",
-    }
+    base = f"/github/repos/{gh_org}/codebase/"
+    unknown = c.get(base + route.format(number="999999999"), headers=gh_admin_h)
+    actual = c.get(base + route.format(number=number), headers=gh_admin_h)
+    assert unknown.status_code == 404
+    assert actual.status_code == unknown.status_code
+    assert actual.content == unknown.content
 
 
 def test_github_a_wrong_method_is_not_dressed_as_a_measured_answer(gh_client, gh_admin_h, gh_org):
-    """Every route here declares GET, so a wrong method is refused by Starlette with
-    `http.HTTPStatus(405).phrase` — a string no measurement attributes to real, which answers a
-    wrong method per endpoint rather than uniformly (an unauthenticated `POST /repos/{owner}/{repo}`
-    is real's 401 Requires authentication, measured).
+    """Every route here declares GET, so a wrong method that reaches the router is refused by
+    Starlette with `http.HTTPStatus(405).phrase` — a string no measurement attributes to real, which
+    answers a wrong method per endpoint rather than uniformly (an unauthenticated
+    `POST /repos/{owner}/{repo}` is real's 401 Requires authentication, measured).
 
     So it keeps FastAPI's `detail`, which says plainly that the mock is answering. The envelope is
     for the errors whose wording was measured. `HEAD` is not a wrong method here: real answers it
@@ -2433,6 +2600,83 @@ def test_github_a_wrong_method_is_not_dressed_as_a_measured_answer(gh_client, gh
     r = c.post(f"/github/repos/{gh_org}/codebase", headers=gh_admin_h)
     assert r.status_code == 405
     assert r.json() == {"detail": "Method Not Allowed"}
+
+
+#: (method, path, whether it is refused, the status a caller it does not refuse gets). The first
+#: eight are in `backlot.routers.github._PUBLISHED_NOT_SERVED`, the eighth as the `/orgs/{}` path
+#: `/organizations/{id}` is rewritten to; the next two are baseline rows that `_ROUTED_AS` and
+#: `_NOT_ROUTED` keep out of it; the two after them are no operation, though a parsed URL ends the
+#: first at its decoded `#` and a `missing_param` row of the baseline spells the second's path; the
+#: next is a method GitHub does not publish on a path whose `PATCH` it does, which real answered a
+#: bad bearer with its 404; and the last is no GitHub request at all.
+_UNSERVED_ROWS = [
+    ("PATCH", "/github/repos/{org}/codebase", True, 405),
+    ("DELETE", "/github/repos/{org}/codebase", True, 405),
+    ("POST", "/github/repos/{org}/codebase/forks", True, 404),
+    ("GET", "/github/user/packages", True, 404),
+    ("DELETE", "/github/user/keys/1", True, 404),
+    ("PUT", "/github/teams/1/repos/{org}/codebase", True, 404),
+    ("GET", "/github/repos/{org}/codebase/actions/artifacts/1/zip", True, 404),
+    ("GET", "/github/organizations/1/settings/billing/usage", True, 404),
+    ("GET", "/github/repos/{org}/codebase/actions/artifacts/1/tar", False, 404),
+    ("POST", "/github/repos/{org}/codebase/releases/1/assets", False, 404),
+    ("GET", "/github/zen%23", False, 404),
+    ("GET", "/github/repos/{org}/codebase/issues%3Fsince", False, 404),
+    ("PUT", "/github/orgs/{org}", False, 405),
+    ("GET", "/zen", False, 404),
+]
+
+
+@pytest.mark.parametrize("method, path, refused, status", _UNSERVED_ROWS)
+def test_github_an_unserved_operation_is_refused_for_its_credential_first(
+    gh_client, gh_admin_h, gh_org, method, path, refused, status
+):
+    """Each refused row answers what :func:`backlot.routers.github.refuse_an_unserved_operation`
+    records of real: the credential's 401 with no header, with or without a version, and for each
+    header that carries no credential, then for a token that does not resolve, then the version's
+    400, counted, ahead of the router's answer to the admin token and of the refusal of a `Basic`
+    value that names no token, each carrying the version echo. A row not refused is the
+    router's answer for any caller. Real was measured on each row but the last with a bad bearer, an
+    unknown scheme and a bearer after a tab, on each refused row with each header below, and with no
+    header on the first six.
+    """
+    c, _ = gh_client
+    url = path.format(org=gh_org)
+    bad_version = {"X-GitHub-Api-Version": "1999-01-01"}
+    tab_admin = "Bearer\t" + gh_admin_h["Authorization"].split(" ", 1)[1]
+    if not refused:
+        for headers in (
+            {},
+            {"Authorization": "Bearer nope"},
+            {"Authorization": "Digest x"},
+            {"Authorization": "Bearer\tnope"},
+            gh_admin_h,
+            bad_version,
+        ):
+            assert c.request(method, url, headers=headers).status_code == status, headers
+        return
+    # (headers, whether the 401 carries the five `x-ratelimit-*`)
+    no_credential = [({}, method in ("GET", "POST")), (bad_version, method in ("GET", "POST"))]
+    no_credential += [
+        ({"Authorization": value, **bad_version}, False)
+        for value in ("Digest x", "nope", "", "Bearer\tnope", "Basic\t!!!!", tab_admin)
+    ]
+    for headers, counted in no_credential:
+        r = c.request(method, url, headers=headers)
+        assert (r.status_code, r.json()["message"]) == (401, "Requires authentication"), headers
+        assert "x-github-api-version-selected" not in r.headers, headers
+        assert any(name.startswith("x-ratelimit-") for name in r.headers) == counted, headers
+    bad = c.request(method, url, headers={"Authorization": "Bearer nope", **bad_version})
+    assert (bad.status_code, bad.json()["message"]) == (401, "Bad credentials")
+    basic = {"Authorization": "Basic Zm9vOmJhcg=="}
+    for headers, answered in ((gh_admin_h, status), (basic, 401)):
+        r = c.request(method, url, headers=headers)
+        assert r.status_code == answered, headers
+        assert r.headers["x-github-api-version-selected"] == "2022-11-28", headers
+        assert any(name.startswith("x-ratelimit-") for name in r.headers), headers
+        unversioned = c.request(method, url, headers={**headers, **bad_version})
+        assert (unversioned.status_code, unversioned.json()["message"]) == (400, "Bad Request")
+        assert any(name.startswith("x-ratelimit-") for name in unversioned.headers), headers
 
 
 def test_github_a_head_is_the_get_with_the_body_left_off(gh_client, gh_admin_h, gh_org):
@@ -2812,6 +3056,25 @@ def test_github_a_page_url_omits_a_page_size_the_caller_did_not_send(
     assert nxt.endswith("?state=all&page=2") and "per_page" not in nxt
     sent = c.get(url, headers=gh_admin_h, params={"state": "all", "per_page": 1})
     assert "per_page=1&page=2" in _link_rels(sent.headers["Link"])["next"]
+
+
+@pytest.mark.parametrize(
+    "qs",
+    [
+        "q=extension:md&per_page=2&page=1",
+        "q=extension:md&page=1&per_page=2",
+        "per_page=2&q=extension:md",
+    ],
+)
+def test_github_code_search_page_links_write_page_before_per_page(gh_client, gh_admin_h, qs):
+    """Each order the request sends its parameters in links the same url, in the order
+    :func:`backlot.pagination.github_code_search_link_header` records."""
+    c, _ = gh_client
+    r = c.get(f"/github/search/code?{qs}", headers=gh_admin_h)
+    assert r.status_code == 200
+    rels = _link_rels(r.headers["Link"])
+    assert rels["next"].split("?", 1)[1] == "q=extension%3Amd&page=2&per_page=2"
+    assert rels["first"].split("?", 1)[1] == "q=extension%3Amd&page=1&per_page=2"
 
 
 @pytest.mark.parametrize(
@@ -3524,7 +3787,7 @@ def test_github_a_container_only_repo_reaches_the_admin_and_no_scoped_caller(tmp
     settings = build_corpus(tmp_path, _GH_CONTAINER_ONLY_DOCS)
     with client_for(settings, reload=True) as c:
         org = c.get("/_meta/users").json()["org"]
-        tokens = yaml.safe_load(settings.tokens_path.read_text())
+        tokens = yaml.safe_load(settings.tokens_path.read_text(encoding="utf-8"))
         admin = {"Authorization": f"Bearer {tokens['admin_token']}"}
         ava = {"Authorization": f"Bearer {tok(tokens, 'ava@acme.com')}"}
 
@@ -3583,6 +3846,13 @@ def test_github_user_repos(gh_client, gh_admin_h, gh_user_tokens, gh_org):
     bob = {x["name"] for x in c.get("/github/user/repos", headers=bob_h).json()}
     assert "vault" in {x["name"] for x in body} and "vault" not in bob
     assert bob < {x["name"] for x in body}
+    # a token inside `Basic`, as the password or as the user, is that token's caller and sees what
+    # it sees (see `backlot.auth.github_credential`)
+    every = {x["name"] for x in body}
+    for token, names in ((gh_user_tokens["admin"], every), (gh_user_tokens["bob@acme.com"], bob)):
+        for pair in (f"x:{token}", f"{token}:x-oauth-basic"):
+            basic = {"Authorization": "Basic " + base64.b64encode(pair.encode()).decode()}
+            assert {x["name"] for x in c.get("/github/user/repos", headers=basic).json()} == names
 
     # ...and the repo's own routes agree with the listing. A repo every one of whose documents is
     # hidden from this caller is one they must not be able to confirm the existence of, so "does
@@ -4196,14 +4466,15 @@ def test_github_pull_diff_reverse_applies_with_real_git(
         ).text
         dest = wt / e["path"]
         dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_text(raw)
-    (wt / "pr.diff").write_text(diff)
+        dest.write_text(raw, encoding="utf-8")
+    (wt / "pr.diff").write_text(diff, encoding="utf-8")
     r = subprocess.run(
         ["git", "apply", "--reverse", "--check", "-v", "pr.diff"],
         cwd=wt,
         capture_output=True,
         text=True,
         check=False,
+        encoding="utf-8",
     )
     assert r.returncode == 0, f"git rejected the diff:\n{r.stderr}\n---\n{diff}"
 
@@ -4322,14 +4593,15 @@ def test_github_diff_never_emits_a_file_header_with_no_body(tmp_path):
     wt = tmp_path / "wt"
     wt.mkdir()
     subprocess.run(["git", "init", "-q"], cwd=wt, check=True)
-    (wt / "ok.txt").write_text("hello\n")
-    (wt / "pr.diff").write_text(diff)
+    (wt / "ok.txt").write_text("hello\n", encoding="utf-8")
+    (wt / "pr.diff").write_text(diff, encoding="utf-8")
     r = subprocess.run(
         ["git", "apply", "--reverse", "--check", "pr.diff"],
         cwd=wt,
         capture_output=True,
         text=True,
         check=False,
+        encoding="utf-8",
     )
     assert r.returncode == 0, r.stderr
 
@@ -4785,11 +5057,16 @@ def test_github_tree_truncates_at_the_real_caps(gh_client, gh_admin_h, gh_org, m
 # --- OpenAPI enrichment: github response fidelity ------------------------------------------
 
 
-def test_github_list_issues_documents_state_param(client):
+def test_github_list_issues_documents_its_filters(client):
     op = client.get("/openapi.json").json()["paths"]["/github/repos/{owner}/{repo}/issues"]["get"]
     params = {p["name"]: p for p in op.get("parameters", [])}
     assert "state" in params and {"page", "per_page"} <= set(params)
     assert params["state"]["schema"].get("default") == "open"
+    # `labels` as GitHub's OpenAPI description declares it
+    assert params["labels"]["description"] == (
+        "A list of comma separated label names. Example: `bug,ui,@high`"
+    )
+    assert params["labels"]["schema"]["type"] == "string"
 
 
 def test_github_the_statuses_listing_declares_the_page_parameters_real_accepts(client):
@@ -4805,9 +5082,31 @@ def test_github_the_statuses_listing_declares_the_page_parameters_real_accepts(c
     assert {"page", "per_page"} <= {p["name"] for p in op.get("parameters", [])}
 
 
-def test_github_search_still_filters_by_q(client, admin_h):
-    body = client.get("/github/search/issues", params={"q": "is:issue"}, headers=admin_h).json()
-    assert "items" in body and "total_count" in body
+@pytest.mark.parametrize(
+    "path, q, search_type",
+    [
+        ("/github/search/issues", "is:issue", "lexical"),
+        ("/github/search/issues", "is:pr", "lexical"),
+        ("/github/search/issues", "no-matching-issue-lexical-search", "lexical"),
+        ("/github/search/code", "extension:md", None),
+    ],
+)
+def test_github_search_envelope_members_and_their_order_match_real(
+    client, admin_h, path, q, search_type
+):
+    """Issue search sends `search_type` last, after `items`; code search sends no such member."""
+    response = client.get(path, params={"q": q}, headers=admin_h)
+    assert response.status_code == 200
+    members = ["total_count", "incomplete_results", "items"] + ["search_type"] * bool(search_type)
+    assert list(response.json()) == members
+    assert response.json().get("search_type") == search_type
+
+
+def test_github_issue_search_schema_requires_search_type(client):
+    spec = client.get("/openapi.json").json()
+    schema = spec["components"]["schemas"]["GitHubIssueSearch"]
+    assert "search_type" in schema["required"]
+    assert schema["properties"]["search_type"]["type"] == "string"
 
 
 def test_github_responses_unchanged_by_enrichment(client, admin_h):
@@ -5131,6 +5430,44 @@ def test_github_sort_and_direction_order_the_issue_and_pull_listings_as_measured
         assert _numbers(c, pulls, h, sort="created", per_page=1, page=2) == [4]
 
 
+def test_github_issues_updated_in_the_same_second_stay_newest_first(tmp_path):
+    """Under `sort=updated` the issue listing serves a tie newest first in either direction and the
+    pull listing serves it by number in the direction asked (see `_ISSUE_ORDERING` and
+    `_PULL_ORDERING`). Every document here shares one `updated_at`, so the whole answer is the tie.
+    """
+    updated = "2021-09-09T00:28:33Z"
+    docs = [
+        {
+            "source_type": "github",
+            "doc_id": f"tie-{n}",
+            "repo": "ties",
+            "subtype": "pull_request" if n > 3 else "issue",
+            "number": n,
+            "title": f"Document {n}",
+            "content": "x",
+            "author_email": "bob@acme.com",
+            "visibility": "public",
+            "state": "open",
+            "created": f"2020-01-0{n}T00:00:00Z",
+            "updated": updated,
+            **({"head": f"feat/{n}", "base": "main"} if n > 3 else {}),
+        }
+        for n in range(1, 7)
+    ]
+    settings = build_corpus(tmp_path, docs, name="ties.jsonl")
+    with client_for(settings, reload=True) as c:
+        h = {"Authorization": f"Bearer {settings.admin_token}"}
+        org = c.get("/_meta/users").json()["org"]
+        issues = f"/github/repos/{org}/ties/issues"
+        # 6 is newest; the issue listing includes the pulls, and both directions keep that order
+        assert _numbers(c, issues, h, sort="updated", direction="asc") == [6, 5, 4, 3, 2, 1]
+        assert _numbers(c, issues, h, sort="updated", direction="desc") == [6, 5, 4, 3, 2, 1]
+        pulls = f"/github/repos/{org}/ties/pulls"
+        assert _numbers(c, pulls, h, sort="updated", direction="asc") == [4, 5, 6]
+        assert _numbers(c, pulls, h, sort="updated") == [4, 5, 6]
+        assert _numbers(c, pulls, h, sort="updated", direction="desc") == [6, 5, 4]
+
+
 def test_github_type_visibility_sort_and_direction_on_the_repository_listings(tmp_path):
     """`GET /orgs/{org}/repos` takes `type`, `sort` and `direction` and `GET /user/repos`
     `visibility`, `sort` and `direction`, each declared in GitHub's OpenAPI description with an
@@ -5437,17 +5774,48 @@ def test_github_every_response_carries_the_five_ratelimit_headers_and_rate_limit
         # listed in real's order for a caller with no credential, which is not the token's order
         assert list(resources) == ["code_search", "core", "search"]
         assert list(status.json()["resources"]) == ["core", "search", "code_search"]
-        refused = c.get("/github/rate_limit", headers={"Authorization": "Bearer nope"})
-        assert refused.status_code == 401
-        assert refused.json() == {
-            "message": "Bad credentials",
-            "documentation_url": "https://docs.github.com/rest",
-            "status": "401",
-        }
-        # a credential that did not resolve carries none of the five, no echo, and moves no
-        # window — the address's, where it would have landed, stays put
-        assert not any(n.startswith("x-ratelimit-") for n in refused.headers)
-        assert "x-github-api-version-selected" not in refused.headers
+        # a credential with no token is one too, not the request with no header above, and so is a
+        # tab after the scheme in a header that holds a comma
+        for value in (
+            "Bearer nope",
+            "Bearer",
+            "bearer nope",
+            "TOKEN nope",
+            "Bearer,",
+            "Bearer ,nope",
+            "token,nope",
+            "Basic",
+            "Basic,",
+            "Basic !!!!",
+            "Bearer \tnope",
+            "Bearer\t,nope",
+            "Bearer\tno,pe",
+            "Basic\t!!,!!",
+        ):
+            refused = c.get("/github/rate_limit", headers={"Authorization": value})
+            assert refused.status_code == 401
+            assert refused.json() == {
+                "message": "Bad credentials",
+                "documentation_url": "https://docs.github.com/rest",
+                "status": "401",
+            }
+            # a credential that did not resolve carries none of the five, no echo, and moves no
+            # window — the address's, where it would have landed, stays put
+            assert not any(n.startswith("x-ratelimit-") for n in refused.headers), value
+            assert "x-github-api-version-selected" not in refused.headers, value
+        # after a tab rather than a space, the same 401 carries the five of a window it has not
+        # used, and still no echo
+        for spelling in ("Bearer\tnope", "token\tnope", "Bearer\t nope"):
+            tab = c.get("/github/rate_limit", headers={"Authorization": spelling})
+            assert (tab.status_code, tab.json()) == (401, refused.json()), spelling
+            assert "x-github-api-version-selected" not in tab.headers, spelling
+            limits = _ratelimit(tab)
+            assert [limits[k] for k in ("limit", "remaining", "used", "resource")] == [
+                "60",
+                "60",
+                "0",
+                "core",
+            ], spelling
         assert c.get("/github/rate_limit").json()["resources"]["core"]["used"] == 2
 
         # a search endpoint's name carries `search` past the route it serves; an empty rest and a
@@ -5456,8 +5824,8 @@ def test_github_every_response_carries_the_five_ratelimit_headers_and_rate_limit
         assert _ratelimit(c.get("/github/search/issues/"))["resource"] == "core"
         assert _ratelimit(c.get("/github/search/nonexistent-zz"))["resource"] == "core"
 
-        # the route reads the version header from any request carrying an `Authorization`, an
-        # unparseable one included, and from no other
+        # the route reads the version header from any request carrying an `Authorization`, one
+        # real reads as no credential included, and from no other
         unparseable = {"Authorization": "Basic Zm9vOmJhcg=="}
         pinned = c.get(
             "/github/rate_limit", headers={**unparseable, "X-GitHub-Api-Version": "2026-03-10"}
@@ -5478,7 +5846,7 @@ def test_github_every_response_carries_the_five_ratelimit_headers_and_rate_limit
         # the same unsupported version with no credential is the 400 on any other route
         assert c.get(repo, headers={"X-GitHub-Api-Version": "1999-01-01"}).status_code == 400
 
-        # an `Authorization` real cannot parse is counted apart from the address's bare anonymous
+        # an `Authorization` real reads as no credential is counted apart from the address's bare
         # calls, in ONE window rather than one per value
         address = int(_ratelimit(c.get("/github/user/repos"))["used"])
         first = _ratelimit(c.get("/github/user/repos", headers=unparseable))
@@ -5486,6 +5854,14 @@ def test_github_every_response_carries_the_five_ratelimit_headers_and_rate_limit
         assert (first["limit"], second["limit"]) == ("60", "60")
         assert int(second["used"]) == int(first["used"]) + 1
         assert int(first["used"]) < address  # its own window, not the address's
+        # and so is a bearer after a tab, though it is refused as Bad credentials, and a `Basic`
+        # value after a tab that does not decode
+        tab = c.get("/github/user/repos", headers={"Authorization": "Bearer\tnope"})
+        assert tab.json()["message"] == "Bad credentials"
+        assert int(_ratelimit(tab)["used"]) == int(second["used"]) + 1
+        basic_tab = c.get("/github/user/repos", headers={"Authorization": "Basic\t!!!!"})
+        assert basic_tab.json()["message"] == "Requires authentication"
+        assert int(_ratelimit(basic_tab)["used"]) == int(_ratelimit(tab)["used"]) + 1
         assert int(_ratelimit(c.get("/github/user/repos"))["used"]) == address + 1
 
         # a minute on, the two search windows are new ones where `core`'s is the one it was
@@ -5618,15 +5994,21 @@ def test_github_rate_limit_refuses_an_anonymous_caller_too_and_the_switch_turns_
             assert rate_limit_slash.text == "404 Not Found"
             assert not any(n.startswith("x-ratelimit-") for n in rate_limit_slash.headers)
 
-        # a bearer that does not resolve is its own 401 on the spent window, not the refusal
+        # a bearer after a tab is counted in the unparseable window instead, so it is that window's
+        # refusal once two `Digest x` have spent it (see `refused_without_a_window`)
+        for _ in range(2):
+            digest = c.get("/github/user/repos", headers={"Authorization": "Digest x"})
+            assert digest.status_code == 401
+        tab_spent = c.get("/github/user/repos", headers={"Authorization": "Bearer\tnope"})
+        assert (tab_spent.status_code, tab_spent.json()) == (403, refused.json())
+
+        # `Bearer nope` is its own 401 on both spent windows, not the refusal
         bad_bearer = c.get("/github/user/repos", headers={"Authorization": "Bearer nope"})
         assert bad_bearer.status_code == 401
         assert not any(n.startswith("x-ratelimit-") for n in bad_bearer.headers)
 
-        # a credential the gate treats specially — one that arrived but does not parse — still
-        # gets the ordinary 404 for a path no route matches, not this refusal: the gate needs a
-        # matched route OR no `Authorization` header at all (see `_some_github_route_matches`),
-        # and `Basic ...` on an unmatched path satisfies neither.
+        # a header real reads as no credential, on a path off real's routes, gets that path's
+        # ordinary 404 rather than this refusal (see `_github_routes`)
         basic_unmatched = c.get(
             "/github/nonexistent-zz", headers={"Authorization": "Basic Zm9vOmJhcg=="}
         )
@@ -5753,8 +6135,8 @@ def test_github_a_trailing_slash_is_404_not_a_redirect(gh_client, gh_admin_h, gh
         assert not any(n.startswith("x-ratelimit-") for n in rate_limit_slash.headers)
     assert _ratelimit(c.get("/github/rate_limit"))["used"] == before["used"]
 
-    # a path no route matches at all answers like the trailing-slash spelling of one (see
-    # `_some_github_route_matches`)
+    # a path real does not route answers like the trailing-slash spelling of one (see
+    # `_github_routes`)
     unmatched = c.get("/github/nonexistent-route-zz", headers=gh_admin_h)
     assert unmatched.status_code == 404
     assert not any(n.startswith("x-ratelimit-") for n in unmatched.headers)
@@ -5768,7 +6150,7 @@ def test_github_a_trailing_slash_is_404_not_a_redirect(gh_client, gh_admin_h, gh
     assert "x-github-api-version-selected" not in anon_unmatched.headers
     anon_again = _ratelimit(c.get("/github/nonexistent-route-zz"))
     assert int(anon_again["used"]) == int(_ratelimit(anon_unmatched)["used"]) + 1
-    # see `_some_github_route_matches` for the unparseable-credential measurement
+    # see `_github_routes` for the measurement of a header real reads as no credential
     basic = c.get("/github/nonexistent-route-zz", headers={"Authorization": "Basic Zm9vOmJhcg=="})
     assert basic.status_code == 404
     assert not any(n.startswith("x-ratelimit-") for n in basic.headers)
