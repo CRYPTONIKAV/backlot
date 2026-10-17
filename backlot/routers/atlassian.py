@@ -546,14 +546,18 @@ def _require_project(request: Request, conn, key: str) -> str:
     ids; `0`, `007`, `-1`, `1000000000000000000` (nineteen digits, still a Java `long`) and `1２` (a
     full-width `２`) are keys. A credentialled caller got the same answer from a project's id as from
     its key, on `role`, `role/10002` and `POST role/99999`, on 2026-10-14 and 2026-10-15.
+
+    A key is the project's own as written: on 2026-10-17 the key in lower case or with only its
+    first letter in upper case, and the project's name in either case, were each the 404 by key,
+    with and without a credential, on `role` and `role/10002`.
     """
     ids = auth.visible_ids(request, _jira_caller(request))
     kind = "id" if re.fullmatch(r"[1-9][0-9]{0,17}", key) else "key"
+    rows = store.list_containers(conn, "jira")
     if kind == "id":
-        rows = store.list_containers(conn, "jira")
         container = next((r["name"] for r in rows if _jira_project_id(r["name"]) == key), None)
     else:
-        container = _jira_container_for_key(conn, key, request)
+        container = next((r["name"] for r in rows if _project_key(conn, r["name"]) == key), None)
     # The `ids is None` short-circuit mirrors `github._repo_visible`, where it is load-bearing: a
     # `subtype: repo` record creates a container holding no document, and the admin keeps the repo
     # as soon as that record exists. No Jira record can do that — `project` is required on every

@@ -311,33 +311,49 @@ def test_jira_project_search_refuses_an_order_by_naming_no_field(
     }
 
 
-@pytest.mark.parametrize("headers", UNRESOLVABLE)
+@pytest.mark.parametrize("headers", [*UNRESOLVABLE, "admin"])
 @pytest.mark.parametrize(
-    "segment,kind",
+    "segment,kind,found",
     [
-        pytest.param(synth.jira_project_key("payments"), "key", id="corpus-key"),
-        pytest.param(str(synth.github_user_id("payments")), "id", id="corpus-id"),
-        pytest.param("NOSUCHKEY", "key", id="no-such-key"),
-        pytest.param("1", "id", id="one-digit"),
-        pytest.param("999999999999999999", "id", id="eighteen-digits"),
-        pytest.param("1000000000000000000", "key", id="nineteen-digits"),
-        pytest.param("0", "key", id="zero"),
-        pytest.param("007", "key", id="leading-zero"),
-        pytest.param("1２", "key", id="full-width-digit"),
+        pytest.param(synth.jira_project_key("payments"), "key", True, id="corpus-key"),
+        pytest.param(str(synth.github_user_id("payments")), "id", True, id="corpus-id"),
+        pytest.param("NOSUCHKEY", "key", False, id="no-such-key"),
+        pytest.param("1", "id", False, id="one-digit"),
+        pytest.param("999999999999999999", "id", False, id="eighteen-digits"),
+        pytest.param("1000000000000000000", "key", False, id="nineteen-digits"),
+        pytest.param("0", "key", False, id="zero"),
+        pytest.param("007", "key", False, id="leading-zero"),
+        pytest.param("1２", "key", False, id="full-width-digit"),
+        pytest.param(synth.jira_project_key("payments").lower(), "key", False, id="key-lower"),
+        pytest.param(
+            synth.jira_project_key("payments").capitalize(), "key", False, id="key-capitalised"
+        ),
+        pytest.param("payments", "key", False, id="project-name"),
+        pytest.param("PAYMENTS", "key", False, id="project-name-upper"),
     ],
 )
-def test_jira_404s_a_project_role_an_anonymous_caller_cannot_see(client, headers, segment, kind):
+def test_jira_role_routes_find_a_project_by_its_key_as_written_or_its_id(
+    client, admin_h, headers, segment, kind, found
+):
     """A role read is the one Jira route that keeps refusing an anonymous caller, and which of the
     two refusals it gives is decided by the project: on the site where the key names a project
     anonymous can see it is 401, and on the site where it names nothing it is 404. Anonymous sees no
     Backlot project, so it is always the 404 here — the corpus's own project, by its key or its id,
-    gets the answer a segment naming nothing would. The 404 calls the segment an id or a key by the
-    rule `_require_project` records."""
+    gets the answer a segment naming nothing would. The admin is the control: it reads the role by
+    the project's key and its id, and gets the same 404 for every other segment. The 404 calls the
+    segment an id or a key by the rule `_require_project` records."""
+    if headers == "admin":
+        headers = admin_h
+    else:
+        found = False
     for path in (
         f"/rest/api/3/project/{segment}/role",
         f"/rest/api/3/project/{segment}/role/10002",
     ):
         r = client.get(f"/atlassian{path}", headers=headers)
+        if found:
+            assert r.status_code == 200, path
+            continue
         assert r.status_code == 404, path
         assert r.json() == {
             "errorMessages": [f"No project could be found with {kind} '{segment}'."],
