@@ -802,9 +802,7 @@ def _key_selected(q) -> list[str]:
     too (`?partNumber=1&tagging` is "partNumber, tagging", same date); alone it is GetObject's
     (``_part_refusal``), and beside `uploadId` UploadPart."""
     selected = _selected(q, _OBJECT_READ_SELECTORS)
-    if "annotationName" in q and ("annotation" not in q or selected != ["annotation"]):
-        # Beside `annotation` and another selector, real names `annotationName` in the conflict
-        # (`acl, annotation, annotationName`); beside `annotation` alone there is none (#693).
+    if "annotationName" in q and "annotation" not in q:
         selected = sorted([*selected, "annotationName"])
     if "partNumber" in q and selected and selected != ["uploadId"]:
         selected = sorted([*selected, "partNumber"])
@@ -2957,17 +2955,6 @@ async def object_method_refusal(request: Request, bucket: str, key: str) -> Resp
     selected = _selected(q, frozenset(_OBJECT_PATH_WRITE_SELECTORS))
     if selected == ["uploadId"] and "partNumber" in q:
         selected = ["PART"]
-    if "annotationName" in q and ("annotation" not in q or selected != ["annotation"]):
-        # Writes read `annotationName` as the GET does: alone it is "Unexpected query string
-        # parameter", beside a selector it joins the conflict (#693).
-        selected = sorted([*selected, "annotationName"])
-    if "partNumber" in q and selected and selected != ["uploadId"] and selected != ["PART"]:
-        # `partNumber` beside a selector is the conflict on a write too (#693).
-        selected = sorted([*selected, "partNumber"])
-    if selected == ["annotationName"]:
-        return _argument_error("Unexpected query string parameter", "ResourceType", selected[0])
-    if "annotationName" in selected or "partNumber" in selected:
-        return _conflict(selected)
     refused = _website_refusal(q)
     if refused is not None:
         return refused
