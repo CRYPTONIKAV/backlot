@@ -169,7 +169,7 @@ def test_a_message_with_no_recipient_serves_no_to_header(tmp_path, mailbox):
             ),
         ],
     )
-    tokens = yaml.safe_load(settings.tokens_path.read_text())
+    tokens = yaml.safe_load(settings.tokens_path.read_text(encoding="utf-8"))
     ava = next(u["token"] for u in tokens["users"] if u["email"] == "ava@acme.com")
     # A second client over a different DB in this module, so the app is re-imported: the
     # lifespan writes its connection onto module-level state (see `client_for`).
@@ -446,7 +446,7 @@ def attachment_acl(tmp_path):
     """Two of ava's messages with one attachment each, and a message of mia's with none. Yields the
     client, a header per caller, and each attachment id by the doc it belongs to."""
     settings = tiny_corpus(tmp_path, _ATTACHMENT_ACL)
-    tokens = yaml.safe_load(settings.tokens_path.read_text())
+    tokens = yaml.safe_load(settings.tokens_path.read_text(encoding="utf-8"))
     h = {"admin": {"Authorization": f"Bearer {settings.admin_token}"}}
     for name in ("ava", "mia"):
         h[name] = {"Authorization": f"Bearer {tok(tokens, f'{name}@acme.com')}"}
@@ -621,7 +621,7 @@ def test_gmail_messages_list_pagination_stable_and_ordered(client, admin_h, ro_c
 
 
 def test_gmail_max_results_is_capped_at_500(tmp_path, monkeypatch):
-    """The cap `_gmail_max_results` records, on both listings."""
+    """The cap `_gmail_page` records, on both listings."""
     from backlot.routers import google
     from tests._helpers import corpus_client
 
@@ -664,7 +664,7 @@ def test_gmail_max_results_is_capped_at_500(tmp_path, monkeypatch):
             assert "nextPageToken" in page, kind
 
 
-# The rows `_gmail_max_results` records. A `size` is served, `uint32` is the proto layer's refusal
+# The rows `_gmail_page` records. A `size` is served, `uint32` is the proto layer's refusal
 # of each named repeat, and `maxResults` is `Invalid maxResults`. The measurement is that
 # function's.
 _GMAIL_MAX_RESULTS = [
@@ -695,7 +695,7 @@ _GMAIL_MAX_RESULTS = [
 @pytest.mark.parametrize("kind", ["messages", "threads"])
 @pytest.mark.parametrize("values, shape, named", _GMAIL_MAX_RESULTS)
 def test_gmail_refuses_a_max_results_it_cannot_read(client, admin_h, kind, values, shape, named):
-    """The refusals `_gmail_max_results` records, on both listings."""
+    """The refusals `_gmail_page` records, on both listings."""
     r = client.get(
         f"/gmail/v1/users/me/{kind}",
         headers=admin_h,
@@ -739,6 +739,80 @@ def test_gmail_refuses_a_max_results_it_cannot_read(client, admin_h, kind, value
             }
         ],
     }, (kind, values)
+
+
+_GMAIL_TOKEN = {
+    "code": 400,
+    "message": "Invalid pageToken",
+    "errors": [{"message": "Invalid pageToken", "domain": "global", "reason": "invalidArgument"}],
+    "status": "INVALID_ARGUMENT",
+}
+_GMAIL_RANGE = {
+    "code": 400,
+    "message": "Invalid maxResults",
+    "errors": [{"message": "Invalid maxResults", "domain": "global", "reason": "invalidArgument"}],
+    "status": "INVALID_ARGUMENT",
+}
+_GMAIL_UINT32_ABC = {
+    "code": 400,
+    "message": "Invalid value at 'max_results' (TYPE_UINT32), \"abc\"",
+    "errors": [
+        {"message": "Invalid value at 'max_results' (TYPE_UINT32), \"abc\"", "reason": "invalid"}
+    ],
+    "status": "INVALID_ARGUMENT",
+    "details": [
+        {
+            "@type": "type.googleapis.com/google.rpc.BadRequest",
+            "fieldViolations": [
+                {
+                    "field": "max_results",
+                    "description": "Invalid value at 'max_results' (TYPE_UINT32), \"abc\"",
+                }
+            ],
+        }
+    ],
+}
+
+
+# fmt: off
+_GMAIL_PAGE_TOKEN_ROWS = [
+    ([("pageToken", "bogus")], _GMAIL_TOKEN, _GMAIL_TOKEN),
+    ([("pageToken", "")], None, None),
+    ([("maxResults", "1"), ("pageToken", "{token}")], "second", "second"),
+    ([("maxResults", "0"), ("pageToken", "bogus")], _GMAIL_TOKEN, _GMAIL_RANGE),
+    ([("pageToken", "garbage"), ("maxResults", "0")], _GMAIL_TOKEN, _GMAIL_RANGE),
+    ([("maxResults", "2147483648"), ("pageToken", "garbage")], _GMAIL_TOKEN, _GMAIL_RANGE),
+    ([("pageToken", "garbage"), ("maxResults", "abc")], _GMAIL_UINT32_ABC, _GMAIL_UINT32_ABC),
+    ([("pageToken", "garbage"), ("pageToken", "")], None, None),
+    ([("pageToken", ""), ("pageToken", "garbage")], _GMAIL_TOKEN, _GMAIL_TOKEN),
+    ([("maxResults", "1"), ("pageToken", "garbage"), ("pageToken", "{token}")], "second", "second"),
+    ([("maxResults", "1"), ("pageToken", "{token}"), ("pageToken", "garbage")], _GMAIL_TOKEN, _GMAIL_TOKEN),
+]
+# fmt: on
+
+
+@pytest.mark.parametrize("query, on_messages, on_threads", _GMAIL_PAGE_TOKEN_ROWS)
+@pytest.mark.parametrize("kind", ["messages", "threads"])
+def test_gmail_lists_read_a_page_token_as_real_does(
+    client, admin_h, kind, query, on_messages, on_threads
+):
+    """The rules `_gmail_page` and `gerr.invalid_page_token` record, one request per row and
+    listing. `None` is the answer the request gets without a `pageToken`, `"second"` the page after
+    the first at `maxResults=1`, and `{token}` the `nextPageToken` of that first page."""
+    path = f"/gmail/v1/users/me/{kind}"
+    first = client.get(path, headers=admin_h, params={"maxResults": 1}).json()
+    query = [(k, v.format(token=first["nextPageToken"])) for k, v in query]
+    r = client.get(path, headers=admin_h, params=query)
+    want = on_messages if kind == "messages" else on_threads
+    if want is None:
+        without = [(k, v) for k, v in query if k != "pageToken"]
+        assert r.content == client.get(path, headers=admin_h, params=without).content
+    elif want == "second":
+        both = client.get(path, headers=admin_h, params={"maxResults": 2}).json()[kind]
+        assert r.status_code == 200, r.text
+        assert r.json()[kind] == both[1:]
+    else:
+        assert (r.status_code, _gerr(r)) == (400, want)
 
 
 def test_gmail_attachment_size_matches_part_metadata(client, admin_h, ro_conn):
@@ -932,16 +1006,20 @@ _ANON = "anonymous"  # no credential on the part or on the batch
 _NORMALISED = "/batch/drive/v3?quotaUser=7&foo=%41&b%61r=1&~t=%7e&&"
 _A1_FILTER = '{"dataFilters": [{"a1Range": "A1"}]}'
 _BAD_FILTER = '{"dataFilters": "abc"}'
+_CHALLENGE = 'Bearer realm="https://accounts.google.com/"'  # a credential that names no token
+_CHALLENGED = f'{_CHALLENGE}, error="invalid_token"'  # one that names a token that does not resolve
 
 # One part per batch, as real's Drive batch and Sheets batch answered it. A row is the batch URI
 # with its query, the part as (method, target, body, its own Authorization), the status in the batch
 # and the status of the same request sent on its own, then a 302's `Location` below the server's
-# base URL or a 501's body. The status on its own is ``None`` where real's is one Backlot does not
-# give: the export with an empty `alt=` (400), the id holding a `%` no two hex digits follow (503),
-# the two downloads with `callback=a%20b` (503), the export with that `callback` beside `$.xgafv=9`
-# (400) and the Sheets read of a spreadsheet the caller cannot see (403
-# `The caller does not have permission`, where Backlot answers as for one that does not exist).
-# `_drive_batch_download`, `_drive_batch_redirect` and `_workbook` record the rules.
+# base URL, a 401's `WWW-Authenticate`, the message of a 400 a token in the query answers, or a
+# 501's body. The status on its own is ``None`` where real's is one Backlot does not give: the
+# export with an empty `alt=` (400), the id holding a `%` no two hex digits follow (503), the two
+# downloads with `callback=a%20b` (503), the export with that `callback` beside `$.xgafv=9` (400)
+# and the media read with `access_token=nope` (Google's automated-queries page). It is ``None``
+# too on every row whose batch URI names a token, which the request on its own does not carry. `{t}`
+# in a URI or a part's target is the admin token. `_drive_batch_download`, `_drive_batch_redirect`,
+# `_query_credential` and `_workbook` record the rules.
 # fmt: off
 _BATCH_ROWS = [
     # a Drive download is redirected ahead of the lookup and the typed, `fields` and `mimeType`
@@ -955,6 +1033,9 @@ _BATCH_ROWS = [
     (_DRIVE_BATCH, ("GET", "/drive/v3/files/{doc}/export?mimeType=text/plain&alt=media", None, None), 302, 200, "download/drive/v3/files/{doc}/export?mimeType=text/plain&alt=media&quotaUser=7"),
     (_DRIVE_BATCH, ("GET", "/drive/v3/files/{doc}/export?mimeType=text/plain&alt=", None, None), 302, None, "download/drive/v3/files/{doc}/export?mimeType=text/plain&alt=&quotaUser=7"),
     (_DRIVE_BATCH, ("GET", "/drive/v3/files/{pdf}?alt=media", None, None), 302, 200, "download/drive/v3/files/{pdf}?alt=media&quotaUser=7"),
+    # a trailing slash is routed past but kept in the `Location`
+    (_DRIVE_BATCH, ("GET", "/drive/v3/files/{pdf}//?alt=media", None, None), 302, 200, "download/drive/v3/files/{pdf}//?alt=media&quotaUser=7"),
+    (_DRIVE_BATCH, ("GET", "/drive/v3/files/{doc}/export/?mimeType=text/plain", None, None), 302, 200, "download/drive/v3/files/{doc}/export/?mimeType=text/plain&quotaUser=7"),
     (_DRIVE_BATCH, ("GET", "/drive/v3/files/{pdf}?alt=MEDIA", None, None), 302, 200, "download/drive/v3/files/{pdf}?alt=MEDIA&quotaUser=7"),
     (_DRIVE_BATCH, ("GET", "/drive/v3/files/{pdf}?alt=media&alt=json", None, None), 302, 200, "download/drive/v3/files/{pdf}?alt=media&alt=json&quotaUser=7"),
     (_DRIVE_BATCH, ("GET", "/drive/v3/files/{nope}?alt=media", None, None), 302, 404, "download/drive/v3/files/{nope}?alt=media&quotaUser=7"),
@@ -985,11 +1066,35 @@ _BATCH_ROWS = [
     (_DRIVE_BATCH, ("GET", "/drive/v3/files/a%23b/export?mimeType=text/plain", None, None), 302, 404, "download/drive/v3/files/a%23b/export?mimeType=text/plain&quotaUser=7"),
     (_DRIVE_BATCH, ("GET", "/drive/v3/files/a%b%4?alt=media", None, None), 302, None, "download/drive/v3/files/a%b%4?alt=media&quotaUser=7"),
     # its place among `$.xgafv`, the credential and `callback`, as `_drive_batch_redirect` records
-    (_DRIVE_BATCH, ("GET", "/drive/v3/files/{doc}/export?mimeType=text/plain", None, _BAD), 401, 401, None),
+    (_DRIVE_BATCH, ("GET", "/drive/v3/files/{doc}/export?mimeType=text/plain", None, _BAD), 401, 401, _CHALLENGED),
+    (_DRIVE_BATCH, ("GET", "/drive/v3/files/{pdf}?alt=media", None, "OAuth nope"), 401, 401, _CHALLENGED),
+    (_DRIVE_BATCH, ("GET", "/drive/v3/files/{pdf}?alt=media", None, "Bearer nope x"), 401, 401, _CHALLENGED),
+    (_DRIVE_BATCH, ("GET", "/drive/v3/files/{pdf}?alt=media", None, "Bearernope"), 401, 401, _CHALLENGE),
     (_DRIVE_BATCH, ("GET", "/drive/v3/files/{pdf}?alt=media", None, "Basic YWJjOmRlZg=="), 302, 401, "download/drive/v3/files/{pdf}?alt=media&quotaUser=7"),
     (_DRIVE_BATCH, ("GET", "/drive/v3/files/{pdf}?alt=media", None, "bearer nope"), 302, 401, "download/drive/v3/files/{pdf}?alt=media&quotaUser=7"),
     (_DRIVE_BATCH, ("GET", "/drive/v3/files/{pdf}?alt=media", None, "Bearer"), 302, 401, "download/drive/v3/files/{pdf}?alt=media&quotaUser=7"),
     (_DRIVE_BATCH, ("GET", "/drive/v3/files/{pdf}?alt=media", None, "nope"), 302, 401, "download/drive/v3/files/{pdf}?alt=media&quotaUser=7"),
+    # a token in the part's query or the batch's (`_drive_batch_redirect`, `_query_credential`)
+    (_DRIVE_BATCH, ("GET", "/drive/v3/files/{pdf}?alt=media&access_token=nope", None, _ANON), 400, None, gerr.QUERY_TOKEN_MESSAGE),
+    (_DRIVE_BATCH, ("GET", "/drive/v3/files/{pdf}?alt=media&access_token=", None, _ANON), 400, 400, gerr.QUERY_TOKEN_MESSAGE),
+    (_DRIVE_BATCH, ("GET", "/drive/v3/files/{doc}/export?mimeType=text/plain&access_token=nope", None, _ANON), 400, 400, gerr.QUERY_TOKEN_MESSAGE),
+    (_DRIVE_BATCH, ("GET", "/drive/v3/files/{pdf}?alt=media&access_token=ya29.x", None, _ANON), 401, 401, _CHALLENGED),
+    (f"{_DRIVE_BATCH}&access_token=nope", ("GET", "/drive/v3/files/{pdf}?alt=media", None, _ANON), 400, None, gerr.QUERY_TOKEN_MESSAGE),
+    (f"{_DRIVE_BATCH}&ACCESS_TOKEN=x", ("GET", "/drive/v3/files/{doc}/export?mimeType=text/plain", None, _ANON), 400, None, gerr.QUERY_TOKEN_MESSAGE),
+    (f"{_DRIVE_BATCH}&bearer_token=x", ("GET", "/drive/v3/files/{doc}/export?mimeType=text/plain", None, _ANON), 400, None, gerr.QUERY_TOKEN_MESSAGE),
+    (f"{_DRIVE_BATCH}&access_token=ya29.x", ("GET", "/drive/v3/files/{pdf}?alt=media", None, _ANON), 401, None, _CHALLENGED),
+    (f"{_DRIVE_BATCH}&access_token=ya29.x", ("GET", "/drive/v3/files", None, _ANON), 401, None, _CHALLENGED),
+    (f"{_DRIVE_BATCH}&access_token=nope", ("GET", "/drive/v3/files", None, _ANON), 403, None, None),
+    (f"{_DRIVE_BATCH}&access_token=ya29.x", ("GET", "/drive/v3/files?access_token=nope", None, _ANON), 403, None, None),
+    (f"{_DRIVE_BATCH}&access_token=ya29.x", ("GET", "/drive/v3/files", None, None), 200, None, None),
+    (f"{_DRIVE_BATCH}&access_token=nope", ("GET", "/drive/v3/files", None, "Bearernope"), 401, None, _CHALLENGED),
+    # a name the part carries is read from the part, any other from the batch
+    (_DRIVE_BATCH + "&access_token=nope", ("GET", "/drive/v3/files?bearer_token=ya29.x&oauth_token={t}", None, _ANON), 403, None, None),
+    (_DRIVE_BATCH + "&oauth_token={t}", ("GET", "/drive/v3/files?access_token=ya29.x", None, _ANON), 200, None, None),
+    (_DRIVE_BATCH + "&access_token=ya29.x", ("GET", "/drive/v3/files?oauth_token=nope", None, _ANON), 401, None, _CHALLENGED),
+    (_DRIVE_BATCH + "&access_token=ya29.x&oauth_token={t}", ("GET", "/drive/v3/files?oauth_token=nope", None, _ANON), 401, None, _CHALLENGED),
+    (_DRIVE_BATCH + "&access_token=ya29.x", ("GET", "/drive/v3/files?access_token=ya29.y", None, _ANON), 401, None, _CHALLENGED),
+    (_DRIVE_BATCH + "&access_token=ya29.x", ("GET", "/drive/v3/files/{doc}/export?mimeType=text/plain&oauth_token=nope", None, _ANON), 401, None, _CHALLENGED),
     (_DRIVE_BATCH, ("GET", "/drive/v3/files/{doc}/export?mimeType=text/plain", None, _ANON), 302, 403, "download/drive/v3/files/{doc}/export?mimeType=text/plain&quotaUser=7"),
     (_DRIVE_BATCH, ("GET", "/drive/v3/files/{pdf}?alt=media", None, _ANON), 302, 403, "download/drive/v3/files/{pdf}?alt=media&quotaUser=7"),
     (_DRIVE_BATCH, ("GET", "/drive/v3/files/{doc}", None, _ANON), 403, 403, None),
@@ -1012,16 +1117,16 @@ _BATCH_ROWS = [
     (_SHEETS_BATCH, ("POST", "/sheets/v4/spreadsheets/{sheet}:getByDataFilter", "{}", None), 501, 200, _UNIMPLEMENTED),
     (_SHEETS_BATCH, ("POST", "/sheets/v4/spreadsheets/{sheet}/values:batchGetByDataFilter", _A1_FILTER, None), 501, 200, _UNIMPLEMENTED),
     (_SHEETS_BATCH, ("GET", "/sheets/v4/spreadsheets/{nope}/values/A1", None, None), 501, 404, _UNIMPLEMENTED),
-    (_SHEETS_BATCH, ("GET", "/sheets/v4/spreadsheets/{sheet}/values/A1", None, _MIA), 501, None, _UNIMPLEMENTED),
+    (_SHEETS_BATCH, ("GET", "/sheets/v4/spreadsheets/{sheet}/values/A1", None, _MIA), 501, 403, _UNIMPLEMENTED),
     (_SHEETS_BATCH, ("GET", "/sheets/v4/spreadsheets/{sheet}/values/NoSuchSheet!A1", None, None), 501, 400, _UNIMPLEMENTED),
     (_SHEETS_BATCH, ("GET", "/sheets/v4/spreadsheets/{sheet}/values/A1?alt=media", None, None), 501, 400, _UNIMPLEMENTED),
     (_SHEETS_BATCH, ("GET", "/sheets/v4/spreadsheets/{sheet}/values/A1?$.xgafv=1", None, None), 501, 200, _UNIMPLEMENTED_AT_XGAFV_1),
     (_SHEETS_BATCH, ("GET", "/sheets/v4/spreadsheets/{sheet}/values/A1?majorDimension=NOPE", None, None), 400, 400, None),
     (_SHEETS_BATCH, ("POST", "/sheets/v4/spreadsheets/{sheet}:getByDataFilter", _BAD_FILTER, None), 400, 400, None),
     (_SHEETS_BATCH, ("POST", "/sheets/v4/spreadsheets/{sheet}/values:batchGetByDataFilter", _BAD_FILTER, None), 400, 400, None),
-    (_SHEETS_BATCH, ("GET", "/sheets/v4/spreadsheets/{sheet}/values/A1", None, _BAD), 401, 401, None),
-    (_SHEETS_BATCH, ("POST", "/sheets/v4/spreadsheets/{sheet}:getByDataFilter", "{}", _BAD), 401, 401, None),
-    (_SHEETS_BATCH, ("POST", "/sheets/v4/spreadsheets/{sheet}:getByDataFilter", _BAD_FILTER, _BAD), 401, 401, None),
+    (_SHEETS_BATCH, ("GET", "/sheets/v4/spreadsheets/{sheet}/values/A1", None, _BAD), 401, 401, _CHALLENGED),
+    (_SHEETS_BATCH, ("POST", "/sheets/v4/spreadsheets/{sheet}:getByDataFilter", "{}", _BAD), 401, 401, _CHALLENGED),
+    (_SHEETS_BATCH, ("POST", "/sheets/v4/spreadsheets/{sheet}:getByDataFilter", _BAD_FILTER, _BAD), 401, 401, _CHALLENGED),
 ]
 # fmt: on
 
@@ -1048,20 +1153,23 @@ def _batch_answer(client, headers, uri, method, target, body, auth):
 
 @pytest.mark.parametrize("uri, part, status, alone, detail", _BATCH_ROWS)
 def test_google_batch_redirects_a_drive_download_and_refuses_a_sheets_read(
-    client, admin_h, tokens, uri, part, status, alone, detail
+    client, admin_h, tokens, tokens_yaml, uri, part, status, alone, detail
 ):
     """The rows `_BATCH_ROWS` records, each beside the same request sent on its own where the row
     gives that request's status. A part the redirect answers carries real's three headers in real's
-    order. Neither answer looks the file up, so a spreadsheet the scoped token cannot see is
-    answered as one that does not exist is."""
+    order, and a 401 its challenge ahead of its `Content-Type`. Neither the redirect nor the 501
+    looks the file up, so a spreadsheet the scoped token cannot see is answered as one that does not
+    exist is."""
     ids = {
         "doc": _drive_find(client, admin_h, "Brand")["id"],
         "pdf": _drive_find(client, admin_h, "Whitepaper")["id"],
         "sheet": _drive_find(client, admin_h, "Q1 Revenue Model")["id"],
         "nope": "nosuchfile000",
+        "t": tokens_yaml["admin_token"],
     }
     method, target, body, auth = part
     target = target.format(**ids)
+    uri = uri.format(**ids)
     outer = {} if auth == _ANON else admin_h
     auth = None if auth == _ANON else auth and auth.format(mia=f"Bearer {tokens['mia@acme.com']}")
     got, lines, sub_body = _batch_answer(client, outer, uri, method, target, body, auth)
@@ -1074,6 +1182,13 @@ def test_google_batch_redirects_a_drive_download_and_refuses_a_sheets_read(
             location,
         ]
         assert json.loads(sub_body) == _REDIRECTED
+    elif status == 401:
+        assert lines[:2] == [
+            f"WWW-Authenticate: {detail}",
+            "Content-Type: application/json; charset=UTF-8",
+        ]
+    elif status == 400 and detail is not None:
+        assert json.loads(sub_body)["error"]["message"] == detail
     elif status == 501:
         assert json.loads(sub_body) == detail
     if alone is not None:
@@ -1165,17 +1280,9 @@ def test_user_cannot_fetch_others_private_gmail(client, tokens_yaml, admin_h, ro
 # --- Google error envelope ------------------------------------------------------------
 #
 # Every case below was MEASURED against the live APIs with real OAuth credentials. The envelope is
-# per-family, not uniform:
-#
-#   family                       errors[]           status               no Authorization header, GET
-#   -----------------------------|------------------|---------------------|-------------------------
-#   Drive v3                     | always           | auth failures only  | 403 PERMISSION_DENIED
-#   Gmail v1                     | unless $.xgafv=2 | always              | 401 UNAUTHENTICATED
-#   Docs v1 / Slides v1          | $.xgafv=1        | always              | 401 UNAUTHENTICATED
-#   Sheets v4                    | $.xgafv=1        | always              | 403 PERMISSION_DENIED
-#
-# The last column is the GET rule; `errors.google.no_credentials` carries the POST one.
-# A bad bearer token is 401 UNAUTHENTICATED in every family.
+# per-family, not uniform: which optional members each family carries is the table in the
+# `backlot.errors.google` docstring. What a request with no credential gets is per operation
+# (`errors.google.no_credentials`), and a bad token is 401 UNAUTHENTICATED in every family.
 
 
 def _gerr(resp):
@@ -1847,6 +1954,9 @@ _DRIVE_CHECK_ROWS = [
     ("/drive/v3/files/{pdf}/export", "mimeType=text/plain", "admin", (403, "fileNotExportable", None, None)),
     # the empty value is present, so in the order `drive_files_export` records it meets the 403
     ("/drive/v3/files/{pdf}/export", "mimeType=", "admin", (403, "fileNotExportable", None, None)),
+    # a folder is synthesized rather than stored, and is refused as the PDF is, not as a file that
+    # does not exist
+    ("/drive/v3/files/{folder}/export", "mimeType=text/plain", "admin", (403, "fileNotExportable", None, "Export only supports Docs Editors files.")),
     ("/drive/v3/files/{doc}", "alt=media", "admin", (403, "fileNotDownloadable", "alt", None)),
     # the shared-drive items need a companion flag, which the same spelling turns on
     ("/drive/v3/files", "includeItemsFromAllDrives=true", "admin", _SHARED_DRIVES),
@@ -1943,6 +2053,7 @@ def test_drive_answers_each_check_with_reals_status_and_reason(
     ids = {
         "doc": doc,
         "pdf": _drive_find(client, admin_h, "Whitepaper")["id"],
+        "folder": _drive_ids(client, admin_h, q=f"mimeType='{FOLDER_MIME}'")[0],
         "hidden": _drive_find(client, admin_h, "Q1 Revenue Model")["id"],
         "nope": "nosuchfile000",
         "issued": issued.json()["nextPageToken"],
@@ -1959,6 +2070,87 @@ def test_drive_answers_each_check_with_reals_status_and_reason(
     assert (e["errors"][0].get("reason"), e["errors"][0].get("location")) == (reason, location)
     if message is not None:
         assert (e["message"], "status" in e) == (message, False)
+
+
+def test_reads_of_a_folder_the_caller_cannot_see(tmp_path):
+    """The answers `files.export`, `files.get` and `permissions.list` record for a folder, for each
+    caller, and the ones Docs and Sheets record for mia: `Private` holds only a file mia cannot
+    read, so it is the folder she cannot see."""
+    s = tiny_corpus(
+        tmp_path,
+        [
+            {
+                "source_type": "google_drive",
+                "doc_id": "gd-open",
+                "folder": "Shared",
+                "title": "Open",
+                "content": "body",
+                "author_email": "mia@acme.com",
+                "visibility": "public",
+            },
+            {
+                "source_type": "google_drive",
+                "doc_id": "gd-shut",
+                "folder": "Private",
+                "title": "Shut",
+                "content": "body",
+                "author_email": "ava@acme.com",
+                "readers": ["ava@acme.com"],
+            },
+        ],
+    )
+    tokens = yaml.safe_load(s.tokens_path.read_text(encoding="utf-8"))
+    h = {"admin": {"Authorization": f"Bearer {s.admin_token}"}}
+    for name in ("ava", "mia"):
+        h[name] = {"Authorization": f"Bearer {tok(tokens, f'{name}@acme.com')}"}
+    with client_for(s, reload=True) as c:
+        q = {"q": f"mimeType='{FOLDER_MIME}'", "fields": "files(id,name)"}
+        listed = c.get("/drive/v3/files", headers=h["admin"], params=q).json()["files"]
+        folder = {f["name"]: f["id"] for f in listed}
+        folder["nope"] = "nosuchfile000"
+        for caller, name, status, reason in [
+            ("admin", "Private", 403, "fileNotExportable"),
+            ("ava", "Private", 403, "fileNotExportable"),
+            ("mia", "Private", 404, "notFound"),
+            ("mia", "Shared", 403, "fileNotExportable"),
+            ("mia", "nope", 404, "notFound"),
+        ]:
+            r = c.get(
+                f"/drive/v3/files/{folder[name]}/export",
+                headers=h[caller],
+                params={"mimeType": "text/plain"},
+            )
+            assert (r.status_code, _gerr(r)["errors"][0]["reason"]) == (status, reason), (
+                caller,
+                name,
+            )
+        files, perms = "/drive/v3/files/{}", "/drive/v3/files/{}/permissions"
+        docs, sheets = "/docs/v1/documents/{}", "/sheets/v4/spreadsheets/{}"
+        for route, query, caller, name, status, answer in [
+            (files, {}, "admin", "Private", 200, None),
+            (files, {}, "ava", "Private", 200, None),
+            (files, {}, "mia", "Private", 404, "notFound"),
+            (files, {}, "mia", "Shared", 200, None),
+            (files, {}, "mia", "nope", 404, "notFound"),
+            (files, {"fields": "totallyBogusField"}, "mia", "Private", 404, "notFound"),
+            (files, {"fields": "totallyBogusField"}, "mia", "Shared", 400, "invalidParameter"),
+            (files, {"alt": "media"}, "mia", "Private", 404, "notFound"),
+            (perms, {}, "admin", "Private", 200, None),
+            (perms, {}, "ava", "Private", 200, None),
+            (perms, {}, "mia", "Private", 404, "notFound"),
+            (perms, {}, "mia", "Shared", 200, None),
+            (perms, {}, "mia", "nope", 404, "notFound"),
+            (perms, {"pageSize": "0"}, "mia", "Private", 400, "invalidParameter"),
+            (perms, {"pageToken": "bad"}, "mia", "Private", 400, "invalid"),
+            (docs, {}, "mia", "Private", 400, "INVALID_ARGUMENT"),
+            (docs, {}, "mia", "nope", 404, "NOT_FOUND"),
+            (sheets, {}, "mia", "Private", 400, "INVALID_ARGUMENT"),
+            (sheets, {}, "mia", "nope", 404, "NOT_FOUND"),
+        ]:
+            r = c.get(route.format(folder[name]), headers=h[caller], params=query)
+            error = r.json().get("error", {})
+            got = error.get("status") or (error.get("errors") or [{}])[0].get("reason")
+            assert (r.status_code, got) == (status, answer), (route, query, caller, name)
 
 
 @pytest.mark.parametrize(
@@ -2005,8 +2197,9 @@ def test_a_typed_refusal_comes_after_the_credential_and_before_the_lookup(
 ):
     """The order `_typed_query`'s docstring records, and `sheets_values_batch_get_by_data_filter`'s
     for a data-filter body. The refusal is the same bytes for a spreadsheet the scoped token cannot
-    see as for one that does not exist, where without the bad value (with ``good`` for a body) the
-    first is a 200 to the admin and both are the 404 to the scoped token. With no credential or a
+    see as for one that does not exist. Without the bad value (with ``good`` for a body) the hidden
+    spreadsheet is a 200 to the admin. To the scoped token a Sheets read answers the hidden
+    spreadsheet 403 and the missing id 404, where Drive answers both 404. With no credential or a
     bad one the bad value changes nothing: the answer is the credential's refusal, the 401 for a bad
     one."""
 
@@ -2022,7 +2215,8 @@ def test_a_typed_refusal_comes_after_the_credential_and_before_the_lookup(
     assert _gerr(refused)["code"] == 400
     assert send(hidden, scoped, bad=True).content == refused.content
     assert send(hidden, admin_h).status_code == 200
-    assert send(hidden, scoped).status_code == 404
+    expected_hidden = 403 if path.startswith("/sheets/") else 404
+    assert send(hidden, scoped).status_code == expected_hidden
     assert send(missing, scoped).status_code == 404
     assert send(missing, BAD_TOKEN).status_code == 401
     for headers in ({}, BAD_TOKEN):
@@ -2252,8 +2446,8 @@ def _anonymous(client, method, path, params):
 
 def test_the_credential_entries(client):
     """The three credential failures, which differ from each other rather than by family: a bad
-    token, an anonymous Sheets GET, and the missing credential, which is an anonymous GET on an
-    OAuth-only API or an anonymous POST on any family.
+    token, an unregistered caller (here an anonymous Sheets GET), and the missing credential, which
+    is what an anonymous request gets on an operation that takes no API key.
 
     The last of those is asked of Gmail with NO parameter, because Gmail carries the array by
     default, and of Docs, Slides and the Sheets data-filter POST at `$.xgafv=1`, because they do
@@ -2306,82 +2500,593 @@ def test_the_credential_entries(client):
     assert _gerr(client.get("/gmail/v1/users/me/labels", params={"$.xgafv": "1"})) == gmail
 
 
-def test_every_google_operation_declares_the_system_parameter_and_checks_it(client):
+# The system parameters every Google family operation declares, as real's discovery documents do.
+_SYSTEM_PARAMETERS = [
+    {
+        "name": "$.xgafv",
+        "in": "query",
+        "required": False,
+        "description": "V1 error format.",
+        "schema": {"type": "string", "enum": ["1", "2"]},
+    },
+    {
+        "name": "access_token",
+        "in": "query",
+        "required": False,
+        "description": "OAuth access token.",
+        "schema": {"type": "string"},
+    },
+    {
+        "name": "oauth_token",
+        "in": "query",
+        "required": False,
+        "description": "OAuth 2.0 token for the current user.",
+        "schema": {"type": "string"},
+    },
+]
+
+
+def test_every_google_operation_declares_the_system_parameters_and_reads_them(client):
     """Both directions, and the document asked for twice.
 
-    Declared: every family operation carries it, `/batch` carries nothing. Checked: each operation
-    is SENT a value the parameter does not take and has to refuse it — the declaration is derived
-    from the path, so it would appear on a family route served by some other router while the
-    dependency that validates it never ran, a gap only this half sees. The path parameters are
-    dummies; the refusal comes before the route. The second fetch holds the enrichment idempotent,
-    since it edits the schema FastAPI caches and hands back by identity."""
+    Declared: every family operation carries `$.xgafv`, `access_token` and `oauth_token`, `/batch`
+    none of them. Read: each operation is SENT a `$.xgafv` the parameter does not take and has to
+    refuse it, and an `access_token` of Google's shape that does not resolve and has to answer the
+    bad token's 401 — the declaration is derived from the path, so it would appear on a family
+    route served by some other router while the code that reads it never ran, a gap only this half
+    sees. The path parameters are dummies; both answers come before the route's own work. The
+    second fetch holds the enrichment idempotent, since it edits the schema FastAPI caches and hands
+    back by identity."""
     client.get("/openapi.json")
     spec = client.get("/openapi.json").json()
     families = ("/drive/v3", "/gmail/v1", "/docs/v1", "/sheets/v4", "/slides/v1")
+    names = {p["name"] for p in _SYSTEM_PARAMETERS}
     missing, batch, unchecked = [], [], []
     for path, item in spec["paths"].items():
         for method, op in item.items():
             if method not in ("get", "post", "put", "patch", "delete"):
                 continue
-            declared = [p for p in op.get("parameters", []) if p["name"] == "$.xgafv"]
+            declared = [p for p in op.get("parameters", []) if p["name"] in names]
             if path.startswith(families):
-                if declared != [
-                    {
-                        "name": "$.xgafv",
-                        "in": "query",
-                        "required": False,
-                        "description": "V1 error format.",
-                        "schema": {"type": "string", "enum": ["1", "2"]},
-                    }
-                ]:
+                if declared != _SYSTEM_PARAMETERS:
                     missing.append(f"{method.upper()} {path}")
                 url = re.sub(r"\{[^}]+\}", "dummy", path)
                 r = client.request(method.upper(), f"{url}?$.xgafv=0", json={})
                 if r.status_code != 400 or "system query parameter" not in r.text:
                     unchecked.append(f"{method.upper()} {path} -> {r.status_code}")
+                r = client.request(method.upper(), f"{url}?access_token=ya29.x", json={})
+                if r.headers.get("www-authenticate") != _CHALLENGED:
+                    unchecked.append(f"{method.upper()} {path} access_token -> {r.status_code}")
             elif path.startswith("/batch") and declared:
                 batch.append(f"{method.upper()} {path}")
     assert missing == [] and batch == [] and unchecked == []
 
 
-def test_no_google_baseline_acknowledges_the_system_parameter_any_more():
-    """The 13 `google_drive` and 8 `gmail` entries `missing_param … ?$.xgafv` were the shape of
-    this gap in the fidelity baseline; declaring the parameter is what removes them, and a run of
-    `backlot diff --source <source> --update-baseline` against the live documents did."""
-    from backlot.fidelity import baseline_path
+def test_no_google_baseline_acknowledges_a_system_parameter():
+    """No `google_drive` or `gmail` baseline entry is a `missing_param` for `$.xgafv`,
+    `access_token` or `oauth_token`: `openapi.google_system_parameters` declares all three."""
+    from backlot.fidelity import Baseline, baseline_path
 
     for source in ("google_drive", "gmail"):
-        acknowledged = json.loads(baseline_path(source).read_text())["acknowledged"]
-        assert not [e["path"] for e in acknowledged if "$.xgafv" in e["path"]], source
+        acknowledged = Baseline.load(baseline_path(source)).acknowledged.values()
+        for name in ("$.xgafv", "access_token", "oauth_token"):
+            assert not [f.path for f in acknowledged if f.path.endswith(f"?{name}")], (
+                source,
+                name,
+            )
+
+
+# A request with no credential per row: the method, the path, what real answered it with no
+# `Authorization` (403 an unregistered caller, 401 a missing credential, as
+# `errors.google._UNREGISTERED_CALLER_OPERATIONS` records), and what the admin token gets on the
+# same request, which on an operation Backlot does not serve is the 404 or 405 the path gets with
+# no operation to run (`routers.google.refuse_an_unserved_operation`); None where that answer is
+# not this test's. A code of 404 or 405 is the router's, whatever the credential.
+# fmt: off
+_NO_CREDENTIAL_ROWS = [
+    ("GET", "/drive/v3/files", 403, 200),
+    ("GET", "/drive/v3/files/{doc}", 403, 200),
+    ("GET", "/drive/v3/files/{doc}/export?mimeType=text/plain&alt=json", 403, None),
+    ("GET", "/drive/v3/files/{doc}/permissions", 401, 200),
+    ("GET", "/drive/v3/about?fields=user", 401, 200),
+    ("GET", "/drive/v3/drives", 401, 200),
+    ("GET", "/sheets/v4/spreadsheets/x", 403, 404),
+    ("GET", "/sheets/v4/spreadsheets/x/values/A1", 403, 404),
+    ("GET", "/sheets/v4/spreadsheets/x/values:batchGet?ranges=A1", 403, 404),
+    ("POST", "/sheets/v4/spreadsheets/x/values:batchGetByDataFilter", 401, 404),
+    ("POST", "/sheets/v4/spreadsheets/x:getByDataFilter", 401, 404),
+    ("GET", "/docs/v1/documents/x", 401, 404),
+    ("GET", "/slides/v1/presentations/x", 401, 404),
+    ("GET", "/gmail/v1/users/me/profile", 401, 200),
+    ("GET", "/gmail/v1/users/me/labels", 401, 200),
+    # the baselines' `missing` operations
+    ("GET", "/drive/v3/changes/startPageToken", 401, 404),
+    ("GET", "/drive/v3/files/generateIds", 401, 404),
+    ("GET", "/drive/v3/files/trash", 403, 404),
+    ("GET", "/drive/v3/files/{doc}/comments", 403, 404),
+    ("POST", "/drive/v3/files/{doc}/comments", 403, 404),
+    ("PATCH", "/drive/v3/files/{doc}/comments/c1", 403, 404),
+    ("DELETE", "/drive/v3/files/{doc}/comments/c1", 403, 404),
+    ("GET", "/drive/v3/files/{doc}/comments/c1/replies", 403, 404),
+    ("GET", "/drive/v3/operations/o1", 403, 404),
+    ("POST", "/drive/v3/files/{doc}/download", 403, 404),
+    ("GET", "/drive/v3/apps", 403, 404),
+    ("GET", "/drive/v3/apps/a1", 401, 404),
+    ("PATCH", "/drive/v3/files/{doc}", 401, 405),
+    ("DELETE", "/drive/v3/files/{doc}", 401, 405),
+    ("POST", "/drive/v3/files/{doc}/copy", 401, 404),
+    ("GET", "/sheets/v4/spreadsheets/x/developerMetadata/1", 401, 404),
+    ("POST", "/sheets/v4/spreadsheets/x:batchUpdate", 401, 405),
+    ("POST", "/docs/v1/documents/x:batchUpdate", 401, 405),
+    ("GET", "/slides/v1/presentations/x/pages/p1", 401, 404),
+    ("POST", "/gmail/v1/users/me/messages/send", 401, 405),
+    ("GET", "/gmail/v1/users/me/drafts", 401, 404),
+    ("DELETE", "/gmail/v1/users/me/messages/abc123", 401, 405),
+    ("POST", "/gmail/v1/users/me/labels", 401, 405),
+    # an escaped slash stays inside its segment (`routers.google._operation_path`)
+    ("GET", "/drive/v3/files/abc%2Fpermissions", 403, 404),
+    ("POST", "/drive/v3/files/{doc}%2Fcopy", 404, 404),
+    # no operation Google publishes: the router's 405 whatever the credential, where real answered
+    # its front end's HTML 404
+    ("PUT", "/gmail/v1/users/me/profile", 405, 405),
+    ("PUT", "/drive/v3/files/{doc}", 405, 405),
+]
+# fmt: on
+
+
+@pytest.mark.parametrize("method, path, code, admin", _NO_CREDENTIAL_ROWS)
+def test_a_missing_credential_is_answered_by_operation(client, admin_h, method, path, code, admin):
+    """The rows `_NO_CREDENTIAL_ROWS` records: no `Authorization` at all is answered per operation
+    rather than per family, a published operation Backlot does not serve included. Every 401 carries
+    real's challenge and no 403 does, `Bearer nope` is the 401 on each published operation, and the
+    admin token is what the request gets once its credential is read."""
+    url = path.format(doc=_drive_find(client, admin_h, "Brand")["id"])
+    body = _A1_FILTER if method in ("POST", "PATCH") else None
+    r = client.request(method, url, json=body)
+    if code in (404, 405):
+        for headers in (BAD_TOKEN, admin_h):
+            assert client.request(method, url, json=body, headers=headers).status_code == code
+        assert r.status_code == code, r.text
+        return
+    assert r.status_code == code, r.text
+    e = _gerr(r)
+    if code == 403:
+        assert (
+            e["message"] == gerr.UNREGISTERED_CALLER_MESSAGE and e["status"] == "PERMISSION_DENIED"
+        )
+        assert "www-authenticate" not in r.headers
+    else:
+        assert e["message"] == gerr.MISSING_CREDENTIALS_MESSAGE and e["status"] == "UNAUTHENTICATED"
+        assert r.headers["www-authenticate"] == _CHALLENGE
+    bad = client.request(method, url, json=body, headers=BAD_TOKEN)
+    assert bad.status_code == 401, bad.text
+    assert bad.headers["www-authenticate"] == _CHALLENGED
+    if admin is not None:
+        assert client.request(method, url, json=body, headers=admin_h).status_code == admin
+
+
+_SERVED = "served"  # the read's own 200
+_NONE = "none"  # the operation's answer to no credential at all
+
+# An `Authorization` value per row, `{t}` the admin token, and which of four answers real gave it
+# on the two reads below, as ``routers.google._credential`` records: the read's 200, the bad token's
+# 401 under either challenge (`_CHALLENGED`, `_CHALLENGE`), or what no credential gets.
+# fmt: off
+_CREDENTIAL_ROWS = [
+    ("Bearer {t}", _SERVED), ("OAuth {t}", _SERVED), ("Bearer  {t}", _SERVED),
+    ("Bearer \t{t}", _SERVED), ("Bearer {t} x", _SERVED), ("Bearer {t}\tx", _SERVED),
+    ("Bearer {t},x", _SERVED), ("Bearer ,{t}", _SERVED),
+    ('Bearer "{t}"', _SERVED), ('Bearer "{t}', _SERVED), ('OAuth "{t}"', _SERVED), ('Bearer ,"{t}"', _SERVED),
+    ('Bearer "{t}" x', _SERVED), ('Bearer "{t}",x', _SERVED), ('Bearer "{t}"x', _SERVED),
+    ('Bearer ",{t},"', _SERVED), ('Bearer "\t{t}"', _SERVED), ('Bearer "{t} "', _SERVED),
+    ("Bearer nope", _CHALLENGED), ("OAuth nope", _CHALLENGED), ("Bearer x {t}", _CHALLENGED), ("Bearer {t};x", _CHALLENGED),
+    ('Bearer {t}"', _CHALLENGED), ("Bearer nope x", _CHALLENGED),
+    ('Bearer "nope"', _CHALLENGED), ('Bearer "{t} x"', _CHALLENGED), ('Bearer "{t},x"', _CHALLENGED),
+    ('Bearer " "', _CHALLENGED), ("Bearer '{t}'", _CHALLENGED),
+    ("Bearer{t}", _CHALLENGE), ("Bearer\t{t}", _CHALLENGE), ("Bearers {t}", _CHALLENGE),
+    ("Bearer ,", _CHALLENGE), ("OAuth ,", _CHALLENGE), ("OAuth2 {t}", _CHALLENGE),
+    ('Bearer ""', _CHALLENGE), ('Bearer "', _CHALLENGE), ('Bearer ""{t}', _CHALLENGE),
+    ("bearer {t}", _NONE), ("BEARER {t}", _NONE), ("oauth {t}", _NONE), ("OAUTH {t}", _NONE),
+    ("token {t}", _NONE), ("Token {t}", _NONE), ("MAC {t}", _NONE), ("Basic Zm9vOmJhcg==", _NONE),
+    ("{t}", _NONE), ("Bearer", _NONE), ("OAuth", _NONE),
+]
+# fmt: on
+
+
+# A query per row, beside an `Authorization` value or none, and which of the same four answers real
+# gave a query of that shape, as ``routers.google._query_credential`` records. `ya29.x` stands for a
+# token of Google's shape that does not resolve, `{t}` for the admin token and `{m}` for the scoped
+# one, neither of that shape.
+# fmt: off
+_QUERY_CREDENTIAL_ROWS = [
+    (None, "access_token=ya29.x", _CHALLENGED), (None, "access_token=1/x", _CHALLENGED),
+    (None, "access_token=1%2Fx", _CHALLENGED), (None, "bearer_token=ya29.x", _CHALLENGED),
+    (None, "access%5Ftoken=ya29.x", _CHALLENGED),
+    (None, "oauth_token=ya29.x", _CHALLENGED),
+    (None, "access_token={t}", _NONE), (None, "access_token=ya29", _NONE),
+    (None, "access_token=YA29.x", _NONE), (None, "access_token=%20ya29.x", _NONE),
+    (None, "access_token=", _NONE), (None, "ACCESS_TOKEN=ya29.x", _NONE),
+    # the first of `QUERY_TOKENS` the query carries is the gate, the last the token
+    (None, "access_token=ya29.x&oauth_token={t}", _SERVED),
+    (None, "oauth_token={t}&access_token=ya29.x", _SERVED),
+    (None, "access_token=ya29.x&bearer_token={t}", _SERVED),
+    (None, "bearer_token=ya29.x&oauth_token={t}", _SERVED),
+    (None, "access_token={t}&oauth_token=ya29.x", _NONE),
+    (None, "access_token=&oauth_token=ya29.x", _NONE),
+    (None, "oauth_token=nope&access_token=ya29.x", _CHALLENGED),
+    (None, "oauth_token=&access_token=ya29.x", _CHALLENGE),
+    (None, "access_token=ya29.x&access_token={t}", _CHALLENGE),
+    (None, "access_token=ya29.x&oauth_token={t}&oauth_token={t}", _CHALLENGE),
+    (None, "access_token=ya29.x&access_token=ya29.x&oauth_token={t}", _SERVED),
+    (None, "access_token=ya29.x&oauth_token={m}", _SERVED),
+    # beside a header: a credential, a bare scheme and `Bearer ,` outrank the query, a scheme run
+    # into its token reads it without the gate, and a header that is no credential leaves it alone
+    ("Bearer {t}", "access_token=ya29.x", _SERVED),
+    ("Bearer nope", "access_token=ya29.x&oauth_token={t}", _CHALLENGED),
+    ("Bearer ,", "access_token=ya29.x&oauth_token={t}", _CHALLENGE),
+    ('Bearer ""', "access_token=ya29.x&oauth_token={t}", _CHALLENGE),
+    ('Bearer "nope"', "access_token=ya29.x&oauth_token={t}", _CHALLENGED),
+    ('Bearer "{t}"', "access_token=ya29.x", _SERVED),
+    ("Bearer", "access_token=ya29.x&oauth_token={t}", _NONE),
+    ("Bearer{t}", "access_token={t}", _SERVED), ("OAuth2 {t}", "access_token={t}", _SERVED),
+    ("Bearer{m}", "access_token={m}", _SERVED),
+    ("Bearer{t}", "access_token=nope", _CHALLENGED), ("Bearer{t}", "access_token=", _CHALLENGE),
+    ("Bearer{t}", "ACCESS_TOKEN={t}", _CHALLENGE),
+    ("Bearer{t}", "access_token=&oauth_token={t}", _SERVED),
+    ("Bearer{t}", "oauth_token=&access_token={t}", _CHALLENGE),
+    ("bearer {t}", "access_token=ya29.x&oauth_token={t}", _SERVED),
+    ("Basic Zm9vOmJhcg==", "access_token=ya29.x", _CHALLENGED), ("", "access_token=ya29.x", _CHALLENGED),
+]
+# fmt: on
 
 
 @pytest.mark.parametrize(
-    "method, path, code, status",
-    [
-        ("GET", "/drive/v3/files", 403, "PERMISSION_DENIED"),  # a GET on an API that accepts
-        ("GET", "/sheets/v4/spreadsheets/x", 403, "PERMISSION_DENIED"),  # ...keys is "unregistered"
-        ("GET", "/gmail/v1/users/me/profile", 401, "UNAUTHENTICATED"),  # OAuth-only APIs say the
-        ("GET", "/docs/v1/documents/x", 401, "UNAUTHENTICATED"),  # ...credentials are missing
-        ("GET", "/slides/v1/presentations/x", 401, "UNAUTHENTICATED"),
-        # the two data-filter reads, the only non-GET operations under the five families
-        ("POST", "/sheets/v4/spreadsheets/x/values:batchGetByDataFilter", 401, "UNAUTHENTICATED"),
-        ("POST", "/sheets/v4/spreadsheets/x:getByDataFilter", 401, "UNAUTHENTICATED"),
-    ],
+    "value, query, answer",
+    [(value, "", answer) for value, answer in _CREDENTIAL_ROWS] + _QUERY_CREDENTIAL_ROWS,
 )
-def test_a_missing_header_differs_by_family_and_method(client, method, path, code, status):
-    """The surprise, measured: no `Authorization` header at all is NOT uniformly 401, and the path
-    is half the rule. A GET on Drive or Sheets is 403 PERMISSION_DENIED, a GET on Gmail, Docs or
-    Slides is 401, and a POST is 401 on every family, the two Sheets reads issued over POST
-    included. A bad token is 401 everywhere — so the two cases are genuinely distinct and Backlot
-    conflated them."""
-    r = _anonymous(client, method, path, {})
-    assert r.status_code == code
-    e = _gerr(r)
-    assert e["code"] == code and e["status"] == status
-    if code == 403:
-        assert "unregistered callers" in e["message"]
+@pytest.mark.parametrize(
+    "path, anonymous", [("/gmail/v1/users/me/labels/INBOX", 401), ("/drive/v3/files", 403)]
+)
+def test_a_credential_is_read_as_google_reads_it(
+    client, tokens_yaml, tokens, value, query, answer, path, anonymous
+):
+    """The rows `_CREDENTIAL_ROWS` and `_QUERY_CREDENTIAL_ROWS` record, on an operation whose caller
+    with no credential is a missing one and on one whose is an unregistered one. A served row is
+    answered as its token is under `Authorization: Bearer`, the scoped token's as the scoped user's
+    rather than the admin's."""
+    admin, scoped = tokens_yaml["admin_token"], tokens["mia@acme.com"]
+    headers = {} if value is None else {"Authorization": value.format(t=admin, m=scoped)}
+    sent = query.format(t=admin, m=scoped)
+    r = client.get(f"{path}?{sent}" if sent else path, headers=headers)
+    if answer == _SERVED:
+        assert r.status_code == 200, r.text
+        token = scoped if "{m}" in f"{value}{query}" else admin
+        assert r.json() == client.get(path, headers={"Authorization": f"Bearer {token}"}).json()
+        if token == scoped:
+            assert r.json() != client.get(path, headers={"Authorization": f"Bearer {admin}"}).json()
+        return
+    if answer == _NONE:
+        assert r.status_code == anonymous, r.text
+        assert r.json() == client.get(path).json()
+        return
+    assert r.status_code == 401, r.text
+    assert _gerr(r)["message"] == gerr.BAD_TOKEN_MESSAGE
+    assert r.headers["www-authenticate"] == answer
+
+
+_DENIED = "Delegation denied for mia@acme.com"
+_NOT_AN_ADDRESS = "Invalid user id specified in request/Delegation denied"
+
+# A Gmail request per row as a user's token sends it, `{u}` the mailbox the path names: the user,
+# the `userId`, the rest of the path and its query, and the status and message real answered (the
+# admin row aside), as ``routers.google._refuse_another_mailbox`` records, None where the message
+# is not a refusal's.
+# fmt: off
+_MAILBOX_ROWS = [
+    ("mia", "me", "profile", 200, None),
+    ("mia", "ME", "profile", 200, None),
+    ("mia", "Me", "profile", 200, None),
+    ("mia", "MIA@ACME.COM", "profile", 200, None),
+    ("mia", "mia@acme.com", "messages?maxResults=1", 200, None),
+    ("mia", "ava.chen@acme.com", "profile", 403, _DENIED),
+    ("mia", "someone@example.com", "profile", 403, _DENIED),
+    ("mia", "someone@example.com", "labels", 403, _DENIED),
+    ("mia", "someone@example.com", "labels/INBOX", 403, _DENIED),
+    ("mia", "someone@example.com", "messages", 403, _DENIED),
+    ("mia", "someone@example.com", "messages/{comp}", 403, _DENIED),
+    ("mia", "someone@example.com", "messages/{comp}/attachments/x", 403, _DENIED),
+    ("mia", "someone@example.com", "threads", 403, _DENIED),
+    ("mia", "someone@example.com", "threads/{comp}", 403, _DENIED),
+    ("mia", "bob", "profile", 403, _NOT_AN_ADDRESS),
+    ("mia", "@", "profile", 403, _NOT_AN_ADDRESS),
+    ("mia", "mia@", "profile", 403, _NOT_AN_ADDRESS),
+    ("mia", "@acme.com", "profile", 403, _NOT_AN_ADDRESS),
+    # what comes before it, and what after
+    ("bad", "someone@example.com", "profile", 401, None),
+    ("mia", "someone@example.com", "profile?%24.xgafv=9", 400, None),
+    ("mia", "someone@example.com", "messages?maxResults=abc", 400, None),
+    ("mia", "someone@example.com", "messages?maxResults=-1", 400, None),
+    ("mia", "someone@example.com", "threads?maxResults=abc", 400, None),
+    ("mia", "bob", "messages?maxResults=abc", 400, None),
+    ("mia", "someone@example.com", "messages/zzz", 403, _DENIED),
+    ("mia", "someone@example.com", "messages?maxResults=0", 403, _DENIED),
+    ("mia", "someone@example.com", "messages?pageToken=zzz", 403, _DENIED),
+    # the admin token reads any mailbox (`_refuse_another_mailbox` says what it stands for)
+    ("admin", "someone@example.com", "profile", 200, None),
+]
+# fmt: on
+
+
+@pytest.mark.parametrize("caller, user_id, rest, status, message", _MAILBOX_ROWS)
+def test_gmail_a_users_token_reads_its_own_mailbox_only(
+    client, admin_h, tokens, ro_conn, caller, user_id, rest, status, message
+):
+    """The rows `_MAILBOX_ROWS` records. The refusal is real's to the byte, and a user's own mailbox
+    named any way it can be is answered as `me` is, the address it reports included."""
+    comp = ro_conn.execute(
+        "SELECT id FROM gmail_messages WHERE title LIKE 'Confidential comp%'"
+    ).fetchone()["id"]
+    headers = {
+        "mia": {"Authorization": f"Bearer {tokens['mia@acme.com']}"},
+        "bad": BAD_TOKEN,
+        "admin": admin_h,
+    }[caller]
+    r = client.get(f"/gmail/v1/users/{user_id}/{rest.format(comp=comp)}", headers=headers)
+    assert r.status_code == status, r.text
+    if message is not None:
+        assert r.json() == {
+            "error": {
+                "code": 403,
+                "message": message,
+                "errors": [{"message": message, "domain": "global", "reason": "forbidden"}],
+                "status": "PERMISSION_DENIED",
+            }
+        }
+    if status == 200 and rest == "profile":
+        me = client.get("/gmail/v1/users/me/profile", headers=headers).json()
+        assert r.json() == me if caller == "mia" else r.json()["emailAddress"] == user_id
+
+
+# An unserved operation per row (`routers.google._PUBLISHED_NOT_SERVED`), beside a system parameter:
+# the method, the path, the query, the credential, and what real answered, as
+# ``refuse_an_unserved_operation`` records — the status and the error code inside it, which a
+# `callback` on a GET wraps at 200. A POST and a PATCH leave `callback` alone, as a served POST
+# does. An anonymous GET's `callback=cb` is a row of `JSONP_FAMILY_ERRORS` instead.
+# fmt: off
+_UNSERVED_PARAMETER_ROWS = [
+    ("GET", "/drive/v3/changes/startPageToken", {"$.xgafv": "9"}, None, 400, 400),
+    ("GET", "/drive/v3/changes/startPageToken", {"callback": "cb"}, "bad", 200, 401),
+    ("GET", "/drive/v3/changes/startPageToken", {"callback": "a b"}, None, 200, 400),
+    ("PATCH", "/drive/v3/files/x", {"$.xgafv": "9"}, "bad", 400, 400),
+    ("PATCH", "/drive/v3/files/x", {"callback": "cb"}, None, 401, 401),
+    ("PATCH", "/drive/v3/files/x", {"callback": "a b"}, None, 401, 401),
+    ("POST", "/gmail/v1/users/me/messages/send", {"callback": "a b"}, "bad", 401, 401),
+    ("GET", "/drive/v3/files/x/revisions/y", {"alt": "media", "access_token": ""}, None, 401, 401),
+]
+# fmt: on
+
+
+@pytest.mark.parametrize("method, path, params, caller, status, code", _UNSERVED_PARAMETER_ROWS)
+def test_an_unserved_operation_reads_the_system_parameters_first(
+    client, method, path, params, caller, status, code
+):
+    """The rows `_UNSERVED_PARAMETER_ROWS` records: ahead of the credential, `$.xgafv` refused,
+    and on a GET a `callback` wrapping the refusal or refused itself, as on a served route; and a
+    revision's `alt=media` beside an empty `access_token` left to the missing credential's 401
+    rather than a download's answer. The check runs ahead of routing here
+    (``backlot.main.route_a_google_path_the_way_google_does``), where a served route's runs as the
+    router's dependency, so it is pinned on its own."""
+    headers = BAD_TOKEN if caller == "bad" else {}
+    r = client.request(method, path, params=params, headers=headers)
+    assert r.status_code == status, r.text
+    error = _jsonp(r, params["callback"]) if status == 200 else _gerr(r)
+    assert error["error"]["code"] == code if status == 200 else error["code"] == code
+    if status == 200 and params["callback"] == "cb":
+        plain = client.request(method, path, headers=headers)
+        assert r.text == f"// API callback\ncb({plain.text});"
+    if code == 401:
+        assert r.headers["www-authenticate"] == (_CHALLENGED if caller == "bad" else _CHALLENGE)
+
+
+# --- a `HEAD`, and a trailing slash ------------------------------------------------------------
+
+_REFUSED = "refused"  # the editor hosts' empty 400 (`errors.google.head_refusal`)
+
+# A `HEAD` per row, answered as the `GET` of the same URL (or of the URL in the third column) with
+# the body left off, or refused. The credential is `admin`, `mia` (the scoped token, which can see
+# neither the spreadsheet nor the CFO's message), `bad` or None for no header; the status is the
+# `HEAD`'s, and the GET's too where the row is not refused; the last column is whether the `HEAD`
+# declares a length (`errors.google.head_content_length`).
+# fmt: off
+_HEAD_ROWS = [
+    ("/drive/v3/files", "admin", None, 200, False),
+    ("/drive/v3/files", None, None, 403, False),
+    ("/drive/v3/files", "bad", None, 401, False),
+    ("/drive/v3/files/{doc}", "admin", None, 200, False),
+    ("/drive/v3/files/{sheet}", "mia", None, 404, False),
+    ("/drive/v3/files/nosuchfile000", "admin", None, 404, False),
+    ("/drive/v3/files/{doc}/export?mimeType=text/plain", "admin", None, 200, True),
+    ("/drive/v3/files/{sheet}/export?mimeType=text/csv", "mia", None, 404, False),
+    ("/drive/v3/files/{doc}/export?mimeType=text/plain", None, None, 403, False),
+    ("/drive/v3/files/{doc}/export?mimeType=text/plain&callback=cb", "admin", None, 200, True),
+    ("/drive/v3/files/{pdf}?alt=media", "admin", None, 200, True),
+    ("/drive/v3/files/{doc}?alt=media", "admin", None, 403, False),
+    ("/drive/v3/files/{pdf}?alt=media&callback=a%20b", "admin", None, 503, False),
+    ("/drive/v3/files/{doc}/permissions", "admin", None, 200, False),
+    ("/drive/v3/about?fields=user", "admin", None, 200, False),
+    ("/drive/v3/about", "admin", None, 400, False),
+    ("/drive/v3/drives", "admin", None, 200, False),
+    ("/drive/v3/files?pageSize=0", "admin", None, 400, False),
+    ("/drive/v3/files?%24.xgafv=9", "admin", None, 400, False),
+    # each answered as the read without its `callback` (``errors.google.jsonp_callback``)
+    ("/drive/v3/files?callback=cb", "admin", "/drive/v3/files", 200, False),
+    ("/drive/v3/files?callback=a%20b", "admin", "/drive/v3/files", 200, False),
+    ("/drive/v3/files?callback=cb", "bad", "/drive/v3/files", 401, False),
+    ("/gmail/v1/users/me/profile?callback=a%20b", None, "/gmail/v1/users/me/profile", 401, False),
+    ("/drive/v3/files/", "admin", None, 200, False),
+    ("/gmail/v1/users/me/profile", "admin", None, 200, False),
+    ("/gmail/v1/users/me/profile", None, None, 401, False),
+    ("/gmail/v1/users/me/profile", "bad", None, 401, False),
+    ("/gmail/v1/users/me/profile?callback=cb", "admin", "/gmail/v1/users/me/profile", 200, False),
+    ("/gmail/v1/users/me/labels", "admin", None, 200, False),
+    ("/gmail/v1/users/me/labels/INBOX", "admin", None, 200, False),
+    ("/gmail/v1/users/me/labels/", "admin", None, 200, False),
+    ("/gmail/v1/users/me/messages", "admin", None, 200, False),
+    ("/gmail/v1/users/me/messages?maxResults=0", "admin", None, 400, False),
+    ("/gmail/v1/users/me/messages/{comp}", "admin", None, 200, False),
+    ("/gmail/v1/users/me/messages/{comp}", "mia", None, 404, False),
+    ("/gmail/v1/users/me/messages/zzz", "admin", None, 400, False),
+    ("/gmail/v1/users/me/threads", "admin", None, 200, False),
+    ("/gmail/v1/users/me/threads/{comp}", "admin", None, 200, False),
+    ("/drive/v3/changes/startPageToken", None, None, 401, False),
+    ("/sheets/v4/spreadsheets/{sheet}", "admin", _REFUSED, 400, False),
+    ("/sheets/v4/spreadsheets/{sheet}", None, _REFUSED, 400, False),
+    ("/sheets/v4/spreadsheets/{sheet}/values/A1", "admin", _REFUSED, 400, False),
+    ("/sheets/v4/spreadsheets/{sheet}?%24.xgafv=9", "admin", _REFUSED, 400, False),
+    ("/sheets/v4/spreadsheets/{sheet}/", "admin", _REFUSED, 400, False),
+    ("/sheets/v4/nope", "admin", _REFUSED, 400, False),
+    ("/sheets/v4x/spreadsheets/abc", None, _REFUSED, 400, False),
+    ("/docs/v1/documents/{doc}", "bad", _REFUSED, 400, False),
+    ("/slides/v1/presentations/x", None, _REFUSED, 400, False),
+]
+# fmt: on
+
+
+@pytest.mark.parametrize("path, caller, get_path, status, declares", _HEAD_ROWS)
+def test_google_a_head_is_the_get_without_its_body_or_the_editor_hosts_400(
+    client, admin_h, tokens, ro_conn, path, caller, get_path, status, declares
+):
+    """The rows `_HEAD_ROWS` records. Drive and Gmail answer the `HEAD` as the GET, status and
+    `content-type` alike, with a length only where `declares` says; the three editor hosts answer
+    their empty 400, where the GET beside it is a JSON answer of its own. The body a `HEAD` leaves
+    off is read from the ASGI messages the app sends, since the test client discards it."""
+    from starlette.testclient import TestClient
+
+    ids = {
+        "doc": _drive_find(client, admin_h, "Brand")["id"],
+        "pdf": _drive_find(client, admin_h, "Whitepaper")["id"],
+        "sheet": _drive_find(client, admin_h, "Q1 Revenue Model")["id"],
+        "comp": ro_conn.execute(
+            "SELECT id FROM gmail_messages WHERE title LIKE 'Confidential comp%'"
+        ).fetchone()["id"],
+    }
+    headers = {
+        "admin": admin_h,
+        "mia": {"Authorization": f"Bearer {tokens['mia@acme.com']}"},
+        "bad": BAD_TOKEN,
+        None: {},
+    }[caller]
+    url = path.format(**ids)
+    head = client.head(url, headers=headers)
+    get = client.get(url if get_path in (None, _REFUSED) else get_path, headers=headers)
+    assert head.status_code == status, url
+    if get_path == _REFUSED:
+        assert head.headers["content-type"] == "text/html; charset=utf-8", url
+        assert head.headers["content-length"] == "0", url
+        assert get.headers["content-type"].startswith("application/json"), url
     else:
-        assert "missing required authentication credential" in e["message"]
+        assert get.status_code == status, url
+        assert head.headers["content-type"] == get.headers["content-type"], url
+        if declares:
+            assert head.headers["content-length"] == str(len(get.content)), url
+        else:
+            assert "content-length" not in head.headers, url
+    sent = []
+
+    async def recording(scope, receive, send):
+        async def record(message):
+            sent.append(message)
+            await send(message)
+
+        await client.app(scope, receive, record)
+
+    TestClient(recording).head(url, headers=headers)  # outside `with`, so `client` keeps its state
+    assert b"".join(m.get("body", b"") for m in sent if m["type"] == "http.response.body") == b""
+
+
+# A slashed request per row, the spellings measured for
+# ``backlot.main.route_a_google_path_the_way_google_does``: the slashed request, the request it
+# answers as (None where that is the unrouted 404), the credential as in `_HEAD_ROWS`, and the
+# status.
+# fmt: off
+_SLASHED_ROWS = [
+    ("GET /drive/v3/files/", "GET /drive/v3/files", "admin", 200),
+    ("GET /drive/v3/files//", "GET /drive/v3/files", "admin", 200),
+    ("GET /drive/v3/files/", "GET /drive/v3/files", None, 403),
+    ("GET /drive/v3/files/{doc}/", "GET /drive/v3/files/{doc}", "admin", 200),
+    ("GET /drive/v3/files/{sheet}/", "GET /drive/v3/files/{sheet}", "mia", 404),
+    ("GET /drive/v3/files/nosuchfile000/", "GET /drive/v3/files/nosuchfile000", "admin", 404),
+    ("GET /drive/v3/files/{doc}/export/?mimeType=text/plain", "GET /drive/v3/files/{doc}/export?mimeType=text/plain", "admin", 200),
+    ("GET /drive/v3/files/{doc}/permissions/", "GET /drive/v3/files/{doc}/permissions", "admin", 200),
+    ("GET /drive/v3/about/?fields=user", "GET /drive/v3/about?fields=user", "admin", 200),
+    ("GET /drive/v3/about/?fields=user", "GET /drive/v3/about?fields=user", None, 401),
+    ("GET /drive/v3/drives/", "GET /drive/v3/drives", "admin", 200),
+    ("GET /gmail/v1/users/me/profile/", "GET /gmail/v1/users/me/profile", None, 401),
+    ("GET /gmail/v1/users/me/profile//", "GET /gmail/v1/users/me/profile", "admin", 200),
+    ("GET /gmail/v1/users/me/labels//", "GET /gmail/v1/users/me/labels", "admin", 200),
+    ("GET /gmail/v1/users/me/labels///", "GET /gmail/v1/users/me/labels", "admin", 200),
+    ("GET /gmail/v1/users/me/labels/", "GET /gmail/v1/users/me/labels", "bad", 401),
+    ("GET /gmail/v1/users/me/labels/INBOX/", "GET /gmail/v1/users/me/labels/INBOX", "admin", 200),
+    ("GET /gmail/v1/users/me/messages/?maxResults=1", "GET /gmail/v1/users/me/messages?maxResults=1", "admin", 200),
+    ("GET /gmail/v1/users/me/messages/{comp}/", "GET /gmail/v1/users/me/messages/{comp}", "mia", 404),
+    ("GET /gmail/v1/users/me/messages/{held}/attachments/{att}/", "GET /gmail/v1/users/me/messages/{held}/attachments/{att}", "admin", 200),
+    ("GET /gmail/v1/users/me/threads/", "GET /gmail/v1/users/me/threads", "admin", 200),
+    ("GET /gmail/v1/users/me/threads/{comp}/", "GET /gmail/v1/users/me/threads/{comp}", "admin", 200),
+    ("GET /sheets/v4/spreadsheets/{sheet}/", "GET /sheets/v4/spreadsheets/{sheet}", "admin", 200),
+    ("GET /sheets/v4/spreadsheets/{sheet}//", "GET /sheets/v4/spreadsheets/{sheet}", None, 403),
+    ("GET /sheets/v4/spreadsheets/{sheet}/values/A1/", "GET /sheets/v4/spreadsheets/{sheet}/values/A1", "admin", 200),
+    ("GET /sheets/v4/spreadsheets/{sheet}/values/A1//", "GET /sheets/v4/spreadsheets/{sheet}/values/A1", "admin", 200),
+    # an escaped slash is part of the range, and an empty range is no route at all
+    ("GET /sheets/v4/spreadsheets/{sheet}/values/A1%2F", "GET /sheets/v4/spreadsheets/{sheet}/values/A1%2F", "admin", 400),
+    ("GET /sheets/v4/spreadsheets/{sheet}/values/", None, "admin", 404),
+    ("GET /sheets/v4/spreadsheets/{sheet}/values", None, "admin", 404),
+    ("GET /sheets/v4/spreadsheets/{sheet}/values:batchGet/?ranges=A1", "GET /sheets/v4/spreadsheets/{sheet}/values:batchGet?ranges=A1", "admin", 200),
+    ("POST /sheets/v4/spreadsheets/{sheet}:getByDataFilter/", "POST /sheets/v4/spreadsheets/{sheet}:getByDataFilter", "admin", 200),
+    ("GET /docs/v1/documents/{doc}/", "GET /docs/v1/documents/{doc}", None, 401),
+    ("GET /slides/v1/presentations/x/", "GET /slides/v1/presentations/x", None, 401),
+    ("GET /drive/v3//files", None, "admin", 404),
+    ("GET /gmail/v1/users/me//labels", None, "admin", 404),
+]
+# fmt: on
+
+
+@pytest.mark.parametrize("slashed, slash_free, caller, status", _SLASHED_ROWS)
+def test_google_a_trailing_slash_is_not_part_of_the_path(
+    client, admin_h, tokens, ro_conn, slashed, slash_free, caller, status
+):
+    """The rows `_SLASHED_ROWS` records, each answered byte for byte as the request beside it where
+    it has one (``backlot.main.route_a_google_path_the_way_google_does``)."""
+    held = ro_conn.execute(
+        "SELECT id FROM gmail_messages WHERE COALESCE(attachments,'') NOT IN ('', '[]') LIMIT 1"
+    ).fetchone()["id"]
+    parts = client.get(f"/gmail/v1/users/me/messages/{held}", headers=admin_h).json()["payload"]
+    ids = {
+        "doc": _drive_find(client, admin_h, "Brand")["id"],
+        "sheet": _drive_find(client, admin_h, "Q1 Revenue Model")["id"],
+        "comp": ro_conn.execute(
+            "SELECT id FROM gmail_messages WHERE title LIKE 'Confidential comp%'"
+        ).fetchone()["id"],
+        "held": held,
+        "att": next(p for p in parts["parts"] if p.get("filename"))["body"]["attachmentId"],
+    }
+    headers = {
+        "admin": admin_h,
+        "mia": {"Authorization": f"Bearer {tokens['mia@acme.com']}"},
+        "bad": BAD_TOKEN,
+        None: {},
+    }[caller]
+
+    def send(request):
+        method, url = request.split(" ", 1)
+        body = "{}" if method == "POST" else None
+        return client.request(
+            method, url.format(**ids), headers=headers, content=body, follow_redirects=False
+        )
+
+    got = send(slashed)
+    assert got.status_code == status, got.text
+    if slash_free is not None:
+        assert got.content == send(slash_free).content
 
 
 # --- `callback`, and the bytes a Google body reaches the wire as -------------------------------
@@ -2396,9 +3101,11 @@ def test_a_missing_header_differs_by_family_and_method(client, method, path, cod
 #   indentation   two spaces and a trailing newline on an error, whatever `prettyPrint` says
 #   charset       `application/json; charset=UTF-8` on the plain body
 #
-# The five anonymous errors below are the GET rows of
-# `test_a_missing_header_differs_by_family_and_method`, reused because one request per family is
-# what real was asked.
+# The anonymous errors below are one GET per family from `_NO_CREDENTIAL_ROWS`, because one request
+# per family is what real was asked, then three operations Backlot does not serve
+# (``routers.google.refuse_an_unserved_operation``). Real answered those three as it does the five
+# on 2026-10-13: indented under the charset, the script around the plain body, an empty `callback`
+# as none, and `alt` spelt `json`, `JSON`, `Json` or empty keeping the script.
 
 JSONP_FAMILY_ERRORS = [
     ("/drive/v3/files", 403),
@@ -2406,6 +3113,9 @@ JSONP_FAMILY_ERRORS = [
     ("/gmail/v1/users/me/profile", 401),
     ("/docs/v1/documents/x", 401),
     ("/slides/v1/presentations/x", 401),
+    ("/drive/v3/changes/startPageToken", 401),
+    ("/drive/v3/files/x/comments", 403),
+    ("/gmail/v1/users/me/drafts", 401),
 ]
 
 CALLBACK_REFUSAL = (
@@ -2485,6 +3195,8 @@ def test_a_callback_answers_an_error_at_200_as_a_script(client, path, code):
     assert r.headers["content-type"] == "text/javascript; charset=UTF-8"
     assert r.text == f"// API callback\ncb({plain.text});"
     assert json.loads(r.text[len("// API callback\ncb(") : -2])["error"]["code"] == code
+    # the 401's challenge rides on the script too (``errors.google._CHALLENGE``)
+    assert r.headers.get("www-authenticate") == (_CHALLENGE if code == 401 else None)
 
 
 def test_a_callback_wraps_a_success_and_an_error_through_the_same_serializer(
@@ -2811,8 +3523,9 @@ def test_a_repeated_parameter_is_read_from_the_end_real_reads_it_from(
 
 
 def test_every_google_get_refuses_a_callback_it_cannot_call_and_no_post_reads_one(client):
-    """The other half of ``test_every_google_operation_declares_the_system_parameter_and_checks_it``
-    for the second system parameter, split the way real splits it.
+    """The other half of
+    ``test_every_google_operation_declares_the_system_parameters_and_reads_them`` for `callback`,
+    split the way real splits it.
 
     Every family GET is sent a name that cannot be a JavaScript one and has to refuse it. Every
     family POST is sent the same name and has to IGNORE it: measured on Sheets, a `callback` on
@@ -3202,8 +3915,8 @@ def _download_requests(client, admin_h):
 
 def test_a_download_names_the_missing_api_key_where_the_metadata_read_does_not(client, admin_h):
     """Measured 2026-10-04 on `files.export` and 2026-10-05 on `files.get?alt=media`: a byte-stream
-    read with no credential answers real's missing-API-key sentence with `reason: forbidden` and no
-    `status`, where the metadata read of the same file answers the unregistered caller."""
+    read with no `Authorization` answers real's missing-API-key sentence with `reason: forbidden`
+    and no `status`, where the metadata read of the same file answers the unregistered caller."""
     requests = _download_requests(client, admin_h)
     for kind in ("media", "export"):
         url, params = requests[kind]
@@ -3246,7 +3959,7 @@ def test_a_callback_on_a_download_is_real_503_to_the_byte(client, admin_h):
     `errors[]` entry inline and no trailing newline, where the serializer every other Google body
     goes through writes the array expanded and ends with one.
 
-    The same request with no credential answers it too: the callback is refused ahead of the
+    The same request with no `Authorization` answers it too: the callback is refused ahead of the
     missing-API-key 403, which is the order real answers them in."""
     requests = _download_requests(client, admin_h)
     for kind in ("media", "export"):
@@ -3285,11 +3998,12 @@ def test_a_callback_on_a_download_turns_every_later_error_into_the_same_503(clie
 
 
 def test_the_refusal_order_on_a_download_is_system_bearer_then_callback(client, admin_h):
-    """On both downloads, `$.xgafv` 400 first, then a `Bearer` token that does not resolve 401, then
-    the callback's 503 -- the order `gerr.missing_api_key` records. Only the header
-    `_sends_a_bearer_token` accepts is a credential at that layer (`_require_download_bearer`):
-    every other value below reaches the callback's 503 beside `callback=a b`, and each of them is
-    a 401 without one."""
+    """On both downloads, `$.xgafv` 400 first, then a credential that does not resolve 401, then
+    the callback's 503 -- the order `gerr.missing_api_key` records. Only a header `_credential`
+    reads as a credential is one at that layer (`_require_download_bearer`): every other value
+    below reaches the callback's 503 beside `callback=a b`. Each of them is a 401 without one, the
+    front end's for a credential and the download server's (`gerr.download_credential_refused`)
+    for the rest."""
     requests = _download_requests(client, admin_h)
     for kind in ("media", "export"):
         url, params = requests[kind]
@@ -3298,6 +4012,10 @@ def test_the_refusal_order_on_a_download_is_system_bearer_then_callback(client, 
         assert xgafv.status_code == 400 and XGAFV_REFUSAL.format("9") in xgafv.text, kind
         for value, beside_callback in (
             ("Bearer not-a-real-token", 401),
+            ("OAuth not-a-real-token", 401),
+            ("Bearer not-a-real-token x", 401),
+            ("Bearernot-a-real-token", 401),
+            ("Bearer\tnot-a-real-token", 401),
             ("bearer not-a-real-token", 503),
             ("BEARER not-a-real-token", 503),
             ("token not-a-real-token", 503),
@@ -3305,6 +4023,7 @@ def test_the_refusal_order_on_a_download_is_system_bearer_then_callback(client, 
             ("bearer", 503),
             ("nope", 503),
             ("Basic YWJjOmRlZg==", 503),
+            ("", 503),
         ):
             headers = {"Authorization": value}
             answer = client.get(url, params=bad, headers=headers)
@@ -3313,7 +4032,86 @@ def test_the_refusal_order_on_a_download_is_system_bearer_then_callback(client, 
                 assert answer.text == DOWNLOAD_503_BODY, (kind, value)
             else:
                 assert answer.json()["error"]["status"] == "UNAUTHENTICATED", (kind, value)
-            assert client.get(url, params=params, headers=headers).status_code == 401, (kind, value)
+            alone = client.get(url, params=params, headers=headers)
+            assert alone.status_code == 401, (kind, value)
+            if beside_callback == 503:
+                assert (
+                    _gerr(alone) == gerr.http_body(url, gerr.download_credential_refused())["error"]
+                ), (kind, value)
+                assert (
+                    alone.headers["www-authenticate"]
+                    == 'Bearer realm="https://accounts.google.com"'
+                )
+            else:
+                assert _gerr(alone)["status"] == "UNAUTHENTICATED", (kind, value)
+
+
+# A read per row whose query names a token, a byte-stream read but for `json`, as
+# ``gerr.token_in_query`` records: the read (`media`; `export`; `bare`, an export with no
+# `mimeType`; `missing`, an export of a file that does not exist; `json`, an export asking for
+# `alt=json`), the query, the `Authorization`, and the status real answered with what identifies the
+# answer: the message, or the challenge of a 401. The `media` row with `nope` is the answer real
+# gave inside a batch (``gerr.token_in_query``).
+_QUERY_TOKEN = gerr.QUERY_TOKEN_MESSAGE
+# fmt: off
+_DOWNLOAD_QUERY_TOKEN_ROWS = [
+    ("export", "access_token=nope", None, 400, _QUERY_TOKEN),
+    ("export", "access_token=", None, 400, _QUERY_TOKEN),
+    ("export", "oauth_token=nope", None, 400, _QUERY_TOKEN),
+    ("export", "ACCESS_TOKEN=nope", None, 400, _QUERY_TOKEN),
+    ("export", "BEARER_TOKEN=nope", None, 400, _QUERY_TOKEN),
+    ("export", "access_token=nope", "Bearer {t}", 400, _QUERY_TOKEN),
+    ("export", "access_token=nope", "bearer nope", 400, _QUERY_TOKEN),
+    ("export", "access_token=", "", 400, _QUERY_TOKEN),
+    ("export", "access_token=nope&callback=a%20b", None, 400, _QUERY_TOKEN),
+    ("export", "access_token=nope&callback=cb", None, 400, _QUERY_TOKEN),
+    ("bare", "access_token=nope", None, 400, _QUERY_TOKEN),
+    ("missing", "access_token=nope", None, 400, _QUERY_TOKEN),
+    ("media", "access_token=", None, 400, _QUERY_TOKEN),
+    ("media", "oauth_token=", None, 400, _QUERY_TOKEN),
+    ("media", "ACCESS_TOKEN=nope", None, 400, _QUERY_TOKEN),
+    ("media", "access_token=", "Bearer {t}", 400, _QUERY_TOKEN),
+    ("media", "access_token=&callback=a%20b", None, 400, _QUERY_TOKEN),
+    ("media", "access_token=nope", None, 400, _QUERY_TOKEN),
+    # what comes before it
+    ("export", "access_token=nope&%24.xgafv=9", None, 400, XGAFV_REFUSAL.format("9")),
+    ("media", "access_token=&%24.xgafv=9", None, 400, XGAFV_REFUSAL.format("9")),
+    ("export", "access_token=nope", "Bearer nope", 401, _CHALLENGED),
+    ("media", "access_token=", "Bearer nope", 401, _CHALLENGED),
+    ("export", "access_token=ya29.x", None, 401, _CHALLENGED),
+    ("export", "access_token=nope", "Bearer{t}", 401, _CHALLENGED),
+    # names it does not take, and a read that is no download
+    ("export", "accesstoken=nope", None, 403, gerr.MISSING_API_KEY_MESSAGE),
+    ("export", "id_token=nope", None, 403, gerr.MISSING_API_KEY_MESSAGE),
+    ("json", "access_token=nope", None, 403, gerr.UNREGISTERED_CALLER_MESSAGE),
+]
+# fmt: on
+
+
+@pytest.mark.parametrize("kind, query, value, status, answer", _DOWNLOAD_QUERY_TOKEN_ROWS)
+def test_a_download_refuses_a_token_in_its_query(
+    client, admin_h, tokens_yaml, kind, query, value, status, answer
+):
+    """The rows `_DOWNLOAD_QUERY_TOKEN_ROWS` records. A function of its own beside
+    `test_the_refusal_order_on_a_download_is_system_bearer_then_callback`, whose rows are
+    `Authorization` values on a query that names no token."""
+    requests = _download_requests(client, admin_h)
+    url, params = {
+        "media": requests["media"],
+        "export": requests["export"],
+        "bare": (requests["export"][0], {}),
+        "missing": ("/drive/v3/files/nosuchfile000/export", requests["export"][1]),
+        "json": (requests["export"][0], {**requests["export"][1], "alt": "json"}),
+    }[kind]
+    sent = "&".join(f"{k}={v}" for k, v in params.items())
+    token = tokens_yaml["admin_token"]
+    headers = {} if value is None else {"Authorization": value.format(t=token)}
+    r = client.get(f"{url}?{sent}&{query}" if sent else f"{url}?{query}", headers=headers)
+    assert r.status_code == status, r.text
+    if status == 401:
+        assert r.headers["www-authenticate"] == answer
+    else:
+        assert _gerr(r)["message"] == answer
 
 
 def test_a_download_is_the_route_not_the_path_shape(client, admin_h):
@@ -3842,8 +4640,8 @@ def test_drive_about_rejects_a_mask_that_selects_nothing(client, admin_h):
 
 
 def test_drive_about_needs_auth(client):
-    # no header at all on a Drive GET -> 403 (an unregistered caller); a bad token -> 401
-    assert client.get(ABOUT, params={"fields": "user"}).status_code == 403
+    # no header at all -> 401 (`about` takes no API key, `_NO_CREDENTIAL_ROWS`); a bad token -> 401
+    assert client.get(ABOUT, params={"fields": "user"}).status_code == 401
     bad = {"Authorization": "Bearer nope"}
     assert client.get(ABOUT, params={"fields": "user"}, headers=bad).status_code == 401
     # auth is resolved before the mask, as real Drive does — a missing mask on a bad token is 401
@@ -3984,9 +4782,14 @@ def test_drive_about_appears_in_the_openapi_spec(client):
     """The OpenAPI→MCP bridge builds its tools from the spec, so a route the spec omits is a route
     no generated client can reach."""
     op = client.get("/openapi.json").json()["paths"][ABOUT]["get"]
-    # `$.xgafv` beside the route's own parameter: a system parameter, declared on every Google
-    # operation at once (see test_every_google_operation_declares_the_system_parameter).
-    assert {p["name"] for p in op["parameters"]} == {"fields", "$.xgafv"}
+    # The system parameters beside the route's own, declared on every family operation at once
+    # (see test_every_google_operation_declares_the_system_parameters_and_reads_them).
+    assert {p["name"] for p in op["parameters"]} == {
+        "fields",
+        "$.xgafv",
+        "access_token",
+        "oauth_token",
+    }
 
 
 @pytest.fixture(scope="module")
@@ -4064,6 +4867,219 @@ def test_docs_get_returns_paragraph_text(base, admin_h):
         for e in el["paragraph"]["elements"]
     )
     assert "Logo usage" in text  # SAMPLE "Brand guidelines v3"
+
+
+@pytest.mark.parametrize(
+    "params",
+    [{}, {"suggestionsViewMode": "PREVIEW_WITHOUT_SUGGESTIONS"}, {"includeTabsContent": "true"}],
+    ids=["plain", "preview-without-suggestions", "tabs-content"],
+)
+def test_docs_get_serves_members_in_reals_order(base, admin_h, params):
+    """A document read serves its members in real's order, `commentsViewMode` last with the value
+    real serves. The tabbed shape `includeTabsContent=true` selects is not served, so that row
+    checks the last member alone.
+    """
+    fid, _ = _drive_by_mime(base, admin_h, "application/vnd.google-apps.document")
+    r = httpx.get(f"{base}/docs/v1/documents/{fid}", headers=admin_h, params=params)
+    assert r.status_code == 200
+    assert list(r.json().items())[-1] == ("commentsViewMode", "COMMENTS_VIEW_MODE_OMITTED")
+    if "includeTabsContent" not in params:
+        assert list(r.json()) == [
+            "title",
+            "body",
+            "documentStyle",
+            "namedStyles",
+            "revisionId",
+            "suggestionsViewMode",
+            "documentId",
+            "commentsViewMode",
+        ]
+
+
+_DOCS_SUGGESTIONS = "type.googleapis.com/google.apps.docs.v1.SuggestionsViewMode"
+_DOCS_COMMENTS = "type.googleapis.com/google.apps.docs.v1.CommentsViewMode"
+
+
+def _docs_invalid(field, typ, value):
+    message = f"Invalid value at '{field}' ({typ}), \"{value}\""
+    return {
+        "code": 400,
+        "message": message,
+        "status": "INVALID_ARGUMENT",
+        "details": [
+            {
+                "@type": "type.googleapis.com/google.rpc.BadRequest",
+                "fieldViolations": [{"field": field, "description": message}],
+            }
+        ],
+    }
+
+
+def _docs_query_rows():
+    """Each spelling `docs_get` records, as ``(query pairs, refusal or None)``."""
+    suggestions = (
+        "DEFAULT_FOR_CURRENT_ACCESS",
+        "SUGGESTIONS_INLINE",
+        "PREVIEW_SUGGESTIONS_ACCEPTED",
+        "PREVIEW_WITHOUT_SUGGESTIONS",
+        "suggestions_inline",
+        "Suggestions_Inline",
+        "0",
+        "1",
+        "2",
+        "3",
+        "+1",
+        "01",
+    )
+    comments = (
+        "COMMENTS_VIEW_MODE_UNSPECIFIED",
+        "COMMENTS_VIEW_MODE_DEFAULT_FOR_CURRENT_ACCESS",
+        "COMMENTS_VIEW_MODE_OMITTED",
+        "COMMENTS_VIEW_MODE_INCLUDED",
+    )
+    rows = [([("suggestionsViewMode", name)], None) for name in suggestions]
+    rows += [
+        (
+            [("suggestionsViewMode", value)],
+            _docs_invalid("suggestions_view_mode", _DOCS_SUGGESTIONS, value),
+        )
+        for value in ("4", "-1", "1.0", " 1", "", "NOPE")
+    ]
+    rows += [
+        ([("includeTabsContent", value)], None)
+        for value in ("true", "TRUE", "True", "1", "t", "yes", "false", "0", "f", "no", "n", "y")
+    ]
+    rows += [
+        (
+            [("includeTabsContent", value)],
+            _docs_invalid("include_tabs_content", "TYPE_BOOL", value),
+        )
+        for value in ("", "NOPE", " true", "on", "off", "2")
+    ]
+    # Real reads a comments view only beside the tabs content, and `COMMENTS_VIEW_MODE_INCLUDED`
+    # only beside inline suggestions; without them it refuses the combination after the lookup.
+    tabs = [("includeTabsContent", "true")]
+    rows += [([("commentsViewMode", name), *tabs], None) for name in comments[:3]]
+    rows += [
+        ([("commentsViewMode", value), *tabs], None)
+        for value in ("2", "+1", "comments_view_mode_omitted")
+    ]
+    rows += [
+        (
+            [
+                ("commentsViewMode", comments[3]),
+                *tabs,
+                ("suggestionsViewMode", "SUGGESTIONS_INLINE"),
+            ],
+            None,
+        )
+    ]
+    rows += [
+        (
+            [("commentsViewMode", value)],
+            _docs_invalid("comments_view_mode", _DOCS_COMMENTS, value),
+        )
+        for value in ("", "NOPE", "4", "-1")
+    ]
+    return rows
+
+
+_DOCS_GET_VALUES = _docs_query_rows() + [
+    (
+        [("suggestionsViewMode", "NOPE"), ("suggestionsViewMode", "SUGGESTIONS_INLINE")],
+        _docs_invalid("suggestions_view_mode", _DOCS_SUGGESTIONS, "NOPE"),
+    ),
+    (
+        [("suggestionsViewMode", "SUGGESTIONS_INLINE"), ("suggestionsViewMode", "NOPE")],
+        _docs_invalid("suggestions_view_mode", _DOCS_SUGGESTIONS, "NOPE"),
+    ),
+    (
+        [
+            ("suggestionsViewMode", "DEFAULT_FOR_CURRENT_ACCESS"),
+            ("suggestionsViewMode", "PREVIEW_WITHOUT_SUGGESTIONS"),
+        ],
+        None,
+    ),
+    (
+        [("includeTabsContent", "NOPE"), ("includeTabsContent", "true")],
+        _docs_invalid("include_tabs_content", "TYPE_BOOL", "NOPE"),
+    ),
+    (
+        [("includeTabsContent", "false"), ("includeTabsContent", "NOPE")],
+        _docs_invalid("include_tabs_content", "TYPE_BOOL", "NOPE"),
+    ),
+    ([("includeTabsContent", "true"), ("includeTabsContent", "false")], None),
+]
+
+
+@pytest.fixture(scope="module")
+def document_id(client, tokens_yaml):
+    headers = {"Authorization": f"Bearer {tokens_yaml['admin_token']}"}
+    files = client.get("/drive/v3/files", headers=headers, params={"pageSize": 1000}).json()[
+        "files"
+    ]
+    return next(f["id"] for f in files if f["mimeType"] == "application/vnd.google-apps.document")
+
+
+@pytest.mark.parametrize("query, refusal", _DOCS_GET_VALUES)
+def test_documents_get_reads_a_query_value_real_reads_and_refuses_one_it_cannot(
+    client, tokens_yaml, document_id, query, refusal
+):
+    """The spellings `docs_get` records. A repeat holding a refused value is that value's 400
+    whichever end it is at; two values that are read are served. At `$.xgafv=1` the refusal's
+    `errors` entry is the one `backlot.errors.google.invalid_field_value` records."""
+    headers = {"Authorization": f"Bearer {tokens_yaml['admin_token']}"}
+    r = client.get(f"/docs/v1/documents/{document_id}?{urlencode(query)}", headers=headers)
+    if refusal is None:
+        assert r.status_code == 200, r.text
+        assert r.json()["documentId"] == document_id
+        return
+    assert r.status_code == 400, r.text
+    assert r.json()["error"] == refusal
+    verbose = client.get(
+        f"/docs/v1/documents/{document_id}?{urlencode([*query, ('$.xgafv', '1')])}",
+        headers=headers,
+    )
+    assert verbose.json()["error"] == {
+        **refusal,
+        "errors": [{"message": refusal["message"], "reason": "invalid"}],
+    }
+
+
+@pytest.mark.parametrize(
+    "query, who, target, status, needle",
+    [
+        ("suggestionsViewMode=NOPE", "none", "doc", 401, "UNAUTHENTICATED"),
+        ("suggestionsViewMode=NOPE", "bad", "doc", 401, "UNAUTHENTICATED"),
+        ("suggestionsViewMode=NOPE&$.xgafv=3", "none", "doc", 400, "$.xgafv"),
+        ("suggestionsViewMode=NOPE&$.xgafv=3", "bad", "doc", 400, "$.xgafv"),
+        ("suggestionsViewMode=NOPE&$.xgafv=3", "admin", "doc", 400, "$.xgafv"),
+        ("suggestionsViewMode=NOPE", "admin", "missing", 400, "suggestions_view_mode"),
+        ("includeTabsContent=NOPE", "admin", "missing", 400, "include_tabs_content"),
+        ("commentsViewMode=NOPE", "admin", "missing", 400, "comments_view_mode"),
+    ],
+)
+def test_documents_get_answers_a_bad_query_after_the_credential_and_before_the_lookup(
+    client, tokens_yaml, document_id, query, who, target, status, needle
+):
+    """A bad token or none is the 401, and `$.xgafv=3` is that parameter's 400, ahead of a value
+    `docs_get` cannot read. On an id that does not exist the same value is the 400, where the
+    request without it is the 404."""
+    headers = {
+        "none": {},
+        "bad": BAD_TOKEN,
+        "admin": {"Authorization": f"Bearer {tokens_yaml['admin_token']}"},
+    }[who]
+    document = document_id if target == "doc" else "nosuchfile000"
+    r = client.get(f"/docs/v1/documents/{document}?{query}", headers=headers)
+    assert r.status_code == status, r.text
+    assert needle in r.text
+    if needle != "suggestions_view_mode":
+        assert "suggestions_view_mode" not in r.text
+    if status == 401:
+        assert r.content == client.get(f"/docs/v1/documents/{document}", headers=headers).content
+    if target == "missing":
+        assert client.get(f"/docs/v1/documents/{document}", headers=headers).status_code == 404
 
 
 def test_sheets_get_withholds_grid_data_by_default(base, admin_h):
@@ -4246,37 +5262,92 @@ def test_editor_apis_reject_a_folder(base, admin_h):
     assert r.json()["error"]["message"] == INVALID_ARG
 
 
-def test_wrong_type_is_refused_before_it_is_read(base, live_server):
-    """A caller who cannot see the file still gets 404, not 400: the type of a document you have
-    no access to is not something the API should confirm."""
-    import yaml
+def test_editor_apis_distinguish_hidden_type_permission_and_missing(tmp_path):
+    """Sheets and Docs resolve a stored file's type before its visibility (`_editor_doc`). A hidden
+    file of the API's own type is permission-denied, another native type is not-found, an Office
+    file of the API's own family is a failed precondition, and a PDF or an Office file of the other
+    family is an invalid argument. Slides resolves visibility first, so a hidden presentation is
+    not-found there, as an id that does not exist is on Sheets and Docs. The files the scoped token
+    can see are served. At `$.xgafv=1` the 403's entry is ``forbidden`` and the Office 400's
+    ``failedPrecondition``."""
+    hidden = ("spreadsheet", "document", "presentation", "pdf", "xlsx", "docx")
+    records = [
+        {
+            "source_type": "google_drive",
+            "doc_id": f"hidden-{kind}",
+            "title": kind,
+            "content": "private",
+            "subtype": kind,
+            "author_email": "owner@acme.com",
+            "readers": ["owner@acme.com"],
+        }
+        for kind in hidden
+    ]
+    records += [
+        {
+            "source_type": "google_drive",
+            "doc_id": f"mia-{kind}",
+            "title": kind,
+            "content": "public",
+            "subtype": kind,
+            "author_email": "mia@acme.com",
+            "visibility": "public",
+        }
+        for kind in ("spreadsheet", "document")
+    ]
+    settings = tiny_corpus(tmp_path, records)
+    token_data = yaml.safe_load(settings.tokens_path.read_text(encoding="utf-8"))
+    tokens = {u["email"]: u["token"] for u in token_data["users"]}
+    outsider = {"Authorization": f"Bearer {tokens['mia@acme.com']}"}
+    sheet, doc, deck, pdf, xlsx, docx = (served_id("google_drive", f"hidden-{k}") for k in hidden)
+    own_sheet = served_id("google_drive", "mia-spreadsheet")
+    own_doc = served_id("google_drive", "mia-document")
 
-    tokens = {
-        u["email"]: u["token"]
-        for u in yaml.safe_load(live_server[1].tokens_path.read_text())["users"]
-    }
-    admin_h = {"Authorization": f"Bearer {live_server[1].admin_token}"}
-    sheet, _ = _drive_by_mime(
-        base, admin_h, "application/vnd.google-apps.spreadsheet", name="Q1 Revenue Model"
-    )
-    outsider = {"Authorization": f"Bearer {tokens['mia@acme.com']}"}  # cannot see the finance sheet
-    assert httpx.get(f"{base}/docs/v1/documents/{sheet}", headers=outsider).status_code == 404
+    def refusal(code, message, status):
+        return {"error": {"code": code, "message": message, "status": status}}
 
+    permission = refusal(403, "The caller does not have permission", "PERMISSION_DENIED")
+    not_found = refusal(404, NOT_FOUND, "NOT_FOUND")
+    invalid = refusal(400, INVALID_ARG, "INVALID_ARGUMENT")
+    office = refusal(400, OFFICE_MSG, "FAILED_PRECONDITION")
 
-def test_editor_apis_enforce_acl(base, live_server):
-    """The finance spreadsheet is group-restricted; a non-member gets 404, not the content."""
-    import yaml
-
-    tokens = {
-        u["email"]: u["token"]
-        for u in yaml.safe_load(live_server[1].tokens_path.read_text())["users"]
-    }
-    admin_h = {"Authorization": f"Bearer {live_server[1].admin_token}"}
-    fid, _ = _drive_by_mime(
-        base, admin_h, "application/vnd.google-apps.spreadsheet", name="Q1 Revenue Model"
-    )
-    outsider = {"Authorization": f"Bearer {tokens['mia@acme.com']}"}  # marketing, not finance
-    assert httpx.get(f"{base}/sheets/v4/spreadsheets/{fid}", headers=outsider).status_code == 404
+    rows = [
+        (f"/sheets/v4/spreadsheets/{own_sheet}", 200, None),
+        (f"/docs/v1/documents/{own_doc}", 200, None),
+        (f"/sheets/v4/spreadsheets/{sheet}", 403, permission),
+        (f"/docs/v1/documents/{doc}", 403, permission),
+        (
+            f"/docs/v1/documents/{doc}?suggestionsViewMode=NOPE",
+            400,
+            {"error": _docs_invalid("suggestions_view_mode", _DOCS_SUGGESTIONS, "NOPE")},
+        ),
+        (f"/docs/v1/documents/{own_doc}?suggestionsViewMode=SUGGESTIONS_INLINE", 200, None),
+        (f"/sheets/v4/spreadsheets/{xlsx}", 400, office),
+        (f"/docs/v1/documents/{docx}", 400, office),
+        (f"/sheets/v4/spreadsheets/{pdf}", 400, invalid),
+        (f"/docs/v1/documents/{pdf}", 400, invalid),
+        (f"/sheets/v4/spreadsheets/{docx}", 400, invalid),
+        (f"/docs/v1/documents/{xlsx}", 400, invalid),
+        (f"/sheets/v4/spreadsheets/{doc}", 404, not_found),
+        (f"/docs/v1/documents/{sheet}", 404, not_found),
+        (f"/slides/v1/presentations/{deck}", 404, not_found),
+        ("/sheets/v4/spreadsheets/nosuchfile000", 404, not_found),
+        ("/docs/v1/documents/nosuchfile000", 404, not_found),
+    ]
+    with client_for(settings, reload=True) as client:
+        for path, status, body in rows:
+            response = client.get(path, headers=outsider)
+            assert response.status_code == status, path
+            if body is not None:
+                assert response.json() == body, path
+        for path, message, reason in (
+            (f"/sheets/v4/spreadsheets/{sheet}", permission["error"]["message"], "forbidden"),
+            (f"/docs/v1/documents/{docx}", OFFICE_MSG, "failedPrecondition"),
+        ):
+            verbose = client.get(path, headers=outsider, params={"$.xgafv": "1"})
+            assert verbose.json()["error"]["errors"] == [
+                {"message": message, "domain": "global", "reason": reason}
+            ], path
 
 
 # --- Sheets values.get / values.batchGet ----------------------------------------
@@ -4464,7 +5535,6 @@ def test_sheets_values_get_omits_values_when_the_range_is_empty(base, admin_h, s
         "not a range",
         "A1:",
         " !A1",  # an empty title is the first sheet; a whitespace one is nothing
-        "",
         "R1C1:",
         "R0C1",  # absolute R1C1 is 1-based
         "R[-1]C[0]",  # an offset is not negative
@@ -4921,15 +5991,15 @@ def test_sheets_values_get_enforces_the_acl(base, live_server, sheet_id):
 
     tokens = {
         u["email"]: u["token"]
-        for u in yaml.safe_load(live_server[1].tokens_path.read_text())["users"]
+        for u in yaml.safe_load(live_server[1].tokens_path.read_text(encoding="utf-8"))["users"]
     }
     outsider = {"Authorization": f"Bearer {tokens['mia@acme.com']}"}  # marketing, not finance
     admin_h = {"Authorization": f"Bearer {live_server[1].admin_token}"}
-    # the admin arm is what keeps this honest: without it a missing route 404s and the test passes
+    # the admin arm keeps this honest: without it a route that refused every caller would pass
     assert _values(base, admin_h, sheet_id, "Sheet1").status_code == 200
     assert _batch(base, admin_h, sheet_id, ["Sheet1"]).status_code == 200
-    assert _values(base, outsider, sheet_id, "Sheet1").status_code == 404
-    assert _batch(base, outsider, sheet_id, ["Sheet1"]).status_code == 404
+    assert _values(base, outsider, sheet_id, "Sheet1").status_code == 403
+    assert _batch(base, outsider, sheet_id, ["Sheet1"]).status_code == 403
 
 
 def test_sheets_values_get_needs_auth(base, sheet_id):
@@ -5824,7 +6894,7 @@ def test_drive_q_me_is_the_caller(tmp_path):
     with corpus_client(tmp_path, _Q_RECORDS) as (client, settings):
         tokens = {
             u["email"]: u["token"]
-            for u in yaml.safe_load(settings.tokens_path.read_text())["users"]
+            for u in yaml.safe_load(settings.tokens_path.read_text(encoding="utf-8"))["users"]
         }
         mia = {"Authorization": f"Bearer {tokens['mia@x.com']}"}
         files = "mimeType != 'application/vnd.google-apps.folder'"
@@ -6153,6 +7223,20 @@ _GMAIL_SHAPES = [
         "to": "회의 <peer@x.com>",
         "attachments": [{"filename": "회의록.txt", "mime": "text/plain", "content": "안녕"}],
     },
+    # two attachments, the second stating no `content`, so its bytes are `attachment <its own id>`:
+    # as long as the stand-in for any other id, and equal to none of them
+    {
+        "source_type": "gmail",
+        "doc_id": "att2",
+        "mailbox": "ceo",
+        "title": "Two attachments",
+        "content": "see attached",
+        "author_email": "ceo@x.com",
+        "attachments": [
+            {"filename": "a.txt", "mime": "text/plain", "content": "hello"},
+            {"filename": "b.txt", "mime": "text/plain"},
+        ],
+    },
 ]
 
 
@@ -6197,7 +7281,7 @@ def test_gmail_a_message_with_an_attachment_nests_its_text_in_multipart_alternat
     assert att_h["Content-Type"] == 'text/plain; charset="US-ASCII"; name="notes.txt"'
     assert att_h["Content-Disposition"] == 'attachment; filename="notes.txt"'
     assert att_h["Content-Transfer-Encoding"] == "base64"
-    # one attachment was measured, so only the prefix and the Content-ID equality are pinned
+    # past `f_` the value is Backlot's, so only the prefix and the Content-ID equality are pinned
     assert att_h["X-Attachment-Id"].startswith("f_")
     assert att_h["Content-ID"] == f"<{att_h['X-Attachment-Id']}>"
 
@@ -6210,6 +7294,24 @@ def test_gmail_a_message_with_an_attachment_nests_its_text_in_multipart_alternat
         ("0", ["Content-Type"]),
         ("1", ["Content-Type"]),
     ]
+
+
+def test_gmail_two_attachments_carry_distinct_attachment_ids(gmail_shapes):
+    """Each of a message's two attachments carries its own `X-Attachment-Id`, and its `Content-ID`
+    is that value in angle brackets, as measured on 2026-10-09 and 2026-10-11 over a Google
+    Workspace mailbox: in each of the 11 messages whose two or more parts with an `attachmentId` all
+    carried the header, no value repeated."""
+    client, h = gmail_shapes
+    payload = client.get(
+        f"/gmail/v1/users/me/messages/{served_id('gmail', 'att2')}", headers=h
+    ).json()["payload"]
+    parts = [p for p in payload["parts"] if p.get("filename")]
+    assert [p["filename"] for p in parts] == ["a.txt", "b.txt"]
+    ids = [_hdrs(p)["X-Attachment-Id"] for p in parts]
+    assert len(set(ids)) == 2, f"attachments share X-Attachment-Id: {ids}"
+    for part in parts:
+        part_h = _hdrs(part)
+        assert part_h["Content-ID"] == f"<{part_h['X-Attachment-Id']}>"
 
 
 def _cte(client, h, doc: str) -> dict[str, str | None]:
@@ -6254,11 +7356,14 @@ def test_gmail_a_text_attachment_names_us_ascii_or_utf8_by_its_content(gmail_sha
     }
 
 
-@pytest.mark.parametrize("doc", ["att", "lt", "ko", "html175", "html325", "att-ko", "hdr-ko"])
+@pytest.mark.parametrize(
+    "doc", ["att", "lt", "ko", "html175", "html325", "att-ko", "hdr-ko", "att2"]
+)
 def test_gmail_raw_and_full_describe_one_message(gmail_shapes, doc):
     """`format=raw` is ASCII, and it and the `full` payload are the same tree, with the same
     headers on the message and on each part once `raw`'s encoded-words are decoded, and each raw
-    part decodes, by its own Content-Transfer-Encoding, to the bytes `full` serves."""
+    part decodes, by its own Content-Transfer-Encoding, to the bytes `full` serves, or for an
+    attachment, to the bytes `attachments.get` serves for the id its `full` part names."""
     import email
     import email.policy
 
@@ -6280,6 +7385,9 @@ def test_gmail_raw_and_full_describe_one_message(gmail_shapes, doc):
             assert len(children) == len(part["parts"])
             for child, sub in zip(part["parts"], children):
                 check(child, sub)
+        elif "attachmentId" in part["body"]:
+            got = client.get(f"{url}/attachments/{part['body']['attachmentId']}", headers=h)
+            assert entity.get_payload(decode=True) == base64.urlsafe_b64decode(got.json()["data"])
         elif "data" in part["body"]:
             assert entity.get_payload(decode=True) == base64.urlsafe_b64decode(part["body"]["data"])
             if "Content-Transfer-Encoding" in entity:
@@ -6341,10 +7449,11 @@ def test_gmail_metadata_headers_keeps_the_named_headers(gmail_shapes):
     assert len(full) > 1
 
 
-@pytest.mark.parametrize("doc", ["att", "ko", "att-ko"])
+@pytest.mark.parametrize("doc", ["att", "ko", "att-ko", "att2"])
 def test_gmail_a_parts_size_is_the_byte_length_of_its_data(gmail_shapes, doc):
     """The rule `_byte_len` states, over every part of the message: `att` is ASCII, where bytes and
-    characters are one count, and `ko` and `att-ko` are where they differ."""
+    characters are one count, and `ko` and `att-ko` are where they differ. `att2` holds two
+    attachments, each fetched by the id its own part names."""
     client, h = gmail_shapes
     url = f"/gmail/v1/users/me/messages/{served_id('gmail', doc)}"
     parts = [client.get(url, headers=h).json()["payload"]]
@@ -6633,7 +7742,7 @@ def gc(grid_settings):
 
 @pytest.fixture(scope="module")
 def gh(grid_settings):
-    data = yaml.safe_load(grid_settings.tokens_path.read_text())
+    data = yaml.safe_load(grid_settings.tokens_path.read_text(encoding="utf-8"))
     return {"Authorization": f"Bearer {data['admin_token']}"}
 
 
@@ -8353,7 +9462,10 @@ def test_gmail_size_estimate_matches_raw_bytes_in_every_format(tmp_path, title, 
         ],
     )
     with client_for(s) as c:
-        h = {"Authorization": "Bearer " + yaml.safe_load(s.tokens_path.read_text())["admin_token"]}
+        h = {
+            "Authorization": "Bearer "
+            + yaml.safe_load(s.tokens_path.read_text(encoding="utf-8"))["admin_token"]
+        }
         mid = c.get("/gmail/v1/users/me/messages", headers=h).json()["messages"][0]["id"]
         path = "/gmail/v1/users/me/messages/" + mid
         raw = c.get(path + "?format=raw", headers=h).json()
@@ -8367,3 +9479,227 @@ def test_gmail_size_estimate_matches_raw_bytes_in_every_format(tmp_path, title, 
             thread = c.get(f"/gmail/v1/users/me/threads/{tid}?format={fmt}", headers=h)
             assert thread.status_code == 200
             assert thread.json()["messages"][0]["sizeEstimate"] == size
+
+
+@pytest.mark.parametrize("surface", ["messages", "threads"])
+@pytest.mark.parametrize(
+    "caller, query, expected",
+    [
+        ("ava", "cc:lena", ["plan"]),
+        ("ava", "cc:LENA", ["plan"]),
+        ("ava", "cc:LENA@ACME.COM", ["plan"]),
+        ("ava", 'cc:"lena@acme.com" rollout', ["plan"]),
+        ("ava", "bcc:ava", ["lunch"]),
+        ("ava", "cc:acme.com", ["plan"]),
+        ("ava", "cc:lena bcc:ava", []),
+        ("ava", "cc:nobody", []),
+        ("ava", "bcc:me", ["lunch"]),
+        ("ava", "cc:me", ["plan"]),
+        ("admin", "cc:me", []),
+        # a word, never part of one, and an address only whole
+        ("ava", "cc:len", []),
+        ("ava", "cc:ena", []),
+        ("ava", "cc:acme", ["plan"]),
+        ("ava", "cc:com", ["plan"]),
+        ("ava", "cc:com.acme", []),
+        ("ava", "cc:@acme.com", ["plan"]),
+        ("ava", "cc:lena@", ["plan"]),
+        ("ava", "cc:lena@acme", []),
+        ("ava", "cc:park", ["plan"]),
+        ("ava", "cc:par", []),
+        ("ava", 'cc:"lena park"', ["plan"]),
+        ("ava", "bcc:\uc5d0\ubc14", ["lunch"]),
+        ("ava", "cc:ops_team", ["standup"]),
+        ("ava", "cc:ops", []),
+        ("ava", "cc:_", []),
+        ("ava", "cc:&", []),
+        # no word at all: the operator is ignored
+        ("ava", "cc:.", ["plan", "lunch", "decoy", "standup"]),
+        ("ava", "cc:@", ["plan", "lunch", "decoy", "standup"]),
+        ("ava", 'bcc:""', ["plan", "lunch", "decoy", "standup"]),
+    ],
+)
+def test_gmail_cc_bcc_searches_address_headers(tmp_path, surface, caller, query, expected):
+    """The rule `_gmail_address_match` records, on both listings: a message whose body or subject
+    names the address is not a match. `me` is the caller's address, and for the admin token, which
+    has no mailbox of its own, the address `_service_email` gives."""
+    records = [
+        {
+            "doc_id": "plan",
+            "title": "rollout plan",
+            "cc": "Lena Park <lena@acme.com>, ava@acme.com",
+        },
+        {"doc_id": "lunch", "title": "lunch", "bcc": "\uc5d0\ubc14 <ava@acme.com>"},
+        {"doc_id": "decoy", "title": "cc lena bcc ava", "content": "lena ava"},
+        {"doc_id": "standup", "title": "standup", "cc": "ops_team@corp.example, me@corp.example"},
+    ]
+    settings = tiny_corpus(
+        tmp_path,
+        [
+            {
+                "source_type": "gmail",
+                "mailbox": "ava",
+                "author_email": "bob@acme.com",
+                "to": "ava@acme.com",
+                "content": "body",
+                "visibility": "public",
+                "created": "2026-03-01T09:00:00Z",
+                "readers": ["ava@acme.com"],
+                **r,
+            }
+            for r in records
+        ],
+    )
+    tokens = yaml.safe_load(settings.tokens_path.read_text(encoding="utf-8"))
+    token = tokens["admin_token"] if caller == "admin" else tok(tokens, "ava@acme.com")
+    with client_for(settings, reload=True) as c:
+        response = c.get(
+            f"/gmail/v1/users/me/{surface}",
+            headers={"Authorization": f"Bearer {token}"},
+            params={"q": query},
+        )
+    assert response.status_code == 200
+    assert {r["id"] for r in response.json().get(surface, [])} == {
+        served_id("gmail", doc_id) for doc_id in expected
+    }
+
+
+@pytest.mark.parametrize("surface", ["messages", "threads"])
+@pytest.mark.parametrize(
+    "caller, query, expected",
+    [
+        ("ava", "to:ava@acme.com", ["plan", "lunch"]),
+        ("ava", "to:me", ["plan", "lunch"]),
+        ("ava", "to:av", []),
+        ("ava", "from:bo", []),
+        ("ava", "from:me", ["reply"]),
+        ("ava", "from:", ["plan", "lunch", "reply"]),
+        ("ava", "to:dev@acme.com", ["reply"]),
+        ("ava", "to:dev", ["reply"]),
+        ("ava", "to:lena@acme.com", ["lunch"]),
+        ("ava", "to:lena", ["lunch"]),
+        ("ava", "to:bob@acme.com", ["reply"]),
+        ("ava", "to:bob", ["reply"]),
+        ("ava", "from:bob@acme.com", ["plan"]),
+        ("ava", "from:bob", ["plan"]),
+        ("ava", "from:acme.com", ["plan", "lunch", "reply"]),
+        ("ava", "from:acm", []),
+        ("ava", "to:acme.com", ["plan", "lunch", "reply"]),
+        ("ava", "to:acm", []),
+        ("ava", "to:le", []),
+        ("ava", "to:", ["plan", "lunch", "reply"]),
+        ("ava", "bcc:", ["plan", "lunch", "reply"]),
+        ("ava", "cc:", ["plan", "lunch", "reply"]),
+        ("ava", 'from:""', ["plan", "lunch", "reply"]),
+        ("ava", 'to:""', ["plan", "lunch", "reply"]),
+        ("ava", "to: from: bcc:", []),
+        ("ava", "from: bob", ["plan"]),
+        ("ava", "From: bob", ["plan"]),
+        ("ava", "to:\tlena", ["lunch"]),
+        ("ava", "cc: dev", ["reply"]),
+        ("ava", "bcc: ava", ["lunch"]),
+        ("ava", "to:bob to:dev", ["reply"]),
+        ("ava", "from:bob from:mia", []),
+        ("ava", "from:bob from:", ["plan"]),
+        ("ava", 'to:ava to:""', ["plan", "lunch"]),
+        ("admin", "from:me", []),
+        ("admin", "to:me", []),
+        ("admin", "from:ava@acme.com", ["reply"]),
+        ("admin", "to:ava@acme.com", ["plan", "lunch"]),
+        ("admin", "from:", ["plan", "lunch", "reply"]),
+    ],
+)
+def test_gmail_from_to_searches_address_headers(tmp_path, surface, caller, query, expected):
+    """A `from:` search matches author email, and `to:` matches any recipient header (To, Cc, or
+    Bcc) as whole words or address. `me` resolves to the caller's address, and for admin callers,
+    the address `_service_email` gives. Empty address operators are ignored."""
+    records = [
+        {
+            "doc_id": "plan",
+            "title": "Rollout plan",
+            "content": "attached",
+            "author_email": "bob@acme.com",
+            "to": "ava@acme.com",
+            "readers": ["ava@acme.com"],
+            "created": "2026-03-01T09:00:00Z",
+        },
+        {
+            "doc_id": "lunch",
+            "title": "Lunch",
+            "content": "Friday?",
+            "author_email": "mia@acme.com",
+            "to": "lena@acme.com",
+            "bcc": "ava@acme.com",
+            "readers": ["ava@acme.com"],
+            "created": "2026-03-02T09:00:00Z",
+        },
+        {
+            "doc_id": "reply",
+            "title": "Re: Rollout plan",
+            "content": "ok",
+            "author_email": "ava@acme.com",
+            "to": "bob@acme.com",
+            "cc": "dev@acme.com",
+            "readers": ["ava@acme.com"],
+            "created": "2026-03-03T09:00:00Z",
+        },
+    ]
+    settings = tiny_corpus(
+        tmp_path,
+        [
+            {
+                "source_type": "gmail",
+                "mailbox": "ava",
+                "visibility": "public",
+                **r,
+            }
+            for r in records
+        ],
+    )
+    tokens = yaml.safe_load(settings.tokens_path.read_text(encoding="utf-8"))
+    token = tokens["admin_token"] if caller == "admin" else tok(tokens, f"{caller}@acme.com")
+    with client_for(settings, reload=True) as c:
+        response = c.get(
+            f"/gmail/v1/users/me/{surface}",
+            headers={"Authorization": f"Bearer {token}"},
+            params={"q": query},
+        )
+    assert response.status_code == 200
+    assert {r["id"] for r in response.json().get(surface, [])} == {
+        served_id("gmail", doc_id) for doc_id in expected
+    }
+
+
+@pytest.mark.parametrize("surface", ["messages", "threads"])
+@pytest.mark.parametrize(
+    "query, expected", [('subject:"from: foo"', ["literal"]), ('subject:""', ["literal", "other"])]
+)
+def test_gmail_empty_address_tokens_preserve_quoted_subjects(tmp_path, surface, query, expected):
+    """Ignoring an empty address operator must not edit a quoted value or change empty subjects."""
+    settings = tiny_corpus(
+        tmp_path,
+        [
+            {
+                "source_type": "gmail",
+                "doc_id": doc_id,
+                "mailbox": "ava",
+                "title": title,
+                "content": "body",
+                "author_email": "ava@acme.com",
+                "readers": ["ava@acme.com"],
+                "created": "2026-03-01T09:00:00Z",
+            }
+            for doc_id, title in [("literal", "from: foo"), ("other", "foo")]
+        ],
+    )
+    tokens = yaml.safe_load(settings.tokens_path.read_text(encoding="utf-8"))
+    with client_for(settings, reload=True) as c:
+        r = c.get(
+            f"/gmail/v1/users/me/{surface}",
+            headers={"Authorization": f"Bearer {tok(tokens, 'ava@acme.com')}"},
+            params={"q": query},
+        )
+    assert r.status_code == 200
+    assert {item["id"] for item in r.json().get(surface, [])} == {
+        served_id("gmail", doc_id) for doc_id in expected
+    }
