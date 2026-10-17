@@ -1502,8 +1502,87 @@ def test_confluence_body_and_version(tmp_path):
     assert page["metadata"]["labels"]["results"][0]["name"] == "eng"
 
 
-def test_confluence_restrictions_answers_both_operations_in_real_shape(tmp_path):
-    # restrictions/byOperation must return BOTH read and update operations, with real's links
+def _members(node: dict) -> str:
+    """An answer's member names in order, nested down to each restriction list."""
+    return " ".join(
+        f"{k}{{{_members(v)}}}"
+        if isinstance(v, dict) and k not in ("user", "group", "_links")
+        else k
+        for k, v in node.items()
+    )
+
+
+_BOTH_LISTS = "restrictions{user group} _expandable{content} _links"
+_NO_LISTS = "_expandable{restrictions content} _links"
+
+
+@pytest.mark.parametrize(
+    "query, members",
+    [
+        ("", f"read{{operation {_BOTH_LISTS}}} update{{operation {_BOTH_LISTS}}} _links"),
+        ("expand=", f"read{{operation {_BOTH_LISTS}}} update{{operation {_BOTH_LISTS}}} _links"),
+        ("expand=read", f"read{{operation {_NO_LISTS}}} _expandable{{update}} _links"),
+        ("expand=update", f"update{{operation {_NO_LISTS}}} _expandable{{read}} _links"),
+        (
+            "expand=update,read",
+            f"read{{operation {_NO_LISTS}}} update{{operation {_NO_LISTS}}} _links",
+        ),
+        (
+            "expand=update&expand=read",
+            f"read{{operation {_NO_LISTS}}} update{{operation {_NO_LISTS}}} _links",
+        ),
+        ("expand=&expand=read", f"read{{operation {_NO_LISTS}}} _expandable{{update}} _links"),
+        ("expand=,read,,", f"read{{operation {_NO_LISTS}}} _expandable{{update}} _links"),
+        ("expand=read.bogus", f"read{{operation {_NO_LISTS}}} _expandable{{update}} _links"),
+        (
+            "expand=read..restrictions",
+            f"read{{operation {_NO_LISTS}}} _expandable{{update}} _links",
+        ),
+        (
+            "expand=read.restrictions.user",
+            "read{operation restrictions{user _expandable{group}} _expandable{content} _links}"
+            " _expandable{update} _links",
+        ),
+        (
+            "expand=read.restrictions.user.bogus",
+            "read{operation restrictions{user _expandable{group}} _expandable{content} _links}"
+            " _expandable{update} _links",
+        ),
+        (
+            "expand=update.restrictions.group",
+            "update{operation restrictions{group _expandable{user}} _expandable{content} _links}"
+            " _expandable{read} _links",
+        ),
+        (
+            "expand=read.restrictions",
+            "read{operation restrictions{_expandable{user group}} _expandable{content} _links}"
+            " _expandable{update} _links",
+        ),
+        (
+            "expand=read.restrictions.USER",
+            "read{operation restrictions{_expandable{user group}} _expandable{content} _links}"
+            " _expandable{update} _links",
+        ),
+        (
+            "expand=read.restrictions.group,read.restrictions.user",
+            f"read{{operation {_BOTH_LISTS}}} _expandable{{update}} _links",
+        ),
+        (
+            "expand=read.restrictions.user,update",
+            "read{operation restrictions{user _expandable{group}} _expandable{content} _links}"
+            f" update{{operation {_NO_LISTS}}} _links",
+        ),
+        ("expand=bogus", "_expandable{read update} _links"),
+        ("expand=READ", "_expandable{read update} _links"),
+        ("expand=%20read", "_expandable{read update} _links"),
+        ("expand=.read", "_expandable{read update} _links"),
+        ("expand=%20", "_expandable{read update} _links"),
+    ],
+)
+def test_confluence_restrictions_answer_what_expand_names_in_real_shape(tmp_path, query, members):
+    """Each row is real's answer to the same query, member names and order, as measured where
+    `_restriction_expansions` and the comment in `confluence_restrictions` say. Every operation
+    served links to itself, and the answer ends with real's links."""
     import asyncio
     import types
 
@@ -1537,19 +1616,20 @@ def test_confluence_restrictions_answers_both_operations_in_real_shape(tmp_path)
         "scheme": "http",
         "server": ("m", 80),
         "path": "/",
-        "query_string": b"",
+        "query_string": query.encode(),
         "app": app,
         "headers": [(b"authorization", f"Bearer {s.admin_token}".encode())],
     }
     request = Request(scope)
     result = asyncio.run(confluence_restrictions(cid, request))
-    assert result["read"]["restrictions"]["user"]["results"]  # the private doc's author
+    assert _members(result) == members
     path = f"{_site(request)}/wiki/rest/api/content/{cid}/restriction/byOperation"
-    assert list(result) == ["read", "update", "_links"]
     assert result["_links"] == {"self": path, "base": f"{_site(request)}/wiki", "context": "/wiki"}
     for op in ("read", "update"):
-        assert list(result[op]) == ["operation", "restrictions", "_expandable", "_links"]
-        assert result[op]["_links"] == {"self": f"{path}/{op}"}
+        if op in result:
+            assert result[op]["_links"] == {"self": f"{path}/{op}"}
+            if "user" in result[op].get("restrictions", {}):
+                assert result[op]["restrictions"]["user"]["results"]  # the private doc's author
 
 
 @pytest.mark.parametrize("route", ["child/page", "child/attachment", "restriction/byOperation"])
@@ -2671,64 +2751,6 @@ def test_confluence_child_attachment_is_the_empty_page_from_any_start(
         assert "prev" not in body["_links"]
     else:
         assert body["_links"]["prev"].endswith(f"/child/attachment?{prev}")
-
-
-@pytest.mark.parametrize(
-    "expand, top",
-    [
-        (None, ["read", "update"]),
-        ("read", ["read", "_expandable"]),
-        ("update.restrictions.group", ["update", "_expandable"]),
-        ("read.restrictions.user", ["read", "_expandable"]),
-        ("read.restrictions", ["read", "_expandable"]),
-        ("read,update", ["read", "update"]),
-        ("bogus", ["_expandable"]),
-    ],
-)
-def test_confluence_restrictions_honor_expand(client, admin_h, expand, top):
-    """Measured (#723): `expand` selects operations and restriction members."""
-    api = "/atlassian/wiki/rest/api"
-    cid = client.get(f"{api}/content?limit=1", headers=admin_h).json()["results"][0]["id"]
-    url = f"{api}/content/{cid}/restriction/byOperation"
-    if expand is not None:
-        url += f"?expand={expand}"
-    body = client.get(url, headers=admin_h).json()
-    assert list(body) == top
-
-
-@pytest.mark.parametrize(
-    "expand, path, keys",
-    [
-        (None, ("read", "restrictions"), ["user", "group"]),
-        ("read", ("read",), ["operation", "_expandable"]),
-        ("read.restrictions.user", ("read", "restrictions"), ["user", "_expandable"]),
-        ("read.restrictions", ("read", "restrictions"), ["user", "group"]),
-        ("update.restrictions.group", ("update", "restrictions"), ["group", "_expandable"]),
-        ("bogus", (), ["_expandable"]),
-    ],
-)
-def test_confluence_restrictions_expand_payloads(client, admin_h, expand, path, keys):
-    """Measured (#723): named members carry their content, the rest goes expandable."""
-    api = "/atlassian/wiki/rest/api"
-    cid = client.get(f"{api}/content?limit=1", headers=admin_h).json()["results"][0]["id"]
-    url = f"{api}/content/{cid}/restriction/byOperation"
-    if expand is not None:
-        url += f"?expand={expand}"
-    body = client.get(url, headers=admin_h).json()
-    node = body
-    for key in path:
-        node = node.get(key, {})
-    assert list(node) == keys
-    if expand == "bogus":
-        assert body["_expandable"] == {"read": "", "update": ""}
-    if expand == "read":
-        assert body["_expandable"] == {"update": ""}
-        assert body["read"]["_expandable"] == {
-            "restrictions": "",
-            "content": body["read"]["_expandable"]["content"],
-        }
-    if expand == "read.restrictions.user":
-        assert body["read"]["restrictions"]["_expandable"] == {"group": ""}
 
 
 @pytest.mark.parametrize("route", ["child/page", "child/comment", "child/attachment", "label"])
