@@ -2958,12 +2958,41 @@ def test_an_objects_attributes_size_is_its_bytes(tmp_path):
         ("versions&max-keys=1", ["<NextKeyMarker>c&#x1;k</NextKeyMarker>", "<Key>c&#x1;k</Key>"]),
         ("versions&delimiter=%01", ["<Delimiter>&#x1;</Delimiter>", "<Prefix>c&#x1;</Prefix>"]),
         ("uploads&prefix=c%00", ["<Prefix>c&#x0;</Prefix>"]),
+        (
+            "list-type=2&prefix=q%22&delimiter=%27",
+            ["<Prefix>q&quot;</Prefix>", "<Delimiter>&apos;</Delimiter>", "<Key>q&quot;k</Key>"]
+            + ["<ETag>&quot;", "&quot;</ETag>"],
+        ),
+        (
+            "list-type=2&delimiter=%22",
+            ["<Delimiter>&quot;</Delimiter>", "<Prefix>q&quot;</Prefix>"],
+        ),
+        (
+            "list-type=2&start-after=r%27",
+            ["<StartAfter>r&apos;</StartAfter>", "<Key>r&apos;k</Key>"],
+        ),
+        (
+            "max-keys=1&marker=q%22&delimiter=z",
+            ["<Marker>q&quot;</Marker>", "<NextMarker>q&quot;k</NextMarker>", "<Key>q&quot;k</Key>"]
+            + ["<ETag>&quot;", "&quot;</ETag>"],
+        ),
+        (
+            "versions&key-marker=q%22&max-keys=1",
+            ["<KeyMarker>q&quot;</KeyMarker>", "<NextKeyMarker>q&quot;k</NextKeyMarker>"]
+            + ["<Key>q&quot;k</Key>", "<ETag>&quot;", "&quot;</ETag>"],
+        ),
+        ("versions&delimiter=%27", ["<Delimiter>&apos;</Delimiter>", "<Prefix>r&apos;</Prefix>"]),
+        (
+            "uploads&prefix=q%22&key-marker=r%27&delimiter=%22",
+            ["<KeyMarker>r&apos;</KeyMarker>", "<Delimiter>&quot;</Delimiter>"]
+            + ["<Prefix>q&quot;</Prefix>"],
+        ),
     ],
 )
-def test_a_listing_writes_a_control_character_as_a_hexadecimal_reference(tmp_path, query, written):
+def test_a_listing_writes_control_characters_and_quotes_as_real_does(tmp_path, query, written):
     """Each row is what real's listing wrote for the same query over the same keys, written here by
     ``backlot.routers.s3._xml_listing_text``; U+007F stays as it is."""
-    keys = ["c\x01k", "c\x01m", "d\x1fx", "e\x7fy", "plain"]
+    keys = ["c\x01k", "c\x01m", "d\x1fx", "e\x7fy", "plain", 'q"k', "r'k"]
     records = [
         complete(
             source_type="s3",
@@ -2985,41 +3014,6 @@ def test_a_listing_writes_a_control_character_as_a_hexadecimal_reference(tmp_pat
     assert r.status_code == 200, r.text
     for element in written:
         assert element in r.text, element
-
-
-@pytest.mark.parametrize("query", ["list-type=2", "", "versions"])
-def test_a_listing_writes_an_etags_quotes_as_a_character_reference(tmp_path, query):
-    """Each listing's `ETag` is real's `<ETag>&quot;…&quot;</ETag>`, the measurement
-    ``backlot.routers.s3._xml_etag_text`` records, where the bytes held the quotes as they are.
-    Through an XML parser the value is the same quoted digest either way."""
-    records = [
-        complete(
-            source_type="s3",
-            doc_id="s3-etag-quotes",
-            bucket="eng-artifacts",
-            group="engineering",
-            key="runbooks/oncall.md",
-            title="oncall",
-            content="x",
-            author_email="ava@acme.com",
-            author_groups=["engineering"],
-            visibility="public",
-        )
-    ]
-    tiny = tiny_corpus(tmp_path, records)
-    path = f"/s3/eng-artifacts?{query}" if query else "/s3/eng-artifacts"
-    with client_for(tiny, reload=True) as client:
-        r = _s3_get(client, path, tiny.admin_token)
-    assert r.status_code == 200, r.text
-    written = re.findall(r"<ETag>(.*?)</ETag>", r.text)
-    assert written, r.text
-    for value in written:
-        assert value.startswith("&quot;") and value.endswith("&quot;"), value
-    root = ET.fromstring(r.text)
-    parsed = {element.text for element in root.iter(f"{NS}ETag")}
-    assert parsed
-    for value in parsed:
-        assert value.startswith('"') and value.endswith('"'), (query, value)
 
 
 @pytest.mark.parametrize(
