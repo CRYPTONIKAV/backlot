@@ -530,15 +530,20 @@ async def normalise_the_slashes_in_an_atlassian_path(request: Request, call_next
     What the request ECHOES is not normalised the same way, which is why the path is kept: real
     collapses an interior run in `detail`, `instance` and Confluence's `null for uri:` message
     (`/api/3//nope` comes back `/api/3/nope`) but leaves a trailing slash in all three
-    (`/nopesuchroute/` comes back `/nopesuchroute/`). The collapsed spelling is stashed on the
-    scope for ``backlot.routers.atlassian._echoed_path`` to read.
+    (`/nopesuchroute/` comes back `/nopesuchroute/`). Nor are its escapes: real echoes the path as
+    it arrived, decoding only some of them (``errors.atlassian.echoed_spelling``), where routing
+    reads the decoded path. That spelling is built from `raw_path` before the rewrite below
+    replaces it, and stashed on the scope for ``backlot.routers.atlassian._echoed_path`` to read.
 
     Ahead of routing, because the answer for a path no route matches is a route of its own
     (`atlassian.unmatched_router`), which would otherwise claim every slashed spelling of a served
     one. GitHub's trailing slash is the opposite rule and has its own middleware above -- the two
     vendors are measured separately.
     """
-    path = request.url.path
+    # the decoded path as the server parsed it: `request.url` parses it again, so an escaped `?` or
+    # `#` would end it there and hide a trailing slash after it (`POST /rest/api/3/issue/A%23B/` is
+    # real's 405, 2026-10-17)
+    path = request.scope["path"]
     if path.startswith(f"{errors.atlassian.PREFIX}/"):
         collapsed = re.sub("/{2,}", "/", path)
         routed = collapsed.rstrip("/")
@@ -547,7 +552,10 @@ async def normalise_the_slashes_in_an_atlassian_path(request: Request, call_next
         # arrived. It keeps its slash and reaches the catch-all like any other unserved path.
         if routed == errors.atlassian.PREFIX:
             routed = collapsed
-        request.scope["atlassian_echo_path"] = collapsed
+        raw = request.scope.get("raw_path") or path.encode()
+        request.scope["atlassian_echo_path"] = errors.atlassian.echoed_spelling(
+            raw.decode("latin-1"), confluence=errors.atlassian.is_confluence(path)
+        )
         if routed != path:
             request.scope["path"] = routed
             request.scope["raw_path"] = routed.encode()

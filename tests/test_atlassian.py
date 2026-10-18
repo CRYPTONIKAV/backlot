@@ -298,7 +298,11 @@ def test_jira_project_search_refuses_an_order_by_naming_no_field(
     )
     if refused is None:
         assert r.status_code == 200, r.text
-        assert r.json() == listing.json()
+        # the links carry the query as sent (`_project_search_link`), so they are left out
+        unlinked = ("self", "nextPage")
+        assert {k: v for k, v in r.json().items() if k not in unlinked} == {
+            k: v for k, v in listing.json().items() if k not in unlinked
+        }
         return
     assert r.status_code == 400, r.text
     assert r.json() == {
@@ -308,6 +312,126 @@ def test_jira_project_search_refuses_an_order_by_naming_no_field(
             f"{refused}."
         ],
         "errors": {},
+    }
+
+
+@pytest.mark.parametrize(
+    "query, start, limit",
+    [
+        ({}, 0, 50),
+        ({"startAt": "1"}, 1, 50),
+        ({"startAt": "1", "maxResults": "1"}, 1, 1),
+        ({"startAt": "-1"}, 0, 50),
+        ({"startAt": "99999999999"}, 99999999999, 50),
+        ({"maxResults": "0"}, 0, 1),
+        ({"maxResults": "-1"}, 0, 1),
+        ({"maxResults": "1"}, 0, 1),
+        ({"maxResults": " 1"}, 0, 1),
+        ({"maxResults": "101"}, 0, 100),
+        ({"maxResults": "5000"}, 0, 100),
+    ],
+)
+def test_jira_project_search_pages(tmp_path, query, start, limit):
+    """The project pagination measurement recorded in `jira_project_search` governs each page."""
+    settings = tiny_corpus(
+        tmp_path,
+        [
+            {
+                "source_type": "jira",
+                "doc_id": f"issue-{i}",
+                "project": name,
+                "key": f"{name.upper()}-1",
+                "title": name,
+                "content": "Issue",
+                "author_email": "a@x.com",
+                "visibility": "public",
+            }
+            for i, name in enumerate(("payments", "orders"))
+        ],
+    )
+    with client_for(settings, reload=True) as client:
+        admin_h = {"Authorization": f"Bearer {settings.admin_token}"}
+        url = "/atlassian/rest/api/3/project/search"
+        full = client.get(url, headers=admin_h).json()["values"]
+        assert len(full) > 1
+        response = client.get(url, params=query, headers=admin_h)
+        assert response.status_code == 200, response.text
+        page = full[start : start + limit]
+        body = response.json()
+        last = start + len(page) >= len(full)
+        assert list(body) == ["self", *([] if last else ["nextPage"]), *_PAGE_MEMBERS]
+        assert {k: body[k] for k in _PAGE_MEMBERS} == {
+            "values": page,
+            "startAt": start,
+            "maxResults": limit,
+            "total": len(full),
+            "isLast": last,
+        }
+        assert body["self"].endswith(f"/project/search?maxResults={limit}&startAt={start}")
+        if not last:
+            assert body["nextPage"].endswith(f"?maxResults={limit}&startAt={start + limit}")
+
+
+_PAGE_MEMBERS = ["maxResults", "startAt", "total", "isLast", "values"]
+
+
+@pytest.mark.parametrize(
+    "query, link",
+    [
+        ("maxResults=1&bogus=a%2Bb", "bogus=a%2Bb&maxResults=1&startAt=0"),
+        ("maxResults=1&bogus=a+b", "bogus=a+b&maxResults=1&startAt=0"),
+        ("maxResults=1&b%6Fgus=x", "b%6Fgus=x&maxResults=1&startAt=0"),
+        ("maxResults=1&bogus", "bogus=&maxResults=1&startAt=0"),
+        ("maxResults=1&bogus=1&bogus=2", "bogus=1&bogus=2&maxResults=1&startAt=0"),
+        ("maxResults=1&Zeta=1&alpha=2", "Zeta=1&maxResults=1&alpha=2&startAt=0"),
+        ("maxResults=1&keys=A&keys=B", "keys=A&keys=B&maxResults=1&startAt=0"),
+        ("maxResults=1&=x", "maxResults=1&x=&startAt=0"),
+        ("maxResults=1&startAt=0&startAt=5", "maxResults=1&startAt=0"),
+        ("startAt=%2B1&maxResults=1", "maxResults=1&startAt=1"),
+        # fifteen names spread over thirty-two buckets, twelve over sixteen
+        (
+            "maxResults=1&qmokc=1&qscln=1&qmlde=1&qklik=1&qatpo=1&qazyu=1&qzuet=1&quimu=1&qkiux=1&qdktb=1&qolft=1&qqlew=1&qbwqu=1",
+            "qmokc=1&qazyu=1&qdktb=1&quimu=1&qatpo=1&qzuet=1&qbwqu=1&qscln=1&qolft=1&qqlew=1&maxResults=1&qkiux=1&qmlde=1&qklik=1&startAt=0",
+        ),
+        (
+            "maxResults=1&qmokc=1&qscln=1&qmlde=1&qklik=1&qatpo=1&qazyu=1&qzuet=1&quimu=1&qkiux=1&qdktb=1",
+            "qmokc=1&qazyu=1&qdktb=1&quimu=1&qatpo=1&maxResults=1&qkiux=1&qmlde=1&qzuet=1&qscln=1&qklik=1&startAt=0",
+        ),
+    ],
+)
+def test_jira_project_search_links_itself_with_what_it_was_sent(client, admin_h, query, link):
+    """Each row is the query real's `self` carried for the same query, in the order
+    `_project_search_link` gives."""
+    r = client.get(f"/atlassian/rest/api/3/project/search?{query}", headers=admin_h)
+    assert r.status_code == 200, r.text
+    assert r.json()["self"].split("?", 1)[1] == link
+
+
+@pytest.mark.parametrize(
+    "query, name, value",
+    [
+        ([("startAt", "abc")], "startAt", "abc"),
+        ([("startAt", "1.5")], "startAt", "1.5"),
+        ([("maxResults", "abc")], "maxResults", "abc"),
+        ([("startAt", "abc"), ("orderBy", "bogus")], "startAt", "abc"),
+        ([("orderBy", "bogus"), ("startAt", "abc")], "startAt", "abc"),
+        ([("maxResults", "abc"), ("orderBy", "bogus")], "maxResults", "abc"),
+        ([("orderBy", "bogus"), ("maxResults", "abc")], "maxResults", "abc"),
+        ([("startAt", "abc"), ("maxResults", "xyz")], "startAt", "abc"),
+        ([("maxResults", "xyz"), ("startAt", "abc")], "startAt", "abc"),
+    ],
+)
+def test_jira_project_search_integer_conversion_precedes_order(client, admin_h, query, name, value):
+    """The measured integer refusal precedes orderBy validation in either URL order."""
+    response = client.get("/atlassian/rest/api/3/project/search", params=query, headers=admin_h)
+    assert response.status_code == 400, response.text
+    assert response.headers["content-type"] == "application/problem+json;charset=UTF-8"
+    assert response.json() == {
+        "type": "about:blank",
+        "title": "Bad Request",
+        "status": 400,
+        "detail": f"Failed to convert '{name}' with value: '{value}'",
+        "instance": "/rest/api/3/project/search",
     }
 
 
@@ -1800,6 +1924,14 @@ def test_jira_comments_without_order_by_keep_the_order_the_corpus_states(paged):
         ("orderBy=CREATED", ["comment 7", "comment 6"]),
         ("orderBy=-Created", ["comment 1", "comment 2"]),
         ("orderBy=-%20created", ["comment 1", "comment 2"]),
+        # `_jira_order_desc` reads the rest, as real did.
+        ("orderBy=%01created", ["comment 7", "comment 6"]),
+        ("orderBy=created%01", ["comment 7", "comment 6"]),
+        ("orderBy=%01-created", ["comment 1", "comment 2"]),
+        ("orderBy=%0Bcreated", ["comment 7", "comment 6"]),
+        ("orderBy=-%0Bcreated", ["comment 1", "comment 2"]),
+        ("orderBy=-%0D%0Acreated", ["comment 1", "comment 2"]),
+        ("orderBy=created%C2%85", ["comment 7", "comment 6"]),
     ],
 )
 def test_jira_order_by_takes_the_spellings_the_real_api_takes(paged, query, want):
@@ -1814,14 +1946,30 @@ def test_jira_order_by_takes_the_spellings_the_real_api_takes(paged, query, want
     assert _bodies(d.json()) == want
 
 
-@pytest.mark.parametrize("query", ["orderBy=--created", "orderBy=%2B-created", "orderBy="])
-def test_jira_refuses_the_spellings_the_real_api_refuses(paged, query):
-    """Measured: exactly ONE sigil is stripped, so `--created` leaves `-created`, which is not a
-    field — real Jira's own message echoes `-created`, not `--created`. An empty value is refused
-    for the same reason: the field is the empty string."""
+@pytest.mark.parametrize(
+    "query, named",
+    [
+        ("orderBy=--created", "-created"),
+        ("orderBy=%2B-created", "-created"),
+        ("orderBy=", ""),
+        ("orderBy=%C2%A0created", "\xa0created"),
+        ("orderBy=%E2%80%83created", " created"),
+        ("orderBy=-%01created", "\x01created"),
+        ("orderBy=-%1Fcreated", "\x1fcreated"),
+        ("orderBy=-%C2%A0created", "\xa0created"),
+        ("orderBy=-%C2%85created", "-\x85created"),
+        ("orderBy=-cre%0Aated", "-cre\nated"),
+        ("orderBy=created%20%C2%85", "created "),
+        ("orderBy=created%C2%85%C2%85", "created\x85\x85"),
+    ],
+)
+def test_jira_refuses_the_spellings_the_real_api_refuses(paged, query, named):
+    """Each row names the field real's 400 named, as `_jira_order_desc` reads the value; the
+    sentence around it is Backlot's own."""
     client, h = paged
     r = client.get(f"/atlassian/rest/api/3/issue/PAY-7/comment?{query}", headers=h)
     assert r.status_code == 400, r.text
+    assert r.json()["errorMessages"][0].endswith(f"Instead: {named}")
 
 
 def test_jira_validates_order_by_before_resolving_the_issue(paged):
@@ -2101,25 +2249,29 @@ def test_jira_role_list_links_the_role_its_read_answers(client, admin_h):
 # the path a refusal echoes, as `_echoed_path` gives it
 @pytest.mark.parametrize("slash", ["", "/"])
 @pytest.mark.parametrize(
-    "param,value",
+    "param,value,key",
     [
-        ("maxResults", "abc"),
-        ("startAt", "abc"),
-        ("maxResults", "1.5"),
+        ("maxResults", "abc", "PAY-7"),
+        ("startAt", "abc", "PAY-7"),
+        ("maxResults", "1.5", "PAY-7"),
         # where Python's own int() reads 10
-        ("maxResults", "1_0"),
+        ("maxResults", "1_0", "PAY-7"),
         # the width is per PARAMETER: `maxResults` is a Java int, `startAt` a Java long, and each
         # is refused just past its own boundary and answered 200 just inside it (below)
-        ("maxResults", "2147483648"),
-        ("maxResults", "-2147483649"),
-        ("maxResults", "9223372036854775807"),
-        ("startAt", "9223372036854775808"),
-        ("startAt", "-9223372036854775809"),
+        ("maxResults", "2147483648", "PAY-7"),
+        ("maxResults", "-2147483649", "PAY-7"),
+        ("maxResults", "9223372036854775807", "PAY-7"),
+        ("startAt", "9223372036854775808", "PAY-7"),
+        ("startAt", "-9223372036854775809", "PAY-7"),
+        # escapes in the key ``errors.atlassian.echoed_spelling`` keeps as sent
+        ("maxResults", "abc", "A%20B"),
+        ("maxResults", "abc", "A%3FB"),
+        ("maxResults", "abc", "A%23B"),
     ],
 )
-def test_jira_refuses_an_integer_parameter_it_cannot_convert(paged, param, value, slash):
+def test_jira_refuses_an_integer_parameter_it_cannot_convert(paged, param, value, key, slash):
     client, h = paged
-    r = client.get(f"/atlassian/rest/api/3/issue/PAY-7/comment{slash}?{param}={value}", headers=h)
+    r = client.get(f"/atlassian/rest/api/3/issue/{key}/comment{slash}?{param}={value}", headers=h)
     assert r.status_code == 400, r.text
     assert r.headers["content-type"] == "application/problem+json;charset=UTF-8"
     assert r.json() == {
@@ -2127,7 +2279,7 @@ def test_jira_refuses_an_integer_parameter_it_cannot_convert(paged, param, value
         "title": "Bad Request",
         "status": 400,
         "detail": f"Failed to convert '{param}' with value: '{value}'",
-        "instance": f"/rest/api/3/issue/PAY-7/comment{slash}",
+        "instance": f"/rest/api/3/issue/{key}/comment{slash}",
     }
 
 
@@ -4085,6 +4237,10 @@ def test_confluence_refuses_a_wrong_method_with_springs_errors_list_and_no_allow
         ("put", "/rest/api/2/search/jql", "GET, POST"),
         # the row the vendor's own document disagrees with: it declares GET alone on `project/search`
         ("post", "/rest/api/3/project/search", "GET, PUT, DELETE"),
+        # an escape in the path, echoed as ``errors.atlassian.echoed_spelling`` spells it
+        ("post", "/rest/api/3/issue/A%20B", "GET, PUT, DELETE"),
+        ("post", "/rest/api/3/issue/A%23B", "GET, PUT, DELETE"),
+        ("post", "/rest/api/3/issue/A%3FB", "GET, PUT, DELETE"),
     ],
 )
 def test_jira_refuses_a_wrong_method_as_rfc_7807_naming_the_methods_it_takes(
@@ -4572,6 +4728,24 @@ _NO_ENDPOINT_PATHS = [
         ("GET", "/atlassian/rest/api/3/nopesuchroute?a=1&b=2", "/rest/api/3/nopesuchroute"),
         ("GET", "/atlassian/rest/api/3/nopesuchroute/", "/rest/api/3/nopesuchroute/"),
         ("GET", "/atlassian/rest/api/3//nopesuchroute", "/rest/api/3/nopesuchroute"),
+        # an escape ``errors.atlassian.echoed_spelling`` keeps: as sent, hex in upper case, one
+        # layer only
+        ("GET", "/atlassian/rest/api/3/nope%20x", "/rest/api/3/nope%20x"),
+        ("GET", "/atlassian/rest/api/3/nope%3cx", "/rest/api/3/nope%3Cx"),
+        ("GET", "/atlassian/rest/api/3/nope%2541", "/rest/api/3/nope%2541"),
+        ("GET", "/atlassian/rest/api/3/nope%c3%a9", "/rest/api/3/nope%C3%A9"),
+        ("GET", "/atlassian/rest/api/3/nope%3Fx", "/rest/api/3/nope%3Fx"),
+        ("GET", "/atlassian/rest/api/3/nope%23x", "/rest/api/3/nope%23x"),
+        ("GET", "/atlassian/rest/api/3/nope%09x", "/rest/api/3/nope%09x"),
+        ("GET", "/atlassian/rest/api/3/nope%0Dx", "/rest/api/3/nope%0Dx"),
+        # and ones it decodes
+        ("GET", "/atlassian/rest/api/3/nope%2dx", "/rest/api/3/nope-x"),
+        ("GET", "/atlassian/rest/api/3/nope%7ex", "/rest/api/3/nope~x"),
+        ("GET", "/atlassian/rest/api/3/nope%21x", "/rest/api/3/nope!x"),
+        ("GET", "/atlassian/rest/api/3/nope%41x", "/rest/api/3/nopeAx"),
+        # an escape beside the slash rules above, and a decoded `%2F` among them
+        ("GET", "/atlassian/rest/api/3//nope%20x/", "/rest/api/3/nope%20x/"),
+        ("GET", "/atlassian/rest/api/3/nope%2F%2Fx", "/rest/api/3/nope/x"),
     ],
 )
 def test_jira_answers_a_path_it_mounts_nothing_at_as_rfc_7807(
@@ -4909,6 +5083,16 @@ def test_jira_unserved_sorts_every_operation_no_route_serves(monkeypatch):
                 ("*/*;q=0.5;Q=2;q=0.5", "xml"),
             )
         ),
+        # the escapes ``errors.atlassian.echoed_spelling`` keeps and decodes, in `null for uri:`,
+        # by Confluence's own set
+        ("/atlassian/wiki/rest/api/nope%20x", "application/json", "json", "nope%20x"),
+        ("/atlassian/wiki/rest/api/nope%21x", "application/json", "json", "nope%21x"),
+        ("/atlassian/wiki/rest/api/nope%3cx", "application/json", "json", "nope%3cx"),
+        ("/atlassian/wiki/rest/api/nope%3Fx", "application/json", "json", "nope%3Fx"),
+        ("/atlassian/wiki/rest/api/nope%23x", "application/json", "json", "nope%23x"),
+        ("/atlassian/wiki/rest/api/nope%2Dx", "application/json", "json", "nope-x"),
+        # an escaped `?` beside a real query: the query is the one sent, after the path's escape
+        ("/atlassian/wiki/rest/api/nope%3Fx?_=1", "application/json", "json", "nope%3Fx?_=1"),
     ],
 )
 def test_confluence_answers_an_unclaimed_segment_in_the_shape_accept_asks_for(
@@ -5385,6 +5569,23 @@ _JIRA_PAGE = errors_atlassian.JIRA_SITE_HTML_MEDIA_TYPE
             302,
             None,
             "{site}/login?application=confluence&dest-url=%2Fwiki%2Fnope",
+            None,
+        ),
+        # an escape in the path, and an escaped `?` beside a query (``unmatched_path``)
+        (
+            "/atlassian/wiki/nope%20x",
+            True,
+            302,
+            None,
+            "{site}/login?application=confluence&dest-url=%2Fwiki%2Fnope%2520x",
+            None,
+        ),
+        (
+            "/atlassian/wiki/nope%3Fx?a=1",
+            True,
+            302,
+            None,
+            "{site}/login?application=confluence&dest-url=%2Fwiki%2Fnope%253Fx%3Fa%3D1",
             None,
         ),
         # Jira's own not-found page, its charset in lower case
