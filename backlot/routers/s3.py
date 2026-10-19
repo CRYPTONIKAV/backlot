@@ -2629,7 +2629,7 @@ _OBJECT_PATH_WRITE_SELECTORS = {
     **{selector: _BUCKET_WRITE_SELECTORS[selector] for selector in _KEY_BUCKET_SELECTORS},
 }
 _KEY_REQUIRED = "Object must have a valid key name."
-# Real's 400 for a write at a key with a `partNumber` and no `uploadId` (see
+# Real's 400 for a write at a key whose part number has no valued upload id beside it (see
 # ``object_method_refusal``).
 _PART_WITHOUT_UPLOAD_ID = "This operation does not accept partNumber without uploadId"
 # What real answers an unsigned ListBuckets with: a 307 to here (measured 2026-09-29).
@@ -3318,18 +3318,18 @@ async def object_method_refusal(request: Request, bucket: str, key: str) -> Resp
     `tagging&website=x`, did with a bearer header and with a V2 signature by an unknown key, a
     garbage `Content-MD5` and a body.
 
-    A lone `partNumber` — no `uploadId` beside it and no selector for it to conflict with — is
-    refused with 400 ``InvalidArgument``, "This operation does not accept partNumber without
-    uploadId", naming `partNumber` in both `ArgumentName` and `ArgumentValue`, ahead of the
-    credential and the bucket: measured 2026-10-17 at the same two keys on `PUT`, `POST`, `DELETE`
-    and `PATCH`, unsigned at both, signed with Signature Version 4 at the public one, and with a
-    bearer or a V2 header by an unknown key beside the valued `annotation` pair, for which the same
-    400 comes. Sitting above the credential as the refusals beside it do, the check cannot depend
-    on the credential or the bucket, so a signed, an unsigned and a spoilt signature answer alike.
-    A `partNumber` beside `uploadId` stays UploadPart, a GET's stays GetObject's part
-    (``_part_refusal``), a selector beside it — `acl`, `tagging`, `website` — stays the conflict,
-    and a `versionId` beside a lone one is answered here too, no measured answer of a write at a
-    key reading a `versionId`; real's order between the two is unmeasured."""
+    A `partNumber` with no `uploadId` beside it, or an empty one, and no selector to conflict with
+    is refused with 400 ``InvalidArgument``, :data:`_PART_WITHOUT_UPLOAD_ID`, naming `partNumber`
+    in both `ArgumentName` and `ArgumentValue` whatever its value, ahead of the credential and the
+    bucket. Measured at the same two keys on `PUT`, `POST`, `DELETE` and `PATCH`: on 2026-10-17
+    unsigned at both, signed with Signature Version 4 at the public one, and with a bearer or a V2
+    header by an unknown key beside the valued `annotation` pair; on 2026-10-18 unsigned, for the
+    values ``""``, none, `abc`, `0`, `-1`, `10001`, `1.5` and two of them, beside an empty
+    `uploadId`, and beside `versionId`, `x-id`, `renameObject` and `response-content-type`. The
+    name is read decoded and in its case: `part%4Eumber=1` is refused and `PartNumber=1` is not. A
+    `partNumber` beside a valued `uploadId` stays UploadPart, a GET's stays GetObject's part
+    (``_part_refusal``), and one beside a selector (`acl`, `tagging`, `website`, `uploads`,
+    `restore`, `torrent`) stays the conflict."""
     method = request.method
     if method == "OPTIONS":
         selected = _key_selected(request.query_params)
@@ -3353,7 +3353,7 @@ async def object_method_refusal(request: Request, bucket: str, key: str) -> Resp
     refused = _website_refusal(q)
     if refused is not None:
         return refused
-    if not selected and "partNumber" in q:
+    if "partNumber" in q and not q.get("uploadId"):
         return _argument_error(_PART_WITHOUT_UPLOAD_ID, "partNumber", "partNumber")
     by_selector = await _selector_refusal(
         request,
