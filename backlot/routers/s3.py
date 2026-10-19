@@ -597,11 +597,17 @@ def _xml_text(value: str) -> str:
 
 def _xml_listing_text(value: str) -> str:
     """``value`` as real writes it in a listing: as ``_xml_text`` does, but each reference in
-    lower-case hexadecimal (`c&#x1;`, `&#x0;`). Measured on the same dates in each echoed
-    parameter, `Prefix`, `Delimiter`, `StartAfter`, `Marker` and `KeyMarker`, and in what a
-    listing names itself, `Key`, `CommonPrefixes/Prefix`, `NextMarker` and `NextKeyMarker`, of
-    ListObjects, ListObjectsV2, ListObjectVersions and ListMultipartUploads."""
-    return _XML_CONTROL.sub(lambda m: f"&#x{ord(m[0]):x};", escape(value))
+    lower-case hexadecimal (`c&#x1;`, `&#x0;`), and `"` and `'` as `&quot;` and `&apos;`. Measured
+    on the same dates in each echoed parameter, `Prefix`, `Delimiter`, `StartAfter`, `Marker` and
+    `KeyMarker`, and in what a listing names itself, `Key`, `CommonPrefixes/Prefix`, `NextMarker`
+    and `NextKeyMarker`, of ListObjects, ListObjectsV2, ListObjectVersions and ListMultipartUploads;
+    the quotes on 2026-10-17, in each of those elements and in the `ETag` of the first three
+    (`<ETag>&quot;9dd4e461268c8034f5c8564e155c67a6&quot;</ETag>`), where NoSuchKey's `Key`, the
+    `ArgumentValue` of `versionId`, `max-keys` and `encoding-type`, and ListBuckets' `Prefix` wrote
+    `"` and `'` as they are."""
+    return _XML_CONTROL.sub(
+        lambda m: f"&#x{ord(m[0]):x};", escape(value, {'"': "&quot;", "'": "&apos;"})
+    )
 
 
 def _nul_refusal(q, names: tuple[str, ...]) -> Response | None:
@@ -1581,7 +1587,7 @@ def _list_objects(
         body.append(
             f"<Contents><Key>{_xml_listing_text(enc(val))}</Key>"
             f"<LastModified>{synth.s3_iso(ts)}</LastModified>"
-            f"<ETag>{escape(synth.s3_etag(r['key'], r['content']))}</ETag>"
+            f"<ETag>{_xml_listing_text(synth.s3_etag(r['key'], r['content']))}</ETag>"
             f"<Size>{len(r['content'].encode())}</Size>{owner}"
             f"<StorageClass>{escape(r['subtype'] or 'STANDARD')}</StorageClass></Contents>"
         )
@@ -1830,7 +1836,7 @@ def _list_object_versions(request: Request, conn, bucket: str, visible, max_keys
             f"<Version><Key>{_xml_listing_text(enc(val))}</Key><VersionId>null</VersionId>"
             f"<IsLatest>true</IsLatest>"
             f"<LastModified>{synth.s3_iso(r['updated_ts'] or r['created_ts'])}</LastModified>"
-            f"<ETag>{escape(synth.s3_etag(r['key'], r['content']))}</ETag>"
+            f"<ETag>{_xml_listing_text(synth.s3_etag(r['key'], r['content']))}</ETag>"
             f"<Size>{len(r['content'].encode())}</Size>{owner}"
             f"<StorageClass>{escape(r['subtype'] or 'STANDARD')}</StorageClass></Version>"
         )

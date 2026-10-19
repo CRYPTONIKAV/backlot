@@ -2958,12 +2958,41 @@ def test_an_objects_attributes_size_is_its_bytes(tmp_path):
         ("versions&max-keys=1", ["<NextKeyMarker>c&#x1;k</NextKeyMarker>", "<Key>c&#x1;k</Key>"]),
         ("versions&delimiter=%01", ["<Delimiter>&#x1;</Delimiter>", "<Prefix>c&#x1;</Prefix>"]),
         ("uploads&prefix=c%00", ["<Prefix>c&#x0;</Prefix>"]),
+        (
+            "list-type=2&prefix=q%22&delimiter=%27",
+            ["<Prefix>q&quot;</Prefix>", "<Delimiter>&apos;</Delimiter>", "<Key>q&quot;k</Key>"]
+            + ["<ETag>&quot;", "&quot;</ETag>"],
+        ),
+        (
+            "list-type=2&delimiter=%22",
+            ["<Delimiter>&quot;</Delimiter>", "<Prefix>q&quot;</Prefix>"],
+        ),
+        (
+            "list-type=2&start-after=r%27",
+            ["<StartAfter>r&apos;</StartAfter>", "<Key>r&apos;k</Key>"],
+        ),
+        (
+            "max-keys=1&marker=q%22&delimiter=z",
+            ["<Marker>q&quot;</Marker>", "<NextMarker>q&quot;k</NextMarker>", "<Key>q&quot;k</Key>"]
+            + ["<ETag>&quot;", "&quot;</ETag>"],
+        ),
+        (
+            "versions&key-marker=q%22&max-keys=1",
+            ["<KeyMarker>q&quot;</KeyMarker>", "<NextKeyMarker>q&quot;k</NextKeyMarker>"]
+            + ["<Key>q&quot;k</Key>", "<ETag>&quot;", "&quot;</ETag>"],
+        ),
+        ("versions&delimiter=%27", ["<Delimiter>&apos;</Delimiter>", "<Prefix>r&apos;</Prefix>"]),
+        (
+            "uploads&prefix=q%22&key-marker=r%27&delimiter=%22",
+            ["<KeyMarker>r&apos;</KeyMarker>", "<Delimiter>&quot;</Delimiter>"]
+            + ["<Prefix>q&quot;</Prefix>"],
+        ),
     ],
 )
-def test_a_listing_writes_a_control_character_as_a_hexadecimal_reference(tmp_path, query, written):
+def test_a_listing_writes_control_characters_and_quotes_as_real_does(tmp_path, query, written):
     """Each row is what real's listing wrote for the same query over the same keys, written here by
     ``backlot.routers.s3._xml_listing_text``; U+007F stays as it is."""
-    keys = ["c\x01k", "c\x01m", "d\x1fx", "e\x7fy", "plain"]
+    keys = ["c\x01k", "c\x01m", "d\x1fx", "e\x7fy", "plain", 'q"k', "r'k"]
     records = [
         complete(
             source_type="s3",
