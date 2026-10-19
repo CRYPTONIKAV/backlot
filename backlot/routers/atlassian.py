@@ -652,6 +652,49 @@ def _java_long(raw: str) -> int | None:
     return value if -(2**63) <= value < 2**63 else None
 
 
+def _confluence_content_id(raw: str) -> int | None:
+    """``raw`` as Confluence's ``ContentId`` reads it, or None where it cannot.
+
+    A `ContentId` is `Long.parseLong` with no hex and no trimming, unlike the `long` of
+    :func:`_java_long`: `+5` and `05` read as 5, `-9223372036854775808` and `9223372036854775807`
+    are ids, and `abc`, `1.5`, `1e3`, a space, `9223372036854775808`, `-9223372036854775809` and
+    `99999999999999999999` are None. Measured on Confluence Cloud, 2026-10-16.
+
+    A digit of any script in the Basic Multilingual Plane counts, as :func:`_java_digit` reads it
+    (`٥` is five); a character past U+FFFF is two `char`s to Java and neither of them a digit.
+    """
+    negative = raw.startswith("-")
+    digits = raw[1:] if raw[:1] in ("+", "-") else raw
+    if not digits:
+        return None
+    value = 0
+    for ch in digits:
+        digit = _java_digit(ch, 10)
+        if digit is None:
+            return None
+        value = value * 10 + digit
+    value = -value if negative else value
+    return value if -(2**63) <= value < 2**63 else None
+
+
+def _content_id(request: Request, raw: str) -> int:
+    """The ``content_id`` path variable as real reads it, or the 400 it answers.
+
+    Every route under `content/{id}` reads it in its body rather than declaring it an ``int``:
+    Spring converts the path variable AFTER the credential's 403 and BEFORE the route's own
+    parameter refusals, which a signature annotation cannot order (``errors.atlassian``
+    ``.validation_body``'s own docstring records this server answering a 422 there).
+    """
+    # Tests call the route functions directly with the served int id; FastAPI hands the raw
+    # path string. Both read as the same ContentId.
+    if isinstance(raw, int):
+        return raw
+    content_id = _confluence_content_id(raw)
+    if content_id is None:
+        raise errors_atlassian.content_id_not_convertible(raw)
+    return content_id
+
+
 def _role_id(request: Request, raw: str) -> int:
     """A project role's id as real reads it (:func:`_java_long`), or the 400 it answers: one naming
     the variable as missing where removing the whitespace leaves nothing
@@ -1972,13 +2015,14 @@ async def confluence_content_list(request: Request):
 @router.get(
     "/wiki/rest/api/content/{content_id}", response_model=ConfluencePage, openapi_extra=_P_EXPAND
 )
-async def confluence_content_get(content_id: int, request: Request):
+async def confluence_content_get(content_id: str, request: Request):
     conn = auth.conn(request)
     caller = _confluence_caller(request)
+    content_id = _content_id(request, content_id)
     ids = auth.visible_ids(request, caller)
     row = store.confluence_by_id(conn, content_id, visible_ids=ids)
     if row is None:
-        raise HTTPException(status_code=404, detail="No content found with id")
+        raise errors_atlassian.content_not_found("content", content_id)
     return _confluence_page(conn, request, row, _str_param(request, "expand", "body.storage"))
 
 
@@ -1987,14 +2031,18 @@ async def confluence_content_get(content_id: int, request: Request):
     response_model=ConfluenceResults,
     openapi_extra=_P_CHILD_PAGE,
 )
-async def confluence_child_pages(content_id: int, request: Request):
+async def confluence_child_pages(content_id: str, request: Request):
     conn = auth.conn(request)
     caller = _confluence_caller(request)
+    content_id = _content_id(request, content_id)
+    # Real reads `limit` and `start` before it looks the page up: on an unknown id
+    # `?limit=abc` is the conversion 400 and `?limit=-1` the negative one, not the 404
+    # (measured 2026-10-16, as `child/attachment` has read them since 2026-10-10).
+    limit, start = _confluence_page_params(request)
     ids = auth.visible_ids(request, caller)
     if store.get_document(conn, "confluence", content_id, visible_ids=ids) is None:
-        raise HTTPException(status_code=404, detail="No content found with id")
+        raise errors_atlassian.content_not_found("child/page", content_id)
     expand = _str_param(request, "expand", "") or ""
-    limit, start = _confluence_page_params(request)
     kids = store.children(conn, "confluence", content_id, visible_ids=ids)
     page = kids[start : start + limit]
     results = [_confluence_page(conn, request, k, expand) for k in page]
@@ -2015,13 +2063,15 @@ async def confluence_child_pages(content_id: int, request: Request):
 
 
 @router.get("/wiki/rest/api/content/{content_id}/child/comment", openapi_extra=_P_CONTENT_CHILD)
-async def confluence_comments(content_id: int, request: Request):
+async def confluence_comments(content_id: str, request: Request):
     conn = auth.conn(request)
     caller = _confluence_caller(request)
+    content_id = _content_id(request, content_id)
+    # Conversion and negative before the lookup, measured 2026-10-16 as on `child/page`.
+    limit, start = _confluence_page_params(request, cap=1000)
     ids = auth.visible_ids(request, caller)
     if store.get_document(conn, "confluence", content_id, visible_ids=ids) is None:
-        raise HTTPException(status_code=404, detail="No content found with id")
-    limit, start = _confluence_page_params(request, cap=1000)
+        raise errors_atlassian.content_not_found("child/comment", content_id)
     comments = store.doc_comments(conn, "confluence", content_id)
     results = []
     for c in comments[start : start + limit]:
@@ -2066,7 +2116,7 @@ async def confluence_comments(content_id: int, request: Request):
 
 
 @router.get("/wiki/rest/api/content/{content_id}/child/attachment", openapi_extra=_P_CONTENT_CHILD)
-async def confluence_attachments(content_id: int, request: Request):
+async def confluence_attachments(content_id: str, request: Request):
     """A page's attachments, which is the empty page for every page: a corpus record states no
     attachment, and this is the page real answers for a page holding none.
 
@@ -2076,10 +2126,11 @@ async def confluence_attachments(content_id: int, request: Request):
     """
     conn = auth.conn(request)
     caller = _confluence_caller(request)
+    content_id = _content_id(request, content_id)
     limit, start = _confluence_page_params(request, default=50)
     ids = auth.visible_ids(request, caller)
     if store.get_document(conn, "confluence", content_id, visible_ids=ids) is None:
-        raise HTTPException(status_code=404, detail="No content found with id")
+        raise errors_atlassian.content_not_found("child/attachment", content_id)
     return {
         "results": [],
         "start": start,
@@ -2118,17 +2169,19 @@ def _refuse_a_label_prefix(request: Request) -> None:
 
 
 @router.get("/wiki/rest/api/content/{content_id}/label", openapi_extra=_P_CONTENT_CHILD)
-async def confluence_labels(content_id: int, request: Request):
+async def confluence_labels(content_id: str, request: Request):
     conn = auth.conn(request)
     caller = _confluence_caller(request)
+    content_id = _content_id(request, content_id)
+    # Real converts `limit` and `start` before it reads `prefix` and before it looks the page up,
+    # and refuses a negative or zero one after it (measured 2026-10-14 and 2026-10-16, where an
+    # unknown id with `?limit=-1` is the 404 and with `?limit=abc` the conversion 400).
+    _int_param(request, "limit", 200)
+    _int_param(request, "start", 0)
     ids = auth.visible_ids(request, caller)
     row = store.get_document(conn, "confluence", content_id, visible_ids=ids)
     if row is None:
-        raise HTTPException(status_code=404, detail="No content found with id")
-    # Real converts `limit` and `start` before it reads `prefix`, and refuses a negative or zero
-    # one after it (measured 2026-10-14).
-    _int_param(request, "limit", 200)
-    _int_param(request, "start", 0)
+        raise errors_atlassian.content_not_found("label", content_id)
     _refuse_a_label_prefix(request)
     limit, start = _confluence_page_params(request, default=200, cap=200, refuse_zero=True)
     labels = store.jcol(row, "labels")
@@ -2153,12 +2206,13 @@ async def confluence_labels(content_id: int, request: Request):
 
 
 @router.get("/wiki/rest/api/content/{content_id}/restriction/byOperation")
-async def confluence_restrictions(content_id: int, request: Request):
+async def confluence_restrictions(content_id: str, request: Request):
     conn = auth.conn(request)
     caller = _confluence_caller(request)
+    content_id = _content_id(request, content_id)
     ids = auth.visible_ids(request, caller)
     if store.get_document(conn, "confluence", content_id, visible_ids=ids) is None:
-        raise HTTPException(status_code=404, detail="No content found with id")
+        raise errors_atlassian.content_not_found("restriction/byOperation", content_id)
     emails = store.doc_member_emails(conn, "confluence", content_id)
     site = _site(request)
     users = [] if emails is None else [_conf_user(e, site) for e in sorted(emails)]

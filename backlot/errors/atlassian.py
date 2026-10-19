@@ -358,6 +358,96 @@ def content_finder_cannot_fetch(content_type: str) -> AtlassianError:
     )
 
 
+#: The six routes under `content/{id}`, each with the sentence real's 404 carries for it and
+#: whether the `data` object beside it is the refused shape or the readable one. Measured on
+#: Confluence Cloud, 2026-10-16, on ids naming no page (`999999999`, `888888888`, `-1`, `0`,
+#: `9223372036854775807`): `content/{id}` and `label` name the id bare and answer the refused
+#: shape, the three `child/*` routes name it as a `ContentId` and answer the readable one, and
+#: `restriction/byOperation` wraps that `ContentId` in angle brackets.
+_CONTENT_NOT_FOUND = {
+    "content": (lambda i: f"No content found with id : {i}", False),
+    "label": (lambda i: f"No content found with id : {i}", False),
+    "child/page": (
+        lambda i: f"No parent or not permitted to view content with id : ContentId{{id={i}}}",
+        True,
+    ),
+    "child/comment": (
+        lambda i: f"No parent or not permitted to view content with id : ContentId{{id={i}}}",
+        True,
+    ),
+    "child/attachment": (lambda i: f"No content found with id: ContentId{{id={i}}}", True),
+    "restriction/byOperation": (
+        lambda i: f"No content with id <ContentId{{id={i}}}> can be found",
+        False,
+    ),
+}
+
+
+def content_not_found(route: str, content_id: int) -> AtlassianError:
+    """Confluence's 404 for a content id naming no page, in the three members and the two `data`
+    shapes :data:`_CONTENT_NOT_FOUND` records.
+
+    The id named is the one READ, never the one sent: `content/05/child/page` names
+    `ContentId{id=5}`, because real converts the path variable before it looks the page up
+    (:func:`content_id_not_convertible` is what refuses the ones it cannot).
+
+    A page the caller may not read answers this too, and that is what keeps it byte for byte the
+    same as a made-up id: both raise here with the same route and the same read id, which
+    ``tests.test_atlassian.test_confluence_a_page_an_outsider_cannot_read_is_a_made_up_id`` pins.
+    """
+    sentence_of, readable = _CONTENT_NOT_FOUND[route]
+    sentence = sentence_of(content_id)
+    if readable:
+        data = {"authorized": True, "valid": True, "errors": [], "successful": True}
+    else:
+        data = {
+            "authorized": False,
+            "valid": False,
+            "errors": [{"message": {"translation": sentence, "args": []}}],
+            "successful": False,
+        }
+    return AtlassianError(
+        404,
+        {
+            "statusCode": 404,
+            "data": data,
+            "message": (
+                f"com.atlassian.confluence.api.service.exceptions.api.NotFoundException: {sentence}"
+            ),
+        },
+    )
+
+
+def content_id_not_convertible(value: str) -> AtlassianError:
+    """Spring's 400 for a `content/{id}` path variable Confluence's `ContentId` cannot parse.
+
+    Measured on Confluence Cloud, 2026-10-16 for `abc`, `1.5`, `1e3`, a space,
+    `9223372036854775808`, `-9223372036854775809` and `99999999999999999999`, each as sent and
+    decoded inside the brackets. Three refusals name it and this is the third: the credential's 403
+    comes first and the route's own parameter refusals (`?limit=abc`, `?limit=-1`) come after, so
+    the routes read the id where they read the parameters, not in the signature
+    (``routers.atlassian._confluence_content_id``).
+    """
+    return AtlassianError(
+        400,
+        {
+            "statusCode": 400,
+            "message": (
+                "org.springframework.web.method.annotation."
+                "MethodArgumentTypeMismatchException: Failed to convert value of type "
+                "'java.lang.String' to required type "
+                "'com.atlassian.confluence.api.model.content.id.ContentId'; nested exception is "
+                "org.springframework.core.convert.ConversionFailedException: Failed to convert "
+                "from type [java.lang.String] to type [@org.springframework.web.bind.annotation."
+                f"PathVariable com.atlassian.confluence.api.model.content.id.ContentId] for "
+                f"value [{value}]; nested exception is "
+                "com.atlassian.confluence.api.service.exceptions.api.BadRequestException: "
+                "Can't parse as a ContentId"
+            ),
+        },
+    )
+
+
 def not_a_custom_content_type(content_type: str) -> AtlassianError:
     """`content`'s 400 for `type=whiteboard`, `database` and `embed`, measured 2026-10-10: the bare
     exception string, as :func:`negative_not_allowed` is."""
