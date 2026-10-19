@@ -9693,6 +9693,9 @@ def test_gmail_cc_bcc_searches_address_headers(tmp_path, surface, caller, query,
         ("ava", 'to:""', ["plan", "lunch", "reply"]),
         ("ava", "to: from: bcc:", []),
         ("ava", "from: bob", ["plan"]),
+        ("ava", 'from:"" bob', ["plan"]),
+        ("ava", 'to:" " lena', ["lunch"]),
+        ("ava", 'cc:""dev', ["reply"]),
         ("ava", "From: bob", ["plan"]),
         ("ava", "to:\tlena", ["lunch"]),
         ("ava", "cc: dev", ["reply"]),
@@ -9775,17 +9778,25 @@ def test_gmail_from_to_searches_address_headers(tmp_path, surface, caller, query
     [
         ("subject:", ["plan", "lunch", "after"]),
         ("subject: ", ["plan", "lunch", "after"]),
+        ("subject:\t", ["plan", "lunch", "after"]),
+        ("SUBJECT:", ["plan", "lunch", "after"]),
         ("label:", ["plan", "lunch", "after"]),
+        ('label:""', ["plan", "lunch", "after"]),
         ("in:", ["plan", "lunch", "after"]),
+        ('in:""', ["plan", "lunch", "after"]),
+        ("lunch label:", ["lunch"]),
+        ('subject:"" lunch', ["lunch"]),
+        ('subject:" " lunch', ["lunch"]),
+        ('label:"" lunch', []),
         ("after:", ["after"]),
     ],
 )
 def test_gmail_an_empty_operator_is_dropped_or_the_term_it_spells(
     tmp_path, surface, query, expected
 ):
-    """A `subject:`, `label:` or `in:` with no value is no search term at all, as an empty address
-    operator is no constraint, where an empty `after:` or `before:` is the word it spells
-    (``_GMAIL_DROPPED_WHEN_EMPTY`` and ``_GMAIL_KEY_ALIASES`` record the measurements)."""
+    """Each row is how the comments on `_GMAIL_DROPPED_WHEN_EMPTY` and `_GMAIL_SPACED` read its
+    query, over both listings; the corpus holds the word `after` so that a bare `after:` can be told
+    from a dropped one."""
     settings = tiny_corpus(
         tmp_path,
         [

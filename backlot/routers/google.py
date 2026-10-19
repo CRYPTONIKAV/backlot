@@ -644,13 +644,17 @@ async def gmail_label_get(user_id: str, label_id: str, request: Request):
 # `older:` after one space or three. A tab after those four leaves the operator empty:
 # `after:<tab>1` answered the messages holding both search terms `after` and `1`. `has:`,
 # `newer_than:`, `older_than:` and `larger:` read nothing after a space: `has: attachment` answered
-# nothing where `has:attachment` answered 160 messages.
+# nothing where `has:attachment` answered 160 messages. On 2026-10-19 a pair of quotes holding
+# nothing or only spaces read as whitespace after each operator `_GMAIL_SPACED` names:
+# `label:"" probe`, `subject:" " probe`, `from:"" <word>` and `cc:""<word>` answered what
+# `label: probe`, `subject: probe`, `from: <word>` and `cc: <word>` answer, and `<word> to:""` what
+# `<word>` alone answers.
 _GMAIL_SPACED = (
     r"(?<=\bfrom:)|(?<=\bto:)|(?<=\bcc:)|(?<=\bbcc:)|(?<=\bsubject:)|(?<=\blabel:)|(?<=\bin:)"
 )
 _GMAIL_DATED = r"(?<=\bafter:)|(?<=\bbefore:)|(?<=\bnewer:)|(?<=\bolder:)"
 _GMAIL_OP = re.compile(
-    rf'(\w+):(?:(?:{_GMAIL_SPACED})\s*|(?:{_GMAIL_DATED}) *)?("[^"]*"|\S*)', re.IGNORECASE
+    rf'(\w+):(?:(?:{_GMAIL_SPACED})(?:\s|"\s*")*|(?:{_GMAIL_DATED}) *)?("[^"]*"|\S*)', re.IGNORECASE
 )
 # operators we honor; anything else stays as free text
 _GMAIL_KEYS = {
@@ -679,12 +683,13 @@ _GMAIL_KEY_ALIASES = {"newer": "after", "older": "before"}
 # text. Measured on a Workspace mailbox: `to:`, `from:` and `bcc:` with no value answered every
 # message, as no `q` does (2026-10-14), and so did `cc:`, `from:""` and `to:""` (2026-10-16).
 _GMAIL_ADDRESS_KEYS = {"from", "to", "cc", "bcc"}
-# The operators whose no value is neither a constraint nor a search term: real answered every
-# message of the mailbox for a bare `subject:`, `label:` or `in:`, with and without the space after
-# the colon, as it answers a bare address operator. Measured on a Workspace mailbox on 2026-10-17,
-# comparing `messages.list` id sets over a mailbox of 603 messages: 603 of 603, the ids of no `q`,
-# for each of the three. A bare `after:`, `before:`, `newer:` or `older:` is instead the word it
-# spells, which is why these three are named rather than read as "any operator with no value".
+# The operators a search ignores when they have no value, as it ignores an address operator with
+# none, where a bare `after:`, `before:`, `newer:` or `older:` is the word it spells. Measured on a
+# Workspace mailbox, comparing `messages.list` id sets with those of no `q`: on 2026-10-17,
+# `subject:`, `label:` and `in:` answered every message, with a space after the colon or none,
+# where `subject`, `label` and `in` alone did not; on 2026-10-18 so did `subject:""`, `label:""`
+# and `in:""`, a tab or two spaces after the colon, and `SUBJECT:`. `probe label:` answered as
+# `probe` does, and `threads.list` answered each of the three with every thread.
 _GMAIL_DROPPED_WHEN_EMPTY = {"subject", "label", "in"}
 # The operators whose value a `+` ends. Measured on a Workspace mailbox on 2026-10-15:
 # `cc:<local>+<word>`, `from:<local>+update` and `to:<local>+update` answered the ids of the
