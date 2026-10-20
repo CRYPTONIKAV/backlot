@@ -475,6 +475,10 @@ def _parent_field(conn, row, version: str | None = None) -> dict:
         if version and _data_sources_model(version):
             database = store.get_document(conn, "notion", row["parent_id"])
             data_source_id = database["data_source_id"] if database is not None else None
+            if not data_source_id:
+                # a parent that is a page has no data source to name: real types it `page_id`,
+                # never a `data_source_id` member carrying null.
+                return {"type": "page_id", "page_id": row["parent_id"]}
             return {
                 "type": "data_source_id",
                 "data_source_id": data_source_id,
@@ -657,8 +661,8 @@ def _data_source_obj(conn, row) -> dict:
 
 def _block_child(conn, page_row, block: dict) -> dict:
     """A block of `blocks.children` in the twelve-member shape real serves (measured 2026-09-30):
-    the seven `synth.notion_blocks` emits plus the page parent, both timestamps and the two
-    partial authors."""
+    the seven `synth.notion_blocks` emits plus the page parent, both timestamps in the measured
+    millisecond form and the two partial authors."""
     created = page_row["created_ts"]
     updated = page_row["updated_ts"] or created
     kind = block["type"]
@@ -666,8 +670,8 @@ def _block_child(conn, page_row, block: dict) -> dict:
         "object": "block",
         "id": block["id"],
         "parent": {"type": "page_id", "page_id": page_row["id"]},
-        "created_time": synth.rfc3339(created),
-        "last_edited_time": synth.rfc3339(updated),
+        "created_time": synth.rfc3339_millis(created),
+        "last_edited_time": synth.rfc3339_millis(updated),
         "created_by": _partial_user(page_row["author_email"]),
         "last_edited_by": _partial_user(page_row["author_email"]),
         "has_children": block["has_children"],
@@ -715,8 +719,8 @@ async def get_block(block_id: str, request: Request):
             "has_children": row["subtype"] != "database",
             "archived": False,
             "in_trash": False,
-            "created_time": synth.rfc3339(row["created_ts"]),
-            "last_edited_time": synth.rfc3339(row["updated_ts"] or row["created_ts"]),
+            "created_time": synth.rfc3339_millis(row["created_ts"]),
+            "last_edited_time": synth.rfc3339_millis(row["updated_ts"] or row["created_ts"]),
             "created_by": _partial_user(row["author_email"]),
             "last_edited_by": _partial_user(row["author_email"]),
             "parent": _parent_field(conn, row, _version(request)),

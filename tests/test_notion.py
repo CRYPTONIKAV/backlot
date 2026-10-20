@@ -1101,8 +1101,43 @@ def test_notion_child_block_has_parent_timestamps_and_authors(tmp_path):
     assert got["parent"] == {"type": "page_id", "page_id": row["id"]}
     assert got["created_by"] == {"object": "user", "id": synth.notion_user_id("ava@acme.com")}
     assert got["last_edited_by"] == got["created_by"]
-    assert got["created_time"].endswith("Z") and got["last_edited_time"].endswith("Z")
+    millis = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z")
+    assert millis.fullmatch(got["created_time"]) and millis.fullmatch(got["last_edited_time"])
     assert got[got["type"]] == block[block["type"]]
+
+
+def test_notion_page_parent_under_the_data_sources_model_is_a_page_id(tmp_path):
+    from backlot.routers.notion import _page_obj
+
+    s = tiny_corpus(
+        tmp_path,
+        [
+            {
+                "source_type": "notion",
+                "doc_id": "nf-parent",
+                "teamspace": "eng",
+                "title": "Parent",
+                "content": "body",
+                "author_email": "ava@acme.com",
+                "visibility": "public",
+            },
+            {
+                "source_type": "notion",
+                "doc_id": "nf-child",
+                "parent": "nf-parent",
+                "teamspace": "eng",
+                "title": "Child",
+                "content": "body",
+                "author_email": "ava@acme.com",
+                "visibility": "public",
+            },
+        ],
+    )
+    conn = store.connect_ro(s.db_path)
+    child = store.get_document(conn, "notion", served_id("notion", "nf-child"))
+    parent = _page_obj(conn, child, "2025-09-03")["parent"]
+    assert parent == {"type": "page_id", "page_id": served_id("notion", "nf-parent")}
+    assert "data_source_id" not in parent
 
 
 def test_notion_page_database_and_data_source_members_per_version(tmp_path):
@@ -1181,6 +1216,7 @@ def test_notion_search_and_query_trailers_follow_the_version(client, admin_h):
 def test_notion_blocks_over_http_carry_authors_and_the_page_parent(client, notion_h):
     pid = synth.notion_id("nt-runbook")
     block = client.get(f"/notion/v1/blocks/{pid}", headers=notion_h).json()
+    assert block["created_time"].endswith(".000Z") and block["last_edited_time"].endswith(".000Z")
     assert block["created_by"] == block["last_edited_by"]
     assert block["created_by"]["object"] == "user"
     children = client.get(f"/notion/v1/blocks/{pid}/children", headers=notion_h)
