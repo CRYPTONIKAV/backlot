@@ -401,19 +401,24 @@ def _list_obj(results: list, offset: int, page_len: int, total: int, type_key: s
     }
 
 
+# The objects below carry real's members in real's order, as api.notion.com answered one object of
+# each kind on 2026-10-20 under 2025-09-03, and under 2022-06-28 too for a page, a row, the block of
+# each and a database: a child block, a data source, the bot and a person beside those.
+
+
 def _partial_user(email: str) -> dict:
     """The user member real puts on `created_by` / `last_edited_by`: `object` and `id` only.
 
-    Measured against api.notion.com on 2026-09-30: a page, a row, a block, a
-    database and a data source answer this two-member user there, while `GET /v1/users/{id}`
-    keeps the full person `_user_obj` renders.
+    Measured against api.notion.com on 2026-09-30: a page, a row, a block, a database and a data
+    source answer this two-member user there, while `GET /v1/users/{id}` keeps the full person
+    `_user_obj` renders.
     """
     return {"object": "user", "id": synth.notion_user_id(email or "")}
 
 
 def _object_url(object_id: str) -> str:
-    """The public URL real serves for a page, a database or a data source (measured 2026-09-30):
-    `app.notion.com/p/` and the served id without its dashes."""
+    """The `url` real serves for a page or a database (measured 2026-09-30): `app.notion.com/p/`
+    and the id without its dashes. A data source answers its database's."""
     return f"https://app.notion.com/p/{object_id.replace('-', '')}"
 
 
@@ -427,8 +432,9 @@ def _workspace_id(name: str) -> str:
 def _answer(request: Request, payload: dict) -> JSONResponse:
     """A 200 in Notion's envelope: `request_id` as the last body member and on the header.
 
-    Measured 2026-09-30: every 200, list bodies included, carries the same id in
-    `request_id` and `x-notion-request-id`; `_error` already answers refusals that way.
+    Measured 2026-09-30 and 2026-10-20: the 200 of each route this router serves, list bodies
+    included, carries one id in `request_id` and in `x-notion-request-id`, the way `_error`
+    answers a refusal.
     """
     request_id = _request_id(request)
     body = dict(payload)
@@ -442,9 +448,9 @@ def _user_obj(conn, email: str) -> dict:
     return {
         "object": "user",
         "id": synth.notion_user_id(email or ""),
-        "type": "person",
         "name": name,
         "avatar_url": None,
+        "type": "person",
         # Real's person member is `email` then `email_verified` under each Notion-Version, the
         # latter `true` for the one person measured (2026-10-13). The corpus records no
         # verification, so every person is served `true`.
@@ -465,26 +471,29 @@ def _cover(url: str | None) -> dict | None:
 
 
 def _parent_field(conn, row, version: str | None = None) -> dict:
-    """The `parent` a page serves, in the model the caller's version reads.
+    """The `parent` a page and its block serve, in the model the caller's version reads.
 
-    `parent_id` already HOLDS the parent's served id -- the importer resolved it there. Under
-    `2025-09-03` real types a row's parent `data_source_id` and names the data source beside the
-    database id (measured 2026-09-30); before the split it types it `database_id`.
+    `parent_id` already HOLDS the parent's served id -- the importer resolved it there. Measured
+    against api.notion.com on 2026-10-20, for the page and for its block alike: a page under a page
+    is typed `page_id` under 2022-06-28 and 2025-09-03, and a row is typed `database_id` under
+    2022-06-28 and `data_source_id`, with the database id beside it, under 2025-09-03.
     """
-    if row["parent_id"]:
-        if version and _data_sources_model(version):
-            database = store.get_document(conn, "notion", row["parent_id"])
-            data_source_id = database["data_source_id"] if database is not None else None
-            if not data_source_id:
-                # a parent that is a page has no data source to name: real types it `page_id`,
-                # never a `data_source_id` member carrying null.
-                return {"type": "page_id", "page_id": row["parent_id"]}
-            return {
-                "type": "data_source_id",
-                "data_source_id": data_source_id,
-                "database_id": row["parent_id"],
-            }
-        return {"type": "database_id", "database_id": row["parent_id"]}
+    if not row["parent_id"]:
+        return {"type": "workspace", "workspace": True}
+    parent = store.get_document(conn, "notion", row["parent_id"])
+    if parent["subtype"] != "database":
+        return {"type": "page_id", "page_id": row["parent_id"]}
+    if version and _data_sources_model(version):
+        return {
+            "type": "data_source_id",
+            "data_source_id": parent["data_source_id"],
+            "database_id": row["parent_id"],
+        }
+    return {"type": "database_id", "database_id": row["parent_id"]}
+
+
+def _database_parent(row) -> dict:
+    """A database's own `parent`. This router serves each database at the top of the workspace."""
     return {"type": "workspace", "workspace": True}
 
 
@@ -510,23 +519,24 @@ def _page_obj(conn, row, version: str | None = None) -> dict:
     props = {"title": _title_prop(row["title"])}
     for k, v in (json.loads(row["properties"]) if row["properties"] else {}).items():
         props[k] = _prop_value(k, v)
+    # Both timestamps in the millisecond form real sends for the page and for its block.
     return {
         "object": "page",
         "id": pid,
-        "created_time": synth.rfc3339(created),
-        "last_edited_time": synth.rfc3339(updated),
+        "created_time": synth.rfc3339_millis(created),
+        "last_edited_time": synth.rfc3339_millis(updated),
         "created_by": _partial_user(row["author_email"]),
         "last_edited_by": _partial_user(row["author_email"]),
         "cover": _cover(row["cover"]),
         "icon": _emoji_icon(row["icon"]),
         "parent": _parent_field(conn, row, version),
-        "archived": False,
         "in_trash": False,
         "is_archived": False,
         "is_locked": False,
         "properties": props,
         "url": _object_url(pid),
         "public_url": None,
+        "archived": False,
     }
 
 
@@ -593,66 +603,80 @@ def _schema_props(row) -> dict:
 
 
 def _database_obj(conn, row, version: str) -> dict:
+    """A database as 2025-09-03 and later answer it, with its data sources, `is_locked` and no
+    author, or as earlier versions do, with the property schema, both authors and no
+    `is_locked`."""
     did = row["id"]
     created = row["created_ts"]
     updated = row["updated_ts"] or created
-    obj = {
+    if _data_sources_model(version):
+        return {
+            "object": "database",
+            "id": did,
+            "title": synth.notion_rich_text(row["title"]),
+            "description": synth.notion_rich_text(row["content"]),
+            "parent": _database_parent(row),
+            "is_inline": False,
+            "database_type": None,
+            "in_trash": False,
+            "is_locked": False,
+            "created_time": synth.rfc3339(created),
+            "last_edited_time": synth.rfc3339(updated),
+            "data_sources": [{"id": row["data_source_id"], "name": row["title"]}],
+            "icon": _emoji_icon(row["icon"]),
+            "cover": _cover(row["cover"]),
+            "url": _object_url(did),
+            "public_url": None,
+            "archived": False,
+        }
+    return {
         "object": "database",
         "id": did,
+        "cover": _cover(row["cover"]),
+        "icon": _emoji_icon(row["icon"]),
         "created_time": synth.rfc3339(created),
-        "last_edited_time": synth.rfc3339(updated),
         "created_by": _partial_user(row["author_email"]),
         "last_edited_by": _partial_user(row["author_email"]),
+        "last_edited_time": synth.rfc3339(updated),
         "title": synth.notion_rich_text(row["title"]),
         "description": synth.notion_rich_text(row["content"]),
-        "icon": _emoji_icon(row["icon"]),
-        "cover": _cover(row["cover"]),
-        "parent": {"type": "workspace", "workspace": True},
-        "archived": False,
-        "in_trash": False,
         "is_inline": False,
         "database_type": None,
-        "is_locked": False,
+        "properties": _schema_props(row),
+        "parent": _database_parent(row),
         "url": _object_url(did),
         "public_url": None,
+        "in_trash": False,
+        "archived": False,
     }
-    if _data_sources_model(version):
-        # Real drops the two authors from a database under the data-sources model (measured
-        # 2026-09-30).
-        obj.pop("created_by")
-        obj.pop("last_edited_by")
-        obj["data_sources"] = [{"id": row["data_source_id"], "name": row["title"]}]
-    else:
-        obj["properties"] = _schema_props(row)
-    return obj
 
 
 def _data_source_obj(conn, row) -> dict:
-    """The data source real serves under `2025-09-03` (measured 2026-09-30): the
-    members `GET /v1/data_sources/{id}` answers, with `title` where Backlot used to send `name`
-    and no `name` at all."""
+    """The data source `GET /v1/data_sources/{id}` answers: the database as `parent`, the
+    database's own parent as `database_parent`, the database's URL as `url`, and the title as
+    `title`, with no `name`."""
     created = row["created_ts"]
     updated = row["updated_ts"] or created
     return {
         "object": "data_source",
         "id": row["data_source_id"],
-        "created_time": synth.rfc3339(created),
-        "last_edited_time": synth.rfc3339(updated),
+        "cover": _cover(row["cover"]),
+        "icon": _emoji_icon(row["icon"]),
+        "created_time": synth.rfc3339_millis(created),
         "created_by": _partial_user(row["author_email"]),
         "last_edited_by": _partial_user(row["author_email"]),
+        "last_edited_time": synth.rfc3339_millis(updated),
         "title": synth.notion_rich_text(row["title"]),
         "description": synth.notion_rich_text(row["content"]),
-        "icon": _emoji_icon(row["icon"]),
-        "cover": _cover(row["cover"]),
-        "parent": {"type": "database_id", "database_id": row["id"]},
-        "database_parent": {"type": "database_id", "database_id": row["id"]},
+        "is_inline": False,
         "database_type": None,
         "properties": _schema_props(row),
-        "archived": False,
-        "in_trash": False,
-        "is_inline": False,
+        "parent": {"type": "database_id", "database_id": row["id"]},
+        "database_parent": _database_parent(row),
+        "url": _object_url(row["id"]),
         "public_url": None,
-        "url": _object_url(row["data_source_id"]),
+        "in_trash": False,
+        "archived": False,
     }
 
 
@@ -660,9 +684,9 @@ def _data_source_obj(conn, row) -> dict:
 
 
 def _block_child(conn, page_row, block: dict) -> dict:
-    """A block of `blocks.children` in the twelve-member shape real serves (measured 2026-09-30):
-    the seven `synth.notion_blocks` emits plus the page parent, both timestamps in the measured
-    millisecond form and the two partial authors."""
+    """A block of `blocks.children` in the twelve members real serves (measured 2026-09-30): the
+    seven `synth.notion_blocks` emits plus the page parent, both timestamps in the millisecond form
+    and the two partial authors."""
     created = page_row["created_ts"]
     updated = page_row["updated_ts"] or created
     kind = block["type"]
@@ -676,9 +700,9 @@ def _block_child(conn, page_row, block: dict) -> dict:
         "last_edited_by": _partial_user(page_row["author_email"]),
         "has_children": block["has_children"],
         "in_trash": block["in_trash"],
-        "archived": block["archived"],
         "type": kind,
         kind: block[kind],
+        "archived": block["archived"],
     }
 
 
@@ -715,16 +739,16 @@ async def get_block(block_id: str, request: Request):
         {
             "object": "block",
             "id": bid,
-            "type": kind,
-            "has_children": row["subtype"] != "database",
-            "archived": False,
-            "in_trash": False,
+            "parent": _parent_field(conn, row, _version(request)),
             "created_time": synth.rfc3339_millis(row["created_ts"]),
             "last_edited_time": synth.rfc3339_millis(row["updated_ts"] or row["created_ts"]),
             "created_by": _partial_user(row["author_email"]),
             "last_edited_by": _partial_user(row["author_email"]),
-            "parent": _parent_field(conn, row, _version(request)),
+            "has_children": row["subtype"] != "database",
+            "in_trash": False,
+            "type": kind,
             kind: {"title": row["title"]},
+            "archived": False,
         },
     )
 
@@ -957,15 +981,14 @@ async def get_me(request: Request):
         {
             "object": "user",
             "id": synth.notion_user_id("bot:backlot"),
-            "type": "bot",
             "name": "backlot",
             "avatar_url": None,
+            "type": "bot",
             "bot": {
                 "owner": {"type": "workspace", "workspace": True},
                 "workspace_name": auth.acl(request).org_name,
                 "workspace_id": _workspace_id(auth.acl(request).org_name),
-                # The issue records the member, not the portal's plan limit; 5 MiB is the ceiling
-                # Notion publishes for a workspace's file uploads (read 2026-09-30).
+                # 5242880 on the free workspace measured on 2026-10-20.
                 "workspace_limits": {"max_file_upload_size_in_bytes": 5 * 1024 * 1024},
             },
         },
