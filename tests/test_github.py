@@ -11,6 +11,7 @@ import base64
 import hashlib
 import json
 import re
+import time
 from urllib.parse import quote
 
 import pytest
@@ -2683,6 +2684,42 @@ def test_github_an_unserved_operation_is_refused_for_its_credential_first(
         assert any(name.startswith("x-ratelimit-") for name in unversioned.headers), headers
 
 
+_NO_CREDENTIAL = "Requires authentication"
+
+
+@pytest.mark.parametrize(
+    "headers, status, message, echo, five",
+    [
+        ({}, 401, _NO_CREDENTIAL, "2022-11-28", True),
+        ({"X-GitHub-Api-Version": "2026-03-10"}, 401, _NO_CREDENTIAL, "2026-03-10", True),
+        ({"X-GitHub-Api-Version": "1999-01-01"}, 400, "Bad Request", None, True),
+        ({"Authorization": ""}, 401, _NO_CREDENTIAL, "2022-11-28", True),
+        ({"Authorization": "Digest x"}, 401, _NO_CREDENTIAL, "2022-11-28", True),
+        ({"Authorization": "Digest x", "X-GitHub-Api-Version": "1999-01-01"}, 400, "Bad Request",
+         None, True),
+        ({"Authorization": "Basic Zm9vOmJhcg=="}, 401, _NO_CREDENTIAL, "2022-11-28", True),
+        ({"Authorization": "Bearer\tnope"}, 401, "Bad credentials", None, True),
+        ({"Authorization": "Bearer nope"}, 401, "Bad credentials", None, False),
+        ({"Authorization": "Bearer nope", "X-GitHub-Api-Version": "1999-01-01"}, 401,
+         "Bad credentials", None, False),
+    ],
+)  # fmt: skip
+def test_github_deleting_the_installation_token_is_answered_as_a_served_route(
+    gh_client, headers, status, message, echo, five
+):
+    """Each row is real's answer as the comment on `refuse_an_unserved_operation` records it: the
+    status, the message, the version echo and whether the five `x-ratelimit-*` ride on it, and a
+    second request leaves `used` where the first put it."""
+    c, _ = gh_client
+    first = c.delete("/github/installation/token", headers=headers)
+    assert (first.status_code, first.json()["message"]) == (status, message), headers
+    assert first.headers.get("x-github-api-version-selected") == echo, headers
+    assert ("x-ratelimit-used" in first.headers) is five, headers
+    if five:
+        second = c.delete("/github/installation/token", headers=headers)
+        assert second.headers["x-ratelimit-used"] == first.headers["x-ratelimit-used"], headers
+
+
 def test_github_a_head_is_the_get_with_the_body_left_off(gh_client, gh_admin_h, gh_org):
     """Real answers a `HEAD` on each GitHub route measured as the `GET` with nothing in the body: the GET's
     status, its headers, `content-length` of the body the GET would have carried and `Link` where
@@ -4181,8 +4218,13 @@ def test_github_a_repo_qualifier_naming_nothing_is_refused_rather_than_widened(
 
 @pytest.mark.parametrize(
     "pinned, serves_removed_fields",
-    [(None, True), ("2022-11-28", True), ("2026-03-10", False)],
-    ids=["unpinned-defaults-to-2022-11-28", "2022-11-28", "2026-03-10"],
+    [(None, True), ("", True), ("2022-11-28", True), ("2026-03-10", False)],
+    ids=[
+        "unpinned-defaults-to-2022-11-28",
+        "empty-defaults-to-2022-11-28",
+        "2022-11-28",
+        "2026-03-10",
+    ],
 )
 def test_github_api_version_selects_the_payload(
     gh_client, gh_admin_h, gh_org, pinned, serves_removed_fields
@@ -4195,7 +4237,7 @@ def test_github_api_version_selects_the_payload(
     c, _ = gh_client
     from backlot import synth
 
-    h = {**gh_admin_h, **({"X-GitHub-Api-Version": pinned} if pinned else {})}
+    h = {**gh_admin_h, **({"X-GitHub-Api-Version": pinned} if pinned is not None else {})}
     num = synth.github_number("gh-pr-1")
     base = f"/github/repos/{gh_org}/gateway"
     for path, removed in (
@@ -4308,10 +4350,12 @@ def test_github_unsupported_api_version_is_refused_ahead_of_a_missing_credential
     version's 400 there where a supported version is `Requires authentication` (measured 2026-09-17,
     three runs of each).
 
-    Real sends no `Selected` echo on this 400 (it selected nothing), and does send one on a 404."""
+    The gateway sends no `Selected` echo on this 400; the pull and contents backend answer their
+    own (``test_github_version_error_depends_on_endpoint_and_representation``). A 404 does carry
+    the selected version."""
     c, _ = gh_client
     bad = {"X-GitHub-Api-Version": "1999-01-01"}
-    r = c.get(f"/github/repos/{gh_org}/gateway/pulls/1", headers=bad)
+    r = c.get(f"/github/repos/{gh_org}/gateway/issues/1", headers=bad)
     assert r.status_code == 400
     body = r.json()
     assert body["message"] == "Bad Request" and body["status"] == "400"
@@ -4326,6 +4370,196 @@ def test_github_unsupported_api_version_is_refused_ahead_of_a_missing_credential
     unversioned = c.get("/github/user/repos")
     assert unversioned.status_code == 401
     assert unversioned.json()["message"] == "Requires authentication"
+
+
+@pytest.mark.parametrize("pinned", ["1999-01-01", "garbage", "2022-11-29"])
+@pytest.mark.parametrize(
+    "path, accept, backend, backend_on_head",
+    [
+        ("pulls/1", None, True, False),
+        ("pulls/1", "*/*", True, False),
+        ("pulls/1", "application/json", True, False),
+        ("pulls/1", "application/vnd.github+json", True, False),
+        ("pulls/1", "application/vnd.github.v3+json", True, False),
+        ("pulls/1", "application/vnd.github.raw+json", True, False),
+        ("pulls/1", "application/vnd.github.full+json", True, False),
+        *[
+            ("pulls/1", f"application/vnd.github.{media}", False, False)
+            for media in ("diff", "v3.diff", "diff+json", "patch", "v3.patch", "patch+json")
+        ],
+        ("pulls/1", "application/vnd.github.diff, application/json", False, False),
+        ("pulls/1", "application/json, application/vnd.github.diff", False, False),
+        ("pulls/1", "application/vnd.github.v3.diff+json", False, False),
+        ("pulls/1", "application/vnd.github.sha", True, False),
+        *[
+            (path, accept, True, True)
+            for path in ("contents", "contents/README.md?ref=main")
+            for accept in (
+                None,
+                "*/*",
+                "application/json",
+                "application/vnd.github+json",
+                "application/vnd.github.raw",
+                "application/vnd.github.v3.raw",
+                "application/vnd.github.html",
+                "application/vnd.github.object",
+                "application/vnd.github.diff",
+            )
+        ],
+        ("readme", None, False, False),
+        ("readme/docs", None, False, False),
+        ("git/blobs/nope", None, False, False),
+        ("pulls/1/reviews", None, False, False),
+    ],
+)
+def test_github_version_error_depends_on_endpoint_and_representation(
+    gh_client, gh_admin_h, gh_org, pinned, path, accept, backend, backend_on_head
+):
+    """Which of the two 400s an unsupported version draws, by route, Accept and GET or HEAD
+    (``backlot.routers.github._validate_api_version``)."""
+    c, _ = gh_client
+    headers = {**gh_admin_h, "X-GitHub-Api-Version": pinned}
+    if accept is not None:
+        headers["Accept"] = accept
+    url = f"/github/repos/{gh_org}/gateway/{path}"
+    head = c.head(url, headers=headers)
+    assert head.status_code == 400 and head.content == b""
+    assert (head.headers.get("X-GitHub-Api-Version-Selected") == "") is backend_on_head
+    response = c.get(url, headers=headers)
+    assert response.status_code == 400
+    if backend:
+        assert response.json() == {
+            "message": (
+                f'The version you specified in the "X-GitHub-Api-Version" request header, "{pinned}", '
+                "is not a supported version. The following versions are currently supported: "
+                '"2026-03-10" (most recent), and "2022-11-28".'
+            )
+        }
+        assert response.headers["X-GitHub-Api-Version-Selected"] == ""
+        assert response.content.endswith(b"\n")
+    else:
+        assert response.json()["message"] == "Bad Request"
+        assert "errors" in response.json()
+        assert "X-GitHub-Api-Version-Selected" not in response.headers
+
+
+@pytest.mark.parametrize("path", ["pulls/1", "contents", "contents/no-such-path"])
+def test_github_backend_version_error_order(gh_client, path):
+    """Where the backend's 400 falls against a repository that does not exist and against the
+    credential (``backlot.routers.github._validate_api_version``)."""
+    c, _ = gh_client
+    url = f"/github/repos/no-such-owner/no-such-repo/{path}"
+    headers = {"X-GitHub-Api-Version": "garbage"}
+    response = c.get(url, headers=headers)
+    assert response.status_code == 400
+    assert set(response.json()) == {"message"}
+    assert response.headers["X-GitHub-Api-Version-Selected"] == ""
+    response = c.get(url, headers={**headers, "Authorization": "Bearer nope"})
+    assert response.status_code == 401
+    assert response.json()["message"] == "Bad credentials"
+    assert "X-GitHub-Api-Version-Selected" not in response.headers
+
+
+def _sent_raw(client, path: str, headers: dict[str, bytes]):
+    """A GET on ``path`` with each header's bytes as they are, which
+    ``tests.test_atlassian._sent_as`` says why the TestClient does not."""
+    import asyncio
+
+    import httpx
+
+    async def send():
+        transport = httpx.ASGITransport(app=client.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as raw:
+            return await raw.get(path, headers=headers)
+
+    return asyncio.run(send())
+
+
+#: Each version sent, as bytes, and the quoted value real's backend wrote in its `message`, as the
+#: bytes of its JSON (``backlot.routers.github._go_quoted`` has the measurement).
+_GO_QUOTED_VERSIONS = [
+    (b'<a>&"b"\\c', b'\\"\\u003ca\\u003e\\u0026\\\\\\"b\\\\\\"\\\\\\\\c\\"'),
+    (b"a\tb", b'\\"a\\\\tb\\"'),
+    (b"a\x80b", b'\\"a\\\\x80b\\"'),
+    (b"a\xffb", b'\\"a\\\\xffb\\"'),
+    (b"a\xc3b", b'\\"a\\\\xc3b\\"'),
+    (b"a\xc0\xafb", b'\\"a\\\\xc0\\\\xafb\\"'),
+    (b"a\xed\xa0\x80b", b'\\"a\\\\xed\\\\xa0\\\\x80b\\"'),
+    (b"a\xc3\xa9b", b'\\"a\xc3\xa9b\\"'),
+    (b"a\xef\xbf\xbdb", b'\\"a\xef\xbf\xbdb\\"'),
+    (b"a\xf0\x9f\x98\x80b", b'\\"a\xf0\x9f\x98\x80b\\"'),
+    (b"a\xcc\x81b", b'\\"a\xcc\x81b\\"'),
+    (b"a\xc2\xa0b", b'\\"a\\\\u00a0b\\"'),
+    (b"a\xe2\x80\xa8b", b'\\"a\\\\u2028b\\"'),
+    (b"a\xe2\x80\x8bb", b'\\"a\\\\u200bb\\"'),
+    (b"a\xee\x80\x80b", b'\\"a\\\\ue000b\\"'),
+    (b"a\xef\xbf\xbfb", b'\\"a\\\\uffffb\\"'),
+    (b"a\xf4\x8f\xbf\xbfb", b'\\"a\\\\U0010ffffb\\"'),
+]
+
+
+@pytest.mark.parametrize("sent, quoted", _GO_QUOTED_VERSIONS)
+def test_github_backend_version_error_quotes_the_value_as_go_does(
+    gh_client, gh_admin_h, gh_org, sent, quoted
+):
+    """The backend's 400 bytes for a value its quoting and escaping change
+    (``backlot.routers.github._go_quoted``, ``backlot.errors.github.rendered``)."""
+    c, _ = gh_client
+    headers = {"Authorization": gh_admin_h["Authorization"].encode(), "X-GitHub-Api-Version": sent}
+    response = _sent_raw(c, f"/github/repos/{gh_org}/gateway/contents/README.md", headers)
+    assert response.status_code == 400
+    assert response.content == (
+        b'{"message":"The version you specified in the \\"X-GitHub-Api-Version\\" request '
+        b"header, " + quoted + b", is not a supported version. The following versions are "
+        b'currently supported: \\"2026-03-10\\" (most recent), and \\"2022-11-28\\"."}\n'
+    )
+
+
+def test_github_every_answer_carries_a_request_id(gh_client, gh_admin_h, gh_org, monkeypatch):
+    """Real puts an `x-github-request-id` on every answer, served or refused, code search's
+    included, and its last field is the request's own second (the measurement is in
+    ``backlot.routers.github.request_id``, the answers below among it). A client that logs it for a
+    support ticket has nothing to log without it."""
+    from backlot.routers import github as gh
+
+    c, _ = gh_client
+    shape = re.compile(r"[0-9A-F]{4}:[0-9A-F]{4,6}:[0-9A-F]{6,7}:[0-9A-F]{6,7}:[0-9A-F]{8}")
+    repo = f"/github/repos/{gh_org}/gateway"
+    before = int(time.time())
+    answers = [
+        (c.get(repo, headers=gh_admin_h), 200),
+        (c.get("/github/rate_limit", headers=gh_admin_h), 200),
+        (c.get("/github/user/repos", headers=gh_admin_h), 200),
+        (c.head(repo, headers=gh_admin_h), 200),
+        (c.get(repo, headers={**gh_admin_h, "X-GitHub-Api-Version": "1999-01-01"}), 400),
+        (c.get("/github/user/repos"), 401),
+        (c.get(f"/github/repos/{gh_org}/ghost", headers={"Authorization": "Bearer nope"}), 401),
+        (c.get("/github/nonexistent-route-zz", headers=gh_admin_h), 404),
+        (c.get(f"{repo}/", headers=gh_admin_h), 404),
+        (c.get(f"{repo}/commits/", headers=gh_admin_h), 422),
+        (c.get("/github/search/code", headers=gh_admin_h, params={"q": "helper"}), 200),
+        (c.get("/github/search/code", params={"q": "helper"}), 401),
+    ]
+    # a spent window's refusal, which the rate-limit middleware answers before any route runs
+    monkeypatch.setitem(gh.RATE_LIMITS, "core", gh._ResourceLimit(1, 5000, gh.RATE_LIMIT_WINDOW))
+    monkeypatch.setitem(
+        gh.RATE_LIMITS, "search", gh._ResourceLimit(1, 30, gh.SEARCH_RATE_LIMIT_WINDOW)
+    )
+    c.app.state.github_rate_limits = gh.RateLimitWindows()
+    for path, params in ((repo, None), ("/github/search/issues", {"q": "x"})):
+        c.get(path, params=params)
+        answers.append((c.get(path, params=params), 403))
+    after = int(time.time())
+    for r, status in answers:
+        assert r.status_code == status, r.request.url
+        rid = r.headers["x-github-request-id"]
+        assert shape.fullmatch(rid), rid
+        assert before <= int(rid.rsplit(":", 1)[1], 16) <= after, rid
+    # seeded from the request: the same request gets the same first four fields
+    first = c.get(repo, headers=gh_admin_h).headers["x-github-request-id"]
+    again = c.get(repo, headers=gh_admin_h).headers["x-github-request-id"]
+    assert first.rsplit(":", 1)[0] == again.rsplit(":", 1)[0]
+    assert c.get("/health").headers.get("x-github-request-id") is None
 
 
 # --- a pull is a pull, not an issue with extra keys -------------
@@ -5900,11 +6134,19 @@ def test_github_every_response_carries_the_five_ratelimit_headers_and_rate_limit
         over = c.get(repo, headers=h)
         assert over.status_code == 403
         # The envelope's shape and `documentation_url` are real's for a TOKEN — three members,
-        # `status` included, and its own anchor; see `_rate_limit_exceeded_message` for the
-        # measurement and why `message`'s tail past the "user ID <id>." prefix is unreproduced.
+        # `status` included, and its own anchor; `message` quotes the answer's own request id and
+        # that id's second (see `_rate_limit_exceeded_message`).
         admin_id = synth.github_user_id("admin")
+        rid = over.headers["x-github-request-id"]
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(int(rid.rsplit(":", 1)[1], 16)))
         assert over.json() == {
-            "message": f"API rate limit exceeded for user ID {admin_id}.",
+            "message": (
+                f"API rate limit exceeded for user ID {admin_id}. If you reach out to GitHub "
+                f"Support for help, please include the request ID {rid} and timestamp {stamp} UTC. "
+                "For more on scraping GitHub and how it may affect your rights, please review our "
+                "Terms of Service (https://docs.github.com/en/site-policy/github-terms/"
+                "github-terms-of-service)"
+            ),
             "documentation_url": (
                 "https://docs.github.com/en/rest/using-the-rest-api/"
                 "getting-started-with-the-rest-api#rate-limiting"

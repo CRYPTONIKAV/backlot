@@ -636,9 +636,49 @@ async def gmail_label_get(user_id: str, label_id: str, request: Request):
     return _label_obj(label_id, (messages, threads) if label_id == _GMAIL_DEFAULT_LABEL else (0, 0))
 
 
-# The lookbehinds are the four `_GMAIL_ADDRESS_KEYS`; their comment says why.
+# The operators that read the word after whitespace as their value. Measured on a Workspace
+# mailbox: on 2026-10-16, `from: <word>`, `bcc: <word>`, `to:<tab><word>`, `From: <word>` and
+# `TO: <word>` answered the ids the operator answers with no whitespace, and `to: from: bcc:`
+# answered nothing; on 2026-10-17, so did `subject:`, `label:` and `in:` after a space or a tab
+# (`subject:` after two spaces or a no-break space too), and `after:`, `before:`, `newer:` and
+# `older:` after one space or three. A tab after those four leaves the operator empty:
+# `after:<tab>1` answered the messages holding both search terms `after` and `1`. `has:`,
+# `newer_than:`, `older_than:` and `larger:` read nothing after a space: `has: attachment` answered
+# nothing where `has:attachment` answered 160 messages. On 2026-10-19 a pair of quotes holding
+# nothing or only spaces read as whitespace after each operator `_GMAIL_SPACED` names:
+# `label:"" probe`, `subject:" " probe`, `from:"" <word>` and `cc:""<word>` answered what
+# `label: probe`, `subject: probe`, `from: <word>` and `cc: <word>` answer, and `<word> to:""` what
+# `<word>` alone answers.
+_GMAIL_SPACED = (
+    r"(?<=\bfrom:)|(?<=\bto:)|(?<=\bcc:)|(?<=\bbcc:)|(?<=\bsubject:)|(?<=\blabel:)|(?<=\bin:)"
+)
+_GMAIL_DATED = r"(?<=\bafter:)|(?<=\bbefore:)|(?<=\bnewer:)|(?<=\bolder:)"
+# An empty operator `_GMAIL_OP` drops, so that the operator after it applies. Measured on a
+# Workspace mailbox of 625 messages on 2026-10-19, comparing `messages.list` id sets
+# (`threads.list` answered the ten queries sent to it alike):
+#
+#   dropped   an empty `subject:`, `from:`, `to:`, `cc:` or `bcc:` with spaces, a tab, a pair of
+#             quotes holding nothing or spaces, or nothing at all after it, and an empty `label:` or
+#             `in:` with any of those except nothing, in any letter case, before `label:`, `in:`,
+#             `has:`, `after:`, `before:`, `newer:`, `older:`, `newer_than:` or `older_than:` whose
+#             value starts right after its colon, or after spaces for the four date operators:
+#             `subject:label:inbox`, `bcc:""in:sent`, `label:" "label:inbox`,
+#             `SUBJECT: NEWER_THAN:30d` and `in: before: 2026/10/01` answered the ids of the
+#             operator after the empty one
+#   kept      before `subject:`, `from:`, `to:`, `cc:` or `bcc:`, before one of those nine whose
+#             value is empty, quoted or (for the five that are not dates) after a space, before a
+#             date operator whose value is `-`, and with a no-break space after it:
+#             `subject: from:me`, `label: label:""`, `in: label:"inbox"`, `from: label: inbox`,
+#             `subject: after:-` and `subject:<no-break space>label:inbox` answered nothing, and
+#             `_GMAIL_OP` reads the next word as the empty operator's value
+_GMAIL_EMPTY_BEFORE = (
+    r'(?:(?:subject|from|to|cc|bcc):|(?:label|in):(?=[ \t"]))(?:[ \t]|"[ \t]*")*'
+    r'(?=(?:label|in|has|newer_than|older_than):[^\s"]|(?:after|before|newer|older): *[^\s"-])'
+)
 _GMAIL_OP = re.compile(
-    r'(\w+):(?:(?:(?<=\bfrom:)|(?<=\bto:)|(?<=\bcc:)|(?<=\bbcc:))\s*)?("[^"]*"|\S*)', re.IGNORECASE
+    rf'(?:{_GMAIL_EMPTY_BEFORE})?(\w+):(?:(?:{_GMAIL_SPACED})(?:\s|"\s*")*|(?:{_GMAIL_DATED}) *)?'
+    r'("[^"]*"|\S*)',
+    re.IGNORECASE,
 )
 # operators we honor; anything else stays as free text
 _GMAIL_KEYS = {
@@ -664,14 +704,17 @@ _GMAIL_KEYS = {
 # `newer`, as an empty `after:` is `after`, and `_GMAIL_OP` leaves both in the free text.
 _GMAIL_KEY_ALIASES = {"newer": "after", "older": "before"}
 # The address operators. A Gmail search ignores one with no value rather than searching it as free
-# text, and reads the word after whitespace as its value. Measured on a Workspace mailbox: `to:`,
-# `from:` and `bcc:` with no value answered every message, as no `q` does (2026-10-14), and so did
-# `cc:`, `from:""` and `to:""` (2026-10-16). On 2026-10-16, `from: <word>`, `bcc: <word>`,
-# `to:<tab><word>`, `From: <word>` and `TO: <word>` answered the ids the operator answers with no
-# whitespace, and `to: from: bcc:` answered nothing. `has: attachment` and `newer_than: 7d` answered
-# nothing where `has:attachment` and `newer_than:7d` answered 160 and 36 messages, so `_GMAIL_OP`
-# reads across whitespace for these four alone.
+# text. Measured on a Workspace mailbox: `to:`, `from:` and `bcc:` with no value answered every
+# message, as no `q` does (2026-10-14), and so did `cc:`, `from:""` and `to:""` (2026-10-16).
 _GMAIL_ADDRESS_KEYS = {"from", "to", "cc", "bcc"}
+# The operators a search ignores when they have no value, as it ignores an address operator with
+# none, where a bare `after:`, `before:`, `newer:` or `older:` is the word it spells. Measured on a
+# Workspace mailbox, comparing `messages.list` id sets with those of no `q`: on 2026-10-17,
+# `subject:`, `label:` and `in:` answered every message, with a space after the colon or none,
+# where `subject`, `label` and `in` alone did not; on 2026-10-18 so did `subject:""`, `label:""`
+# and `in:""`, a tab or two spaces after the colon, and `SUBJECT:`. `probe label:` answered as
+# `probe` does, and `threads.list` answered each of the three with every thread.
+_GMAIL_DROPPED_WHEN_EMPTY = {"subject", "label", "in"}
 # The operators whose value a `+` ends. Measured on a Workspace mailbox on 2026-10-15:
 # `cc:<local>+<word>`, `from:<local>+update` and `to:<local>+update` answered the ids of the
 # operator with `+<word>` sent as a search term of its own; `cc:<local>+`, `cc:<local>++` and
@@ -722,6 +765,19 @@ _GMAIL_DATE_KEYS = {"after", "before"}
 _GMAIL_SECONDS_MAX = 253402300800
 _GMAIL_DATE = re.compile(r"([0-9]+)([/-])([0-9]+)\2([0-9]+)")
 _GMAIL_NEGATED_DATE = re.compile(r"(?<!\S)-(after|before|newer|older): *(\S+)", re.IGNORECASE)
+# A `-` in front of an address operator, or in front of its value, negates it. Measured on a
+# Workspace mailbox, comparing `messages.list` id sets: on 2026-10-17, `-from:<word>` and
+# `from:-<word>` each answered the messages `from:<word>` does not, and so did `to:` and `cc:`, for
+# three words on each operator and for 15 hyphenated local parts sent as `from:-<local part>`. On
+# 2026-10-18, so did `bcc:`, and on all four operators `-from: <word>`, `from: -<word>`,
+# `-from:-<word>`, `--from:<word>`, `from:--<word>`, `-FROM:<word>`, `-from:"<word>"`, a whole
+# address, an `@<domain>` and `me`; `from:"-<word>"` answered as `from:<word>`, and `-from:`,
+# `from:-`, `-from:-`, `from:--` and `-from:""` every message. Another operator keeps the `-` in its
+# value: `label:-` answered nothing. Not modelled: `- from:<word>` answered as `from:<word>`, where
+# the `-` standing alone is searched here as a term, and `from:-<word>+update` answered every
+# message, where `-from:<word>+update` answered the messages of `+update` that `from:<word>` leaves
+# out. A negated value is stored under its key with a `-` in front.
+_GMAIL_NEGATED_ADDRESS = re.compile(r"(?<!\S)-+(from|to|cc|bcc):\s*", re.IGNORECASE)
 _GMAIL_NEGATION = {"after": "before", "before": "after", "newer": "older", "older": "newer"}
 
 
@@ -765,6 +821,8 @@ def _parse_gmail_q(q: str) -> tuple[str, dict]:
             key = _GMAIL_KEY_ALIASES.get(key, key)
             value = m.group(2)
             if not value and key not in _GMAIL_ADDRESS_KEYS:
+                if key in _GMAIL_DROPPED_WHEN_EMPTY:
+                    return " "
                 return m.group(0)
             if key in _GMAIL_DATE_KEYS:
                 if value == "-":
@@ -772,6 +830,11 @@ def _parse_gmail_q(q: str) -> tuple[str, dict]:
                 read = _gmail_q_date(value)
                 ops.setdefault(_GMAIL_NOTHING if read is None else key, []).append(read or value)
                 return " "
+            stored = key
+            if key in _GMAIL_ADDRESS_KEYS and value.startswith("-"):
+                value, stored = value.lstrip("-"), f"-{key}"
+                if not _GMAIL_ADDRESS_WORD.search(value):
+                    return " "
             if key in _GMAIL_PLUS_ENDS and not value.startswith('"'):
                 value = value.lstrip("+")
                 if re.search(r"[^@]@", value):
@@ -782,13 +845,18 @@ def _parse_gmail_q(q: str) -> tuple[str, dict]:
                         ops.setdefault(_GMAIL_NOTHING, []).append(value)
                         return " "
                     if plus:
-                        ops.setdefault(key, []).append(value)
+                        ops.setdefault(stored, []).append(value)
                         return f" +{term} "
-            ops.setdefault(key, []).append(value.strip('"'))
+            # A quoted address value keeps its quotes, which `_gmail_address_match` reads.
+            quoted = (
+                key in _GMAIL_ADDRESS_KEYS and len(value) > 1 and value[:1] == value[-1:] == '"'
+            )
+            ops.setdefault(stored, []).append(value if quoted else value.strip('"'))
             return " "
         return m.group(0)
 
     q = _GMAIL_NEGATED_DATE.sub(_gmail_negated_date, q)
+    q = _GMAIL_NEGATED_ADDRESS.sub(lambda m: f"{m.group(1)}:-", q)
     free = re.sub(r"\s+", " ", _GMAIL_OP.sub(_take, q)).strip()
     # A `+` standing alone is no search term, and a word ending in one matches nothing (the
     # measurement at `_GMAIL_PLUS_ENDS`).
@@ -852,6 +920,8 @@ def _resolve_relative_dates(ops: dict) -> dict:
 _GMAIL_ADDRESS_WORD = re.compile(r"[\w&]+")
 _GMAIL_ONE_ADDRESS = re.compile(r"[^@\s]+@[^@\s]+")
 _GMAIL_ADDRESS = re.compile(r"[\w.+'-]+@[\w-]+(?:\.[\w-]+)+")
+# What keeps a hyphenated value from being read joined as well (`_gmail_address_match`).
+_GMAIL_UNJOINED = re.compile(r"--|[\w&]\.[\w&]")
 
 
 def _gmail_address_match(header: str | None, value: str) -> bool:
@@ -863,7 +933,12 @@ def _gmail_address_match(header: str | None, value: str) -> bool:
     where `len`, `ena`, `par` and `com.acme` do not. `_` joins the characters around it into one
     word, so `ops` does not match `ops_team@corp.example`, and `&` counts as a word character too,
     where the rest of ASCII punctuation does not. A value with no word in it, such as `.`, `@` or
-    `""`, is ignored and matches every message, a message without the header included.
+    `""`, is ignored and matches every message, a message without the header included. A value
+    with a hyphen matches its words joined as well (`no-reply` finds `noreply@` beside
+    `no-reply@`, `jt-snowball` finds `@jtsnowball.com`) unless it holds `--` or a `.` between two
+    word characters (`jt-snowball.com` is its three words alone); a joined value does not find the
+    hyphenated spelling. A quoted value is matched without its quotes and with no joined spelling:
+    `from:"no-reply"` finds `no-reply@` and not `noreply@`.
 
     Measured on a Workspace mailbox of 595 messages on 2026-10-15: 113 searches on `cc:` and
     `bcc:`, compared with the headers of every message, all match this rule, and of the 32 ASCII
@@ -871,17 +946,40 @@ def _gmail_address_match(header: str | None, value: str) -> bool:
     every message. On the same mailbox at 601 messages on 2026-10-16, 122 of 124 `from:` and `to:`
     searches built from its own addresses, local parts, domains and display-name words match this
     rule over `From`, and over `To`, `Cc` and `Bcc` together; `to:me` counts the four messages
-    where the caller is in `Bcc` alone. The other two are a hyphenated value, which real also reads
-    joined (`no-reply` finds `noreply@` as well as `no-reply@`), and part of a Korean display
-    name. On 2026-10-14, `cc:<a local part>+x` read `+x` as a search term of its own."""
+    where the caller is in `Bcc` alone. The other two are a hyphenated value, read joined as above,
+    and part of a Korean display name. At 603 messages on 2026-10-17, the 311 `from:`, `to:` and
+    `cc:` searches with a hyphen in them (a header's words split by one hyphen and by two, into two
+    and three parts, beside an `@` or a `.`, and each hyphenated local part whole and in pairs),
+    none quoted and none led by `-`, match this rule, and at 604 on 2026-10-18 so did `bcc:` on a
+    word of the one `Bcc` address there, split by one hyphen and by two and beside a `.`. At 624
+    on 2026-10-19 so did 444 searches on the four operators, compared with the headers of every
+    message in `messages.list` and `threads.list`: 27 words of five letters or more from the
+    mailbox's local parts, domain labels and display names, each whole, split by a hyphen, both of
+    those quoted, and the quoted two negated; the 7 domain labels among them split after an `@`,
+    quoted and not; and the 37 local parts the mailbox holds that are letters and digits joined by
+    `-`, each whole, joined, both of those quoted, negated quoted and not, and quoted with its
+    domain and as `@<domain>`. A value led by `-` is the negation the comment at
+    `_GMAIL_NEGATED_ADDRESS` measures. On 2026-10-14, `cc:<a local part>+x` read `+x` as a search
+    term of its own."""
     header = (header or "").lower()
     value = value.lower()
+    # A value the parser kept its quotes around is read alone: no joined spelling beside its words.
+    quoted = len(value) > 1 and value[:1] == value[-1:] == '"'
+    if quoted:
+        value = value[1:-1]
     if _GMAIL_ONE_ADDRESS.fullmatch(value):
         return value in _GMAIL_ADDRESS.findall(header)
     words, have = _GMAIL_ADDRESS_WORD.findall(value), _GMAIL_ADDRESS_WORD.findall(header)
     if not words:
         return True
-    return any(have[i : i + len(words)] == words for i in range(len(have) - len(words) + 1))
+    alternatives = [words]
+    if not quoted and "-" in value and not _GMAIL_UNJOINED.search(value):
+        alternatives.append(_GMAIL_ADDRESS_WORD.findall(value.replace("-", "")))
+    return any(
+        have[i : i + len(option)] == option
+        for option in alternatives
+        for i in range(len(have) - len(option) + 1)
+    )
 
 
 def _gmail_op_match(row, ops: dict) -> bool:
@@ -896,6 +994,16 @@ def _gmail_op_match(row, ops: dict) -> bool:
     for key in ("cc", "bcc"):
         for v in ops.get(key, []):
             if not _gmail_address_match(row[key], v):
+                return False
+    for v in ops.get("-from", []):
+        if _gmail_address_match(row["author_email"], v):
+            return False
+    for v in ops.get("-to", []):
+        if any(_gmail_address_match(row[k], v) for k in ("to_addr", "cc", "bcc")):
+            return False
+    for key in ("cc", "bcc"):
+        for v in ops.get(f"-{key}", []):
+            if _gmail_address_match(row[key], v):
                 return False
     for v in ops.get("subject", []):
         if v.lower() not in (row["title"] or "").lower():
@@ -929,9 +1037,11 @@ def _gmail_query(conn, mailbox, ids, q: str, caller_email: str | None = None) ->
     present; otherwise the mailbox listing). The caller paginates the returned rows."""
     free, ops = _parse_gmail_q(q)
     if caller_email:
-        for key in ("from", "to", "cc", "bcc"):
+        # `me` reads through quotes: on 2026-10-19, `op:"me"` and `-op:"me"` answered what `op:me`
+        # and `-op:me` answer on each address operator.
+        for key in ("from", "to", "cc", "bcc", "-from", "-to", "-cc", "-bcc"):
             if key in ops:
-                ops[key] = [caller_email if v.lower() == "me" else v for v in ops[key]]
+                ops[key] = [caller_email if v.strip('"').lower() == "me" else v for v in ops[key]]
     ops = _resolve_relative_dates(ops)  # newer_than:/older_than: -> absolute after:/before: bounds
     if free:
         # Honor a fully "quoted" free-text term as a phrase (Gmail's quote semantics): match the
@@ -2052,12 +2162,12 @@ def _drive_folder_obj(conn, name: str, me: str | None = None) -> dict:
         "webViewLink": f"https://drive.google.com/drive/folders/{fid}",
         "iconLink": "https://drive.google.com/icons/folder.png",
         "capabilities": {
-            "canDownload": False,
+            "canDownload": True,
             "canListChildren": True,
             "canComment": False,
             "canEdit": False,
             "canCopy": False,
-            "canShare": True,
+            "canShare": False,
             "canRename": False,
             "canTrash": False,
             "canDelete": False,
@@ -2755,6 +2865,10 @@ async def drive_files_get(file_id: str, request: Request):
         # cannot see with the 404 notFound an id that names nothing gets, `fields` mask or not.
         name = _drive_folder_name_by_id(conn, file_id)
         if name is not None and store.drive_folder_has_visible(conn, name, ids):
+            # Measured 2026-10-16: a visible folder cannot be downloaded, just as a native
+            # Docs Editors file cannot; a folder the caller cannot see remains a 404.
+            if gerr.alt_format(request.query_params) == "media":
+                raise gerr.not_downloadable()
             keys = _drive_get_field_keys(gerr.first_repeat(request.query_params, "fields"))
             return _drive_project([_drive_folder_obj(conn, name, caller.email)], keys)[0]
         raise gerr.not_found_file(file_id)
@@ -2908,8 +3022,7 @@ async def drive_files_permissions(file_id: str, request: Request):
 # The Office row is narrower than the widely-cited bug reports (googlesheets4#275 and friends)
 # suggest — they only ever show the family that matches. Measured both ways: .xlsx -> Sheets and
 # .docx -> Docs give the Office message, while .xlsx -> Docs and .docx -> Sheets give the plain
-# invalid-argument one. `.pptx -> Slides` follows the confirmed pattern but was not itself
-# measured; no .pptx was available in the probed account.
+# invalid-argument one. `.pptx -> Slides` gives the Office message too, measured on 2026-10-10.
 EDITOR_NOT_FOUND = "Requested entity was not found."
 EDITOR_INVALID_ARG = "Request contains an invalid argument."
 EDITOR_OFFICE = (
@@ -2932,19 +3045,18 @@ def _editor_doc(request: Request, file_id: str, *, expect: str):
     reading a Doc through the Sheets API answers 200 with prose sliced into a "grid", plausible
     enough that a client trusts it rather than noticing the id was wrong.
 
-    Sheets and Docs resolve the stored type before visibility: a hidden file of their own type is
-    permission-denied, while a hidden file of another type gets that type's usual answer. Measured
-    on 2026-10-06, and for an Office file on 2026-10-09. Slides was not measured and resolves
-    visibility first."""
+    Sheets, Docs and Slides resolve the stored type before visibility: a hidden file of their own
+    type is permission-denied, while a hidden file of another type gets that type's usual answer.
+    Measured on 2026-10-06, for an Office file on 2026-10-09, and through Slides on 2026-10-10 and
+    2026-10-17."""
     conn = auth.conn(request)
     caller = _require(request)
     ids = auth.visible_ids(request, caller)
-    type_before_acl = expect in {"document", "spreadsheet"}
     # A native Doc/Sheet/Slides id is the SAME id space as Drive's own file id --
     # real Google resolves docs.googleapis.com/etc. off the identical Drive file id, so this has
-    # to resolve the file's own id. Sheets and Docs need the unscoped row to distinguish a missing
-    # id from a stored file that this caller cannot see.
-    row = store.gdrive_by_id(conn, file_id, visible_ids=None if type_before_acl else ids)
+    # to resolve the file's own id, unscoped, to distinguish a missing id from a stored file that
+    # this caller cannot see.
+    row = store.gdrive_by_id(conn, file_id, visible_ids=None)
     if row is None:
         # Folders are synthesized rather than stored, so they miss the lookup above. Real Google
         # calls a folder an invalid argument, not a missing entity, so resolve it before giving up.
@@ -2955,7 +3067,7 @@ def _editor_doc(request: Request, file_id: str, *, expect: str):
     # here too — the fallback stays in one place rather than being decided per route.
     subtype = row["subtype"] or "document"
     if subtype == expect:
-        if type_before_acl and store.gdrive_by_id(conn, file_id, visible_ids=ids) is None:
+        if store.gdrive_by_id(conn, file_id, visible_ids=ids) is None:
             raise gerr.permission_denied()
         return row
     if subtype in _EDITOR_NATIVE:  # a different Workspace type: not this API's entity at all
@@ -4796,12 +4908,12 @@ def _drive_file(conn, row, shared: bool | None = None, me: str | None = None) ->
         "webViewLink": view,
         "iconLink": f"https://drive.google.com/icons/{(row['subtype'] or 'document')}.png",
         "capabilities": {
-            "canDownload": not is_folder,
+            "canDownload": True,
             "canListChildren": is_folder,
             "canComment": not is_folder,
             "canEdit": False,
             "canCopy": not is_folder,
-            "canShare": True,
+            "canShare": _drive_owned_by(author, me),
             "canRename": False,
             "canTrash": False,
             "canDelete": False,

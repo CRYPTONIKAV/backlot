@@ -28,6 +28,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi import Path as PathParameter
 from fastapi.responses import Response
 from pydantic import BaseModel, ConfigDict
+from starlette.convertors import PathConvertor, register_url_convertor
 from starlette.routing import Match
 
 from backlot import auth, store, synth
@@ -217,6 +218,12 @@ _P_CONTENT_CHILD = {"parameters": [qp("limit", "integer"), qp("start", "integer"
 _JIRA_COMMENT_PAGE_MAX = 100
 _JIRA_ORDER_FIELD = "created"
 
+# Java's `^([+-]?)\s*(.*)$` under `find`: `\s` is the six ASCII spaces, `.` stops at a line
+# terminator, and `$` matches at the end or before one final line terminator (`_jira_order_desc`).
+_JIRA_ORDER = re.compile(
+    "([+-]?)[ \t\n\x0b\x0c\r]*([^\n\r\x85\u2028\u2029]*)(?:\r\n|[\n\r\x85\u2028\u2029])?\\Z"
+)
+
 
 def _jira_order_desc(raw: str) -> bool:
     """Whether ``orderBy`` asks for the reverse, or Jira's 400 for a field it does not order by.
@@ -230,14 +237,24 @@ def _jira_order_desc(raw: str) -> bool:
     the ascending spelling Atlassian's own document writes — arrives here as `" created"`. Real
     Jira answers 200 to it, so stripping is what matches rather than a special case for `+`.
 
+    Real's answers fit Java reading the value, though Jira does not say so: `String.trim` (every
+    character up to U+0020 off both ends, as :func:`_jira_project_order` measured on
+    `project/search`), then the pattern `^([+-]?)\\s*(.*)$` (:data:`_JIRA_ORDER`), whose `\\s` is
+    ASCII and whose `.` and `$` stop at a line terminator. Measured against Jira Cloud on the
+    comment read (2026-10-16 and 2026-10-17): `%01created`, `created%01` and `%01-created` are 200;
+    after the sigil `%20`, `%09`, `%0A`, `%0B`, `%0C` and `%0D` go and `%01`, `%1F`, a no-break
+    space and an em space stay (`-%01created` names U+0001 and `created`); a no-break space or an em
+    space in front stays in the field too; one line terminator at the end goes (`created%C2%85` is
+    200) and one anywhere else matches nothing, so the 400 names the value whole, sigil and all
+    (`-%C2%85created`, `-cre%0Aated`).
+
     An EMPTY value is refused, not read as absent: the field it leaves is the empty string, and
     real Jira answers 400 to `?orderBy=`.
     """
-    field = raw.strip()
+    field = raw.strip(_JAVA_TRIMMED)
     desc = False
-    if field[:1] in ("+", "-"):
-        desc = field[0] == "-"
-        field = field[1:].strip()
+    if (m := _JIRA_ORDER.match(field)) is not None:
+        desc, field = m[1] == "-", m[2]
     if field.casefold() != _JIRA_ORDER_FIELD:
         # Backlot's own sentence, not a transcription: Jira localises this one to the account's
         # language, and the account it was measured against answers in Korean.
@@ -498,8 +515,15 @@ def _jira_project_order(raw: str) -> None:
     )
 
 
-@router.get("/rest/api/3/project/search")
+@router.get(
+    "/rest/api/3/project/search",
+    openapi_extra={"parameters": [qp("startAt", "integer"), qp("maxResults", "integer")]},
+)
 async def jira_project_search(request: Request):
+    # Jira Cloud, measured 2026-10-16: integer conversion precedes orderBy;
+    # startAt is a long floored at zero, and maxResults is clamped to 1..100.
+    start = max(0, _int_param(request, "startAt", 0, width=JAVA_LONG))
+    limit = min(100, max(1, _int_param(request, "maxResults", 50)))
     # Read for the refusal above. The sort itself is not served, so `orderBy` stays undeclared:
     # `qp` is for a parameter Backlot honours, and advertising this one would offer a client an
     # order the listing never applies. `backlot diff --source jira` keeps the gap.
@@ -525,7 +549,52 @@ async def jira_project_search(request: Request):
                 "self": f"{_site(request)}/rest/api/3/project/{key}",
             }
         )
-    return {"values": values, "maxResults": 50, "startAt": 0, "total": len(values), "isLast": True}
+    total = len(values)
+    page = values[start : start + limit]
+    answer = {"self": _project_search_link(request, start, limit)}
+    if start + len(page) < total:
+        answer["nextPage"] = _project_search_link(request, start + limit, limit)
+    return answer | {
+        "maxResults": limit,
+        "startAt": start,
+        "total": total,
+        "isLast": start + len(page) >= total,
+        "values": page,
+    }
+
+
+def _project_search_link(request: Request, start: int, limit: int) -> str:
+    """`project/search`'s `self` at ``start``, and its `nextPage` at the page after: every parameter
+    the request sent but `startAt` and `maxResults`, each value of a repeated one, by its name and
+    value as sent (`a%2Bb`, `a+b`, `b%6Fgus`; a bare `bogus` as `bogus=`, and `=x` as `x=`), then
+    `maxResults` and `startAt` as read. Real lists them in the order a `java.util.HashMap` holding
+    them in that order iterates: by the bucket each name's `String.hashCode` spreads to, over
+    sixteen buckets doubled while the map is more than three quarters full, and in the order put
+    within a bucket (`maxResults=1&Zeta=1&alpha=2` links `Zeta=1&maxResults=1&alpha=2&startAt=0`).
+    Measured 2026-10-17 on a site of one project and on ecosystem.atlassian.net (100 projects,
+    anonymous), where `nextPage` came with every page but the last."""
+    params: dict[str, list[str]] = {}
+    for piece in request.scope["query_string"].decode("latin-1").split("&"):
+        name, _, value = piece.partition("=")
+        if not name:
+            name, value = value, ""
+        if name and name not in ("startAt", "maxResults"):
+            params.setdefault(name, []).append(value)
+    params["maxResults"], params["startAt"] = [str(limit)], [str(start)]
+    capacity = 16
+    while len(params) > capacity * 3 // 4:
+        capacity *= 2
+
+    def bucket(name: str) -> int:
+        code = 0
+        for char in name:
+            code = (31 * code + ord(char)) & 0xFFFFFFFF
+        return (code ^ (code >> 16)) & (capacity - 1)
+
+    query = "&".join(
+        f"{name}={value}" for name in sorted(params, key=bucket) for value in params[name]
+    )
+    return f"{_site(request)}/rest/api/3/project/search?{query}"
 
 
 def _jira_project_id(container: str) -> str:
@@ -3050,6 +3119,16 @@ _CONFLUENCE_HTML_RESOURCES = ("space", "content")
 
 unmatched_router = APIRouter(prefix="/atlassian", include_in_schema=False)
 
+
+class _EveryPath(PathConvertor):
+    """Starlette's `path`, a newline included: its `.*` stops at one, so `GET /rest/api/3/nope%0Ax`
+    would miss the catch-all, where real answers it as any path no route matches (2026-10-18)."""
+
+    regex = "(?s:.*)"
+
+
+register_url_convertor("every_path", _EveryPath())
+
 _PACKAGE = Path(__file__).resolve().parent.parent
 
 
@@ -3406,14 +3485,14 @@ def _published_answer(request: Request, vendor_path: str) -> Response | None:
     give but the gap the baseline's `missing` operation acknowledges.
 
     Jira checks the request's media type where the operation does, for any caller the gateway lets
-    through (:func:`_jira_media_refusal`), then `Accept` (``errors.atlassian.not_acceptable``, on
-    every operation but those whose entry says ``"accept": "unchecked"``), then refuses a caller
-    with no credential it resolves where the operation will not run anonymously, and any `OPTIONS`
-    on one (:func:`_jira_unauthenticated`), each measured 2026-09-30 and the `Accept` check's place
-    2026-10-13; where the operation runs and is one of :data:`_JIRA_ISSUE_WRITES` or
-    :data:`_JIRA_ROLE_WRITES`, its lookup of a key that names nothing the caller can see is its 404,
-    and a role write's is followed by the 401 :func:`_require_project_admin` gives. The operation
-    is the one :func:`_jira_operation` names.
+    through (:func:`_jira_media_refusal`), then `Accept` (``errors.atlassian.not_acceptable``, asked
+    of no caller where the operation's entry says ``"accept": "unchecked"``, which was measured with
+    no credential), then refuses a caller with no credential it resolves where the operation will
+    not run anonymously, and any `OPTIONS` on one (:func:`_jira_unauthenticated`), each measured
+    2026-09-30 and the `Accept` check's place 2026-10-13; where the operation runs and is one of
+    :data:`_JIRA_ISSUE_WRITES` or :data:`_JIRA_ROLE_WRITES`, its lookup of a key that names nothing
+    the caller can see is its 404, and a role write's is followed by the 401
+    :func:`_require_project_admin` gives. The operation is the one :func:`_jira_operation` names.
 
     Confluence answers a Basic value it cannot read with Tomcat's 401 first, then checks the media
     type where the operation does (:data:`_CONFLUENCE_CONSUMES`, and its JAX-RS writes their own
@@ -3611,9 +3690,9 @@ def _echoed_path(request: Request) -> str:
     """The path a refusal names, which is not always the one that was routed.
 
     Real collapses an interior run of slashes in what it echoes and keeps a trailing one, where
-    routing ignores both (``backlot.main.normalise_the_slashes_in_an_atlassian_path``, which
-    stashes the collapsed spelling on the scope for this). Measured 2026-10-10 on Jira's 415,
-    conversion 400 and 405, each of which keeps the trailing slash in `instance`.
+    routing ignores both, and keeps some escapes as sent, where routing decodes every one
+    (``errors.atlassian.echoed_spelling``). Measured 2026-10-10 on Jira's 415, conversion 400 and
+    405, each of which keeps the trailing slash in `instance`.
     """
     return request.scope.get("atlassian_echo_path", request.url.path)
 
@@ -3655,8 +3734,10 @@ def _confluence_not_found(request: Request) -> Response:
         # blank member and `;foo`, with a credential and without one, and 2026-10-16 with U+00A0
         return Response(b"", status_code=500)
     url = f"{_site(request)}{vendor_path}"
-    if request.url.query:
-        url = f"{url}?{request.url.query}"
+    # the query as it arrived, for the reason `normalise_the_slashes_in_an_atlassian_path` reads
+    # the path from the scope
+    if query := request.scope.get("query_string", b"").decode("latin-1"):
+        url = f"{url}?{query}"
     media_type, body = errors_atlassian.jaxrs_not_found(url, as_json=_wants_json(request))
     # JAX-RS's 404 says `no-transform` in both shapes and the page says nothing, measured 2026-09-30
     # with a credential and without one
@@ -3776,7 +3857,7 @@ def _site_surface(request: Request) -> Response:
     )
 
 
-@unmatched_router.api_route("/{rest:path}", methods=_UNMATCHED_METHODS)
+@unmatched_router.api_route("/{rest:every_path}", methods=_UNMATCHED_METHODS)
 async def unmatched_path(request: Request, rest: str) -> Response:
     """What either product answers for a path no route above serves, and for a method they do not.
 
@@ -3798,7 +3879,9 @@ async def unmatched_path(request: Request, rest: str) -> Response:
     run for gets the answer above. Outside both API mounts the site is its web app
     (:func:`_site_surface`).
     """
-    path = request.url.path
+    # the path as routed, not `request.url.path`: parsing the URL again drops a decoded newline or
+    # tab and ends the path at a decoded `#`, so `myse%0Alf` would be looked up as `myself`
+    path = request.scope["path"]
     vendor_path = _vendor_path(path)
     served = _some_atlassian_route_matches(request)
     if served and request.method == "OPTIONS":
@@ -3815,10 +3898,12 @@ async def unmatched_path(request: Request, rest: str) -> Response:
             and not vendor_path.startswith("/wiki/rest")
         ):
             # the web app, not an API: a caller with no credential is sent to log in (`/wiki/nope`,
-            # measured 2026-09-30; with a credential it is the page below)
+            # measured 2026-09-30; with a credential it is the page below), `dest-url` quoting the
+            # path as `null for uri:` spells it and the query as sent (`/wiki/nope%3Fx?a=1` gives
+            # `%2Fwiki%2Fnope%253Fx%3Fa%3D1`, 2026-10-17)
+            query = request.scope.get("query_string", b"").decode("latin-1")
             asked = quote(
-                f"{_vendor_path(_echoed_path(request))}{'?' + request.url.query if request.url.query else ''}",
-                safe="",
+                f"{_vendor_path(_echoed_path(request))}{'?' + query if query else ''}", safe=""
             )
             return Response(
                 status_code=302,

@@ -2958,12 +2958,41 @@ def test_an_objects_attributes_size_is_its_bytes(tmp_path):
         ("versions&max-keys=1", ["<NextKeyMarker>c&#x1;k</NextKeyMarker>", "<Key>c&#x1;k</Key>"]),
         ("versions&delimiter=%01", ["<Delimiter>&#x1;</Delimiter>", "<Prefix>c&#x1;</Prefix>"]),
         ("uploads&prefix=c%00", ["<Prefix>c&#x0;</Prefix>"]),
+        (
+            "list-type=2&prefix=q%22&delimiter=%27",
+            ["<Prefix>q&quot;</Prefix>", "<Delimiter>&apos;</Delimiter>", "<Key>q&quot;k</Key>"]
+            + ["<ETag>&quot;", "&quot;</ETag>"],
+        ),
+        (
+            "list-type=2&delimiter=%22",
+            ["<Delimiter>&quot;</Delimiter>", "<Prefix>q&quot;</Prefix>"],
+        ),
+        (
+            "list-type=2&start-after=r%27",
+            ["<StartAfter>r&apos;</StartAfter>", "<Key>r&apos;k</Key>"],
+        ),
+        (
+            "max-keys=1&marker=q%22&delimiter=z",
+            ["<Marker>q&quot;</Marker>", "<NextMarker>q&quot;k</NextMarker>", "<Key>q&quot;k</Key>"]
+            + ["<ETag>&quot;", "&quot;</ETag>"],
+        ),
+        (
+            "versions&key-marker=q%22&max-keys=1",
+            ["<KeyMarker>q&quot;</KeyMarker>", "<NextKeyMarker>q&quot;k</NextKeyMarker>"]
+            + ["<Key>q&quot;k</Key>", "<ETag>&quot;", "&quot;</ETag>"],
+        ),
+        ("versions&delimiter=%27", ["<Delimiter>&apos;</Delimiter>", "<Prefix>r&apos;</Prefix>"]),
+        (
+            "uploads&prefix=q%22&key-marker=r%27&delimiter=%22",
+            ["<KeyMarker>r&apos;</KeyMarker>", "<Delimiter>&quot;</Delimiter>"]
+            + ["<Prefix>q&quot;</Prefix>"],
+        ),
     ],
 )
-def test_a_listing_writes_a_control_character_as_a_hexadecimal_reference(tmp_path, query, written):
+def test_a_listing_writes_control_characters_and_quotes_as_real_does(tmp_path, query, written):
     """Each row is what real's listing wrote for the same query over the same keys, written here by
     ``backlot.routers.s3._xml_listing_text``; U+007F stays as it is."""
-    keys = ["c\x01k", "c\x01m", "d\x1fx", "e\x7fy", "plain"]
+    keys = ["c\x01k", "c\x01m", "d\x1fx", "e\x7fy", "plain", 'q"k', "r'k"]
     records = [
         complete(
             source_type="s3",
@@ -3353,6 +3382,11 @@ _BOGUS_ENCODING = (
     "Invalid Encoding Method specified in Request",
     _argued("encoding-type", "bogus"),
 )
+_LONE_PART = (
+    400,
+    "This operation does not accept partNumber without uploadId",
+    _argued("partNumber", "partNumber"),
+)
 _FOO_AT_A_BUCKET = (400, _NOT_OVERRIDABLE.format("response-foo"), _argued("response-foo", "x"))
 _OPEN_QUOTE_AT_A_BUCKET = (
     400,
@@ -3361,9 +3395,27 @@ _OPEN_QUOTE_AT_A_BUCKET = (
 )
 
 # A query parameter real refuses, and which of two it refuses when both are sent: the request, and
-# the status, code, message and members of real's answer (measured 2026-09-29 against us-east-1).
+# the status, code, message and members of real's answer (measured against us-east-1 on 2026-09-29,
+# unless a comment above a row gives another date or names where its measurement is recorded).
 # fmt: off
 _PARAMETER_ROWS = [
+    # A part number with no valued upload id at a key, on a write
+    # (``backlot.routers.s3.object_method_refusal``).
+    ("PUT", "/s3/eng-artifacts/docs/runbook.md?partNumber=1", *_LONE_PART),
+    ("POST", "/s3/eng-artifacts/docs/runbook.md?partNumber=1", *_LONE_PART),
+    ("DELETE", "/s3/no-such-bucket/readme.txt?partNumber=1", *_LONE_PART),
+    ("PATCH", "/s3/eng-artifacts/docs/runbook.md?partNumber=1", *_LONE_PART),
+    ("PUT", "/s3/eng-artifacts/docs/runbook.md?partNumber=abc", *_LONE_PART),
+    ("PUT", "/s3/eng-artifacts/docs/runbook.md?partNumber", *_LONE_PART),
+    ("PUT", "/s3/eng-artifacts/docs/runbook.md?partNumber=1&uploadId=", *_LONE_PART),
+    ("POST", "/s3/eng-artifacts/docs/runbook.md?uploadId=&partNumber=", *_LONE_PART),
+    ("PUT", "/s3/eng-artifacts/docs/runbook.md?partNumber=1&versionId=x", *_LONE_PART),
+    ("PUT", "/s3/eng-artifacts/docs/runbook.md?annotation=v&annotationName=x&partNumber=1",
+     *_LONE_PART),
+    ("PUT", "/s3/eng-artifacts/docs/runbook.md?partNumber=1&uploads", 400,
+     "Conflicting query string parameters: partNumber, uploads", _argued("ResourceType", "partNumber")),
+    ("PUT", "/s3/eng-artifacts/docs/runbook.md?partNumber=abc&website=x", 400,
+     "Conflicting query string parameters: partNumber, website", _argued("ResourceType", "partNumber")),
     # `versionId` at a bucket's path, on each operation there.
     ("GET", "/s3/eng-artifacts?versionId=x", *_VERSION_ID_X),
     ("GET", "/s3/eng-artifacts?list-type=2&versionId=x", *_VERSION_ID_X),
@@ -3574,31 +3626,43 @@ def test_s3_a_parameter_real_refuses_is_refused_with_reals_message_and_members(
 
 
 @pytest.mark.parametrize(
-    "path",
+    "method, path",
     [
-        "/s3/eng-artifacts?versionId=x",
-        "/s3/eng-artifacts?website=v",
-        "/s3/eng-artifacts/runbooks/oncall.md?website=v",
-        "/s3/eng-artifacts/runbooks/oncall.md?annotationName=v",
-        "/s3/eng-artifacts?versions&max-keys=abc",
-        "/s3/eng-artifacts?versions&version-id-marker=x",
-        "/s3/eng-artifacts?versions&key-marker=a&version-id-marker=",
+        ("GET", "/s3/eng-artifacts?versionId=x"),
+        ("GET", "/s3/eng-artifacts?website=v"),
+        ("GET", "/s3/eng-artifacts/runbooks/oncall.md?website=v"),
+        ("GET", "/s3/eng-artifacts/runbooks/oncall.md?annotationName=v"),
+        ("GET", "/s3/eng-artifacts?versions&max-keys=abc"),
+        ("GET", "/s3/eng-artifacts?versions&version-id-marker=x"),
+        ("GET", "/s3/eng-artifacts?versions&key-marker=a&version-id-marker="),
+        ("PUT", "/s3/eng-artifacts/docs/runbook.md?partNumber=1"),
+        ("POST", "/s3/no-such-bucket/readme.txt?partNumber=1"),
+        ("DELETE", "/s3/eng-artifacts/docs/runbook.md?partNumber=1&uploadId="),
+        ("PATCH", "/s3/eng-artifacts/docs/runbook.md?annotation=v&annotationName=x&partNumber=1"),
     ],
 )
-def test_s3_what_a_parameter_is_refused_for_comes_before_the_credential(live_server, path):
+def test_s3_what_a_parameter_is_refused_for_comes_before_the_credential(live_server, method, path):
     """Real gave each of these its 400 unsigned and over a bad secret as well as signed (measured
-    2026-09-29); a HEAD naming it is the 400 without its body, `?versions`' own a HEAD reads as the
-    selector's 405 first."""
+    2026-09-29, the writes as `object_method_refusal` records); a HEAD naming a GET's is the 400
+    without its body, `?versions`' own a HEAD reads as the selector's 405 first."""
     import httpx
 
     base_url, settings = live_server
-    signed = _signed(base_url, path, settings.admin_token)
-    tampered_url, tampered = _sign_get(base_url, path, settings.admin_token, tamper=True)
-    for other in (httpx.get(f"{base_url}{path}"), httpx.get(tampered_url, headers=tampered)):
+    signed = _signed(base_url, path, settings.admin_token, method=method)
+    tampered_url, tampered = _sign_get(
+        base_url, path, settings.admin_token, tamper=True, method=method
+    )
+    for other in (
+        httpx.request(method, f"{base_url}{path}"),
+        httpx.request(method, tampered_url, headers=tampered),
+    ):
         assert other.status_code == signed.status_code == 400, path
         assert _without_request_ids(other.text) == _without_request_ids(signed.text), path
-    head = _signed(base_url, path, settings.admin_token, method="HEAD")
-    assert (head.status_code, head.content) == ((405, b"") if "versions" in path else (400, b""))
+    if method == "GET":
+        head = _signed(base_url, path, settings.admin_token, method="HEAD")
+        assert (head.status_code, head.content) == (
+            (405, b"") if "versions" in path else (400, b"")
+        )
 
 
 @pytest.mark.parametrize(
