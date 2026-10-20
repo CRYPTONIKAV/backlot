@@ -473,10 +473,11 @@ def _cover(url: str | None) -> dict | None:
 def _parent_field(conn, row, version: str | None = None) -> dict:
     """The `parent` a page and its block serve, in the model the caller's version reads.
 
-    `parent_id` already HOLDS the parent's served id -- the importer resolved it there. Measured
-    against api.notion.com on 2026-10-20, for the page and for its block alike: a page under a page
-    is typed `page_id` under 2022-06-28 and 2025-09-03, and a row is typed `database_id` under
-    2022-06-28 and `data_source_id`, with the database id beside it, under 2025-09-03.
+    `parent_id` already HOLDS the parent's served id -- the importer resolved it there, and
+    hashing it again would name a page nothing serves. On 2026-10-20 api.notion.com typed the parent
+    the same way for the page and for its block: a page under a page `page_id` under 2022-06-28 and
+    2025-09-03, and a row `database_id` under 2022-06-28 and `data_source_id`, with the database id
+    beside it, under 2025-09-03.
     """
     if not row["parent_id"]:
         return {"type": "workspace", "workspace": True}
