@@ -256,6 +256,18 @@ async def refuse_an_unserved_github_operation(request: Request, call_next):
 
 
 @app.middleware("http")
+async def refuse_an_unserved_hubspot_operation(request: Request, call_next):
+    """An operation HubSpot publishes that no route here serves is refused for its credential as a
+    served route refuses one, ahead of the router's 404 or 405
+    (``backlot.routers.hubspot.refuse_an_unserved_operation``)."""
+    if request.scope["path"].startswith("/hubspot/"):
+        refusal = hubspot.refuse_an_unserved_operation(request)
+        if refusal is not None:
+            return refusal
+    return await call_next(request)
+
+
+@app.middleware("http")
 async def echo_github_api_version(request: Request, call_next):
     """Report which API version served the response, on the `/github` answers real echoes one for,
     200 and error alike.
@@ -875,6 +887,38 @@ async def warn_slack_post_charset(request: Request, call_next):
         slack.attach_warning(json.loads(body), warning),
         status_code=response.status_code,
         headers=headers,
+    )
+
+
+#: The page Cloudflare, in front of Linear and Fireflies, answers a request carrying `Authorization`
+#: more than once with: `text/html` with no charset, CRLF line ends, 155 bytes.
+_CLOUDFLARE_REPEATED_AUTHORIZATION = (
+    "<html>\r\n<head><title>400 Bad Request</title></head>\r\n<body>\r\n"
+    "<center><h1>400 Bad Request</h1></center>\r\n<hr><center>cloudflare</center>\r\n"
+    "</body>\r\n</html>\r\n"
+)
+
+
+@app.middleware("http")
+async def refuse_a_repeated_authorization_on_linear_and_fireflies(request: Request, call_next):
+    """Answer a `/linear` or `/fireflies` request that carries `Authorization` more than once with
+    :data:`_CLOUDFLARE_REPEATED_AUTHORIZATION`'s 400, ahead of the route, the body and the
+    credential. api.linear.app and api.fireflies.ai answered it on 2026-10-19 (UTC) to two copies of
+    a key, a key and `nope` in either order, a key and an empty value, two empty values, three
+    copies and a second header named in lower case; on `POST /graphql` with a query, with no bytes,
+    with `{` and with a body past each vendor's size limit, on `GET /graphql`, on `HEAD /graphql`,
+    which declared the 155 bytes and sent none, and on `POST /nosuch` and `POST /`."""
+    path = request.url.path
+    if not any(
+        path == prefix or path.startswith(f"{prefix}/") for prefix in ("/linear", "/fireflies")
+    ):
+        return await call_next(request)
+    if not auth.repeated_authorization(request):
+        return await call_next(request)
+    return Response(
+        _CLOUDFLARE_REPEATED_AUTHORIZATION.encode(),
+        status_code=400,
+        headers={"Content-Type": "text/html"},
     )
 
 
