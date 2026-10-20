@@ -106,7 +106,7 @@ def github_credential(request: Request) -> str | None:
     `/user/repos` and `/repos/psf/requests`, and five of them moved neither the token's window nor
     the address's (2026-10-17).
     """
-    if _repeated_authorization(request):
+    if repeated_authorization(request):
         return ""
     scheme, rest = github_scheme(request)
     if scheme in ("bearer", "token"):
@@ -135,32 +135,79 @@ def github_scheme_then_a_tab(request: Request) -> bool:
     return (
         github_scheme(request)[1].startswith("\t")
         and "," not in header
-        and not _repeated_authorization(request)
+        and not repeated_authorization(request)
     )
 
 
-def _repeated_authorization(request: Request) -> bool:
+def repeated_authorization(request: Request) -> bool:
     """Whether the request carries more than one `Authorization` header."""
     return len(request.headers.getlist("authorization")) > 1
 
 
 def api_key_token(request: Request) -> str | None:
-    """Parse ``Authorization: <key>`` — with or without a ``Bearer`` prefix.
+    """``Authorization`` as Linear reads a personal API key: the whole value, with the spaces and
+    tabs around it left off, so a scheme in front is part of the key and fails to resolve.
+    api.linear.app answered each latin-1 byte but NUL, LF and CR, put before and after a key that
+    resolves, on 2026-10-18 (UTC): a space or a tab served the query, U+00A0 and every other byte
+    was the 401, and a control character other than the tab drew an empty 400. A Backlot token
+    travels this way; :func:`linear_bearer_token` reads the other spelling."""
+    return (_authorization(request) or "").strip(" \t") or None
 
-    Linear's GraphQL API carries a personal API key as the bare header value
-    (``Authorization: lin_api_...``, no scheme) and an OAuth access token as
-    ``Bearer <token>``, accepting both on the same header, so this accepts both too.
-    Anything that is not a ``Bearer`` prefix is returned verbatim rather than having its
-    first word stripped: to the real API the whole header value *is* the key, so a stray
-    scheme fails to resolve instead of being quietly discarded.
-    """
-    hdr = (_authorization(request) or "").strip()
+
+def linear_bearer_token(request: Request) -> str | None:
+    """What follows ``Bearer `` or ``bearer `` in ``Authorization``, where Linear reads an OAuth
+    access token; None for any other value.
+
+    With an API key, Linear's answers on 2026-10-18 (UTC) were the 400 for those two spellings and
+    the 401 for the 62 other casings of the six letters, as for a tab after the scheme, two
+    spaces, and U+00A0 or another latin-1 byte other than a control character between the space and
+    the key. A space or a tab after the key is left off and the 400 stays."""
+    hdr = (_authorization(request) or "").strip(" \t")
+    for scheme in ("Bearer ", "bearer "):
+        if hdr.startswith(scheme):
+            return hdr[len(scheme) :]
+    return None
+
+
+#: What Linear takes for a personal API key under ``Bearer``: ``lin_api_`` and forty ASCII letters
+#: and digits (:func:`linear_api_key_under_bearer`).
+_LINEAR_API_KEY = re.compile(r"lin_api_[0-9A-Za-z]{40}")
+
+
+def linear_api_key_under_bearer(request: Request) -> bool:
+    """Whether :func:`linear_bearer_token` holds an API key, which Linear refuses with a 400 before
+    it reads the body: a token in :data:`_LINEAR_API_KEY`'s shape, whether or not Linear issued it,
+    or one Backlot resolves. A Backlot token is served when sent bare, the spelling of a Linear
+    personal API key, so it stands for that user's ``lin_api_`` key.
+
+    On 2026-10-19 (UTC) api.linear.app gave the 400 to ``lin_api_`` and forty ASCII letters or
+    digits, whether or not it issued the key, and the 401 to each other length tried (none to
+    forty-five, fifty, sixty, sixty-four and a hundred), to any other printable ASCII character put
+    first or last of the forty or ``é`` put last, and to ``LIN_API_``, ``lin_oauth_`` and
+    ``xlin_api_``."""
+    token = linear_bearer_token(request)
+    if token is None:
+        return False
+    return _LINEAR_API_KEY.fullmatch(token) is not None or acl(request).resolve(token) is not None
+
+
+def fireflies_bearer_token(request: Request) -> str | None:
+    """The token Fireflies reads from the Authorization header, or None when it has no bearer
+    prefix: the scheme in any case and a space, then the rest with spaces, tabs and U+00A0 left off
+    either end. No header, an empty one and the prefix followed by U+00A0 alone give the empty
+    token, which resolves to no one.
+
+    Sent to api.fireflies.ai on 2026-10-18 (UTC) after the scheme, after its space and after the
+    key, every latin-1 byte other than NUL, LF and CR showed that only a space opens the token, a
+    tab or a comma there leaving no prefix; a tab, a space or U+00A0 around the key served the
+    query, and U+0085 or another byte there was a key that does not resolve. ``BEARER`` and
+    ``bEaReR`` were served, and a U+00A0 before the scheme was no prefix."""
+    hdr = (_authorization(request) or "").strip(" \t")
     if not hdr:
+        return ""
+    if not hdr.lower().startswith("bearer "):
         return None
-    parts = hdr.split(None, 1)
-    if parts[0].lower() == "bearer":
-        return parts[1].strip() or None if len(parts) == 2 else None
-    return hdr
+    return hdr[len("bearer ") :].strip(" \t\xa0")
 
 
 # How much of a Basic credential a request carries.
