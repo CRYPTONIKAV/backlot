@@ -48,7 +48,9 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict
 
-from backlot import auth, pagination, published, store, synth
+from backlot import auth, published, store, synth
+from backlot import notion_request as req
+from backlot.graphql import body as request_body
 from backlot.openapi import qp
 
 router = APIRouter(prefix="/notion/v1", tags=["notion"])
@@ -78,8 +80,8 @@ PUBLISHED_VERSIONS = (
 
 # --- OpenAPI enrichment --------------------------------------------------
 # GET query params are documented with openapi_extra (merges with path params, no signature
-# change); POST bodies (search/query) are read via _body_object, so their shape is documented as
-# a requestBody the same way. Response models use extra="allow" to preserve the full field set.
+# change); POST bodies (search/query) are read via _json_body, so their shape is documented as a
+# requestBody the same way. Response models use extra="allow" to preserve the full field set.
 # Error paths return JSONResponse (_error), which FastAPI passes through unfiltered.
 
 
@@ -168,13 +170,30 @@ def _query_extra(serves: str, refuses: str) -> dict:
     """``openapi_extra`` for one of the two query routes. ``serves`` names the versions it is the
     path for, ``refuses`` the ones that read rows through the other."""
     return {
-        **_body({"start_cursor": {"type": "string"}, "page_size": {"type": "integer"}}),
+        **_body(
+            {
+                "sorts": {"type": "array", "items": {"type": "object"}},
+                "filter": {"type": "object"},
+                "start_cursor": {"type": "string"},
+                "page_size": {"type": "integer"},
+                "result_type": {"type": "string", "enum": ["page", "data_source"]},
+            }
+        ),
         "parameters": [
             _version_param(
                 f"The API version to read this request under. This path serves {serves}; "
                 f"{refuses} read a database's rows through the other query path, and a request "
                 "under one of them is refused here, as is a request that sends no version."
-            )
+            ),
+            qp(
+                "filter_properties",
+                description=(
+                    "A property id or name; repeat the parameter, or spell it "
+                    "`filter_properties[]` or `filter_properties[0]`, to list several. Each row "
+                    "comes back with only the listed properties, and a name the data source does "
+                    "not have is refused."
+                ),
+            ),
         ],
     }
 
@@ -208,23 +227,26 @@ def _request_id(request: Request) -> str:
     return str(uuid.UUID(bytes=raw.digest(16), version=4))
 
 
+class _NodeJSON(JSONResponse):
+    """JSON as Express writes it, which escapes a lone surrogate a refusal's quote can end on
+    (``notion_request.quoted``); Starlette's encoder cannot write one at all."""
+
+    def render(self, content) -> bytes:
+        return request_body.node_json(content)
+
+
 def _error(
-    request: Request, status: int, code: str, message: str, *, extra: dict | None = None
+    request: Request, status: int, code: str, message: str, additional_data: dict | None = None
 ) -> JSONResponse:
+    """Notion's refusal: ``additional_data``, where real sends one, goes ahead of `request_id`, as
+    the comments cursor's and the user list's 503 carried it on 2026-10-21."""
     request_id = _request_id(request)
-    content = {
-        "object": "error",
-        "status": status,
-        "code": code,
-        "message": message,
-        "request_id": request_id,
-    }
-    if extra:
-        content.update(extra)
-    return JSONResponse(
-        status_code=status,
-        content=content,
-        headers={"x-notion-request-id": request_id},
+    content = {"object": "error", "status": status, "code": code, "message": message}
+    if additional_data is not None:
+        content["additional_data"] = additional_data
+    content["request_id"] = request_id
+    return _NodeJSON(
+        status_code=status, content=content, headers={"x-notion-request-id": request_id}
     )
 
 
@@ -271,11 +293,11 @@ def _data_sources_model(version: str) -> bool:
 
 def _unknown_version(value: str) -> str:
     """Notion's refusal for a version it does not publish: the enumeration, then the value it was
-    handed, both quoted the way the live API quotes them (measured 2026-09-17)."""
+    handed, quoted as every refusal quotes one (``backlot.notion_request.quoted``)."""
     listed = ", ".join(f'`"{v}"`' for v in PUBLISHED_VERSIONS[:-1])
     return (
         f"Notion-Version header failed validation: Notion-Version header should be {listed}, "
-        f'or `"{PUBLISHED_VERSIONS[-1]}"`, instead was `"{value}"`.'
+        f'or `"{PUBLISHED_VERSIONS[-1]}"`, instead was `{req.quoted(value)}`.'
     )
 
 
@@ -385,491 +407,159 @@ def _db_doc_for_data_source(request: Request, dsid: str) -> str | None:
     return row["id"] if row is not None else None
 
 
-# Request members real Notion refuses, route by route. Measured against api.notion.com on
-# 2026-09-30 under Notion-Version 2025-09-03 and 2022-06-28: every operation validates the query
-# string and the body against its own schema and answers 400 `validation_error` naming the member
-# it refused, apart from `GET /v1/pages/{id}`, which serves an unknown query parameter (measured
-# with `foo=1`) and is therefore left out of the sweep. The allowlists are per route rather than
-# per router: a `page_size` in the query string of `POST /v1/search` is not that route's member
-# (its pagination sits in the body), and real refuses it as an extra key. The two query routes
-# take no query member either: that half is an extrapolation from the search row, applied so a
-# misspelled key is refused there the same way instead of being served.
-
-_MISSING = object()
-_NEGATIVE_PAGE = object()
-
-_Q_PAGINATE = frozenset({"start_cursor", "page_size"})
-_Q_COMMENTS = frozenset({"block_id", "start_cursor", "page_size"})
-_Q_SEARCH = frozenset({"filter_properties"})
-_Q_NONE: frozenset[str] = frozenset()  # both query routes: no query member at all
-
-_B_SEARCH_MEMBERS = frozenset({"query", "filter", "sort", "start_cursor", "page_size"})
-_B_QUERY_MEMBERS = frozenset({"filter", "sorts", "start_cursor", "page_size"})
-
-# The reserved prefix of the cursor this router hands back on the routes whose real cursor is a
-# uuid, and the shape real reads as one (the dashed 8-4-4-4-12 form in either case, or 32 lower
-# case hex digits, the same pair list_comments reads for its block id).
-_OWN_CURSOR_RE = re.compile(r"00000000-0000-4000-8000-([0-9a-f]{12})")
-_UUID_RE = re.compile(
-    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
-    r"|[0-9a-f]{32}"
-)
-_PAGE_SIZE_RE = re.compile(r"-?[0-9]+")
-
-
-def _inline(value) -> str:
-    """``value`` the way a Notion refusal quotes it back: compact JSON, `undefined` for a member
-    the request did not send."""
-    if value is _MISSING:
-        return "undefined"
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
-
-
-def _query_inline(raw: str) -> str:
-    """A query string's value in that same quoting. The query string carries text, and real reads
-    `1` back as a number and `abc` as a string (measured 2026-09-30)."""
-    try:
-        return _inline(json.loads(raw))
-    except ValueError:
-        return _inline(raw)
-
-
-def _unknown_query(
-    request: Request, allowed: frozenset[str], *, brackets: frozenset[str] = frozenset()
-) -> JSONResponse | None:
-    """The 400 for the first query parameter the route does not take, or None when every key
-    belongs to it.
-
-    ``brackets`` names the allowed keys whose bracketed spellings belong to them too; only
-    ``filter_properties`` was measured to work that way (`[]`, `[0]`, ...), and its own reader
-    judges those. Every other allowed key matches exactly, so `start_cursor[0]` or `page_size[0]`
-    is a member the route does not take. Real's message names the key and quotes the value it
-    read."""
-    for key, value in request.query_params.multi_items():
-        if key in allowed or (key.split("[", 1)[0] in brackets and "[" in key):
-            continue
-        return _error(
-            request,
-            400,
-            "validation_error",
-            f"query failed validation: query.{key} should be not present, "
-            f"instead was `{_query_inline(value)}`.",
-        )
-    return None
-
-
-def _unknown_body(request: Request, body: dict, allowed: frozenset[str]) -> JSONResponse | None:
-    """The 400 for the first body key the route does not take (see :func:`_unknown_query`)."""
-    for key, value in body.items():
-        if key in allowed:
-            continue
-        return _error(
-            request,
-            400,
-            "validation_error",
-            f"body failed validation: body.{key} should be not present, "
-            f"instead was `{_inline(value)}`.",
-        )
-    return None
-
-
-def _page_refusal(request: Request, where: str, message: str) -> JSONResponse:
-    return _error(request, 400, "validation_error", f"{where} failed validation: {message}")
-
-
-def _page_range(n: int, family: str, request: Request, where: str):
-    """Apply the family's range rule to an integer page size.
-
-    ``comments`` refuses every value outside 1..100. The list routes read `0` and anything over
-    the cap as a full page, answer a negative with an empty page carrying the first item's own
-    cursor (real does that for `-1` on all four, measured), and `users` answers -2 and below with
-    the 503 its public list endpoint returns for those three values."""
-    if family == "comments":
-        if n < 1:
-            return None, _page_refusal(
-                request,
-                where,
-                f"{where}.page_size should be \u2265 `1` or `undefined`, instead was `{n}`.",
-            )
-        if n > _PAGE_MAX:
-            return None, _page_refusal(
-                request,
-                where,
-                f"{where}.page_size should be \u2264 `100` or `undefined`, instead was `{n}`.",
-            )
-        return n, None
-    if family == "users" and n <= -2:
-        return None, _error(
-            request,
-            503,
-            "service_unavailable",
-            "Public API service is temporarily unavailable, please try again later.",
-            extra={"additional_data": {"endpoint_name": "public_listUsers"}},
-        )
-    if n < 0:
-        return _NEGATIVE_PAGE, None
-    if n == 0 or n > _PAGE_MAX:
-        return _PAGE_MAX, None
-    return n, None
-
-
-def _query_page_size(request: Request, family: str):
-    """``(page_size, refusal)`` for a route that reads `page_size` from the query string.
-
-    A repeated parameter is refused whatever it repeats -- `1&1` included -- with real's
-    "Conflicting values" wording (measured 2026-09-30); an empty value is the default page.
-    Anything that is not an integer -- `abc`, `1.5`, `1_0` -- is the number's 400, with the value
-    quoted the way real quotes it."""
-    raw = request.query_params.getlist("page_size")
-    if len(raw) > 1:
-        return None, _error(
-            request,
-            400,
-            "validation_error",
-            'Conflicting values for "page_size" in query parameters.',
-        )
-    value = raw[-1] if raw else None
-    if value is None or not value.strip():
-        return _PAGE_MAX, None
-    if not _PAGE_SIZE_RE.fullmatch(value):
-        return None, _page_refusal(
-            request,
-            "query",
-            f"query.page_size should be a number or `undefined`, "
-            f"instead was `{_query_inline(value)}`.",
-        )
-    return _page_range(int(value), family, request, "query")
-
-
-def _body_page_size(body: dict, family: str, request: Request):
-    """``(page_size, refusal)`` for one of the two POST bodies. A member the body did not send is
-    the default page; a bool is not a number, though Python would read it as one."""
-    if "page_size" not in body:
-        return _PAGE_MAX, None
-    value = body["page_size"]
-    if isinstance(value, bool) or not isinstance(value, int):
-        return None, _page_refusal(
-            request,
-            "body",
-            f"body.page_size should be a number or `undefined`, instead was `{_inline(value)}`.",
-        )
-    return _page_range(value, family, request, "body")
-
-
-def _uuid_cursor(offset: int) -> str:
-    """The next-page cursor of the routes whose real cursor is a uuid (children, comments and
-    search): the offset in the last twelve hex digits of a reserved uuid.
-
-    Real's own refusal on those routes names the shape ("should be a valid uuid"), so the token
-    this server hands back takes it too, and the zero uuid real refuses stays outside the reserved
-    prefix."""
-    return f"00000000-0000-4000-8000-{offset:012x}"
-
-
-def _own_cursor_offset(token: str) -> int | None:
-    m = _OWN_CURSOR_RE.fullmatch(token)
-    return int(m[1], 16) if m else None
-
-
-def _position_after(token: str, ids: list[str]) -> int | None:
-    """Where a cursor that names an item resumes: the item after it, or None when it names
-    nothing the route would serve."""
-    wanted = _norm(token)
-    for i, served in enumerate(ids):
-        if _norm(served) == wanted:
-            return i + 1
-    return None
-
-
-def _cursor(token, ids: list[str], family: str, request: Request, where: str):
-    """``(offset, refusal)`` for a `start_cursor`, in the two families real validates.
-
-    ``users`` and the data-source query take an opaque cursor: theirs is refused with "The
-    start_cursor provided is invalid: <value>" for anything that is not one, the zero uuid
-    included. Children, comments and search name the uuid shape instead and quote the value (the
-    three wordings the measurement records). A cursor this server emitted is the page it names; a
-    token that names an item resumes after it. An empty value is refused too -- the user list says
-    it is not a string, with the `0` real reads out of it."""
-    if token is None:
-        return 0, None
-    if not isinstance(token, str):
-        # A body member of the wrong type is refused before anything decodes it (the query string
-        # can only carry text, so this is the POST half).
-        if family in ("users", "query"):
-            return None, _error(
-                request,
-                400,
-                "validation_error",
-                f"The start_cursor provided is invalid: {_inline(token)}",
-            )
-        return None, _error(
-            request,
-            400,
-            "validation_error",
-            f"{where} failed validation: {where}.start_cursor should be a valid uuid or "
-            f"`undefined`, instead was `{_inline(token)}`.",
-        )
-    if family in ("users", "query"):
-        if not token:
-            if family == "users" and where == "query":
-                return None, _page_refusal(
-                    request,
-                    "query",
-                    "query.start_cursor should be a string or `undefined`, instead was `0`.",
-                )
-            return None, _error(
-                request,
-                400,
-                "validation_error",
-                f"The start_cursor provided is invalid: {_inline(token)}",
-            )
-        offset = pagination.decode_cursor_or_none(token)
-        if offset is not None:
-            return offset, None
-        if family == "query" and token.startswith("s:"):
-            parts = token[2:].split(":")
-            if len(parts) == 2:
-                resume = _position_after(parts[0], ids)
-                if resume is not None:
-                    return resume, None
-        resume = _position_after(token, ids)
-        if resume is not None:
-            return resume, None
-        return None, _error(
-            request,
-            400,
-            "validation_error",
-            f"The start_cursor provided is invalid: {token}",
-        )
-    offset = _own_cursor_offset(token)
-    if offset is not None:
-        return offset, None
-    if _UUID_RE.fullmatch(token):
-        resume = _position_after(token, ids)
-        if resume is not None:
-            return resume, None
-        return None, _error(
-            request,
-            400,
-            "validation_error",
-            f"The start_cursor provided is invalid: {token}",
-        )
-    return None, _error(
-        request,
-        400,
-        "validation_error",
-        f"{where} failed validation: {where}.start_cursor should be a valid uuid or `undefined`, "
-        f"instead was `{_inline(token)}`.",
-    )
-
-
-async def _body_object(request: Request) -> tuple[dict, JSONResponse | None]:
-    """The request's JSON object, or the 400 real answers for a body it cannot read.
-
-    A body that parses as a JSON object is judged by its members whatever content type carries
-    it: an empty body, no content type and `text/plain` with `{}` are a 200 on both sides
-    (measured 2026-09-30), and reading the object behind a `text/plain` body is the same rule --
-    a body whose members are visible is validated, never silently dropped. Everything that
-    declares `application/json` is parsed strictly: invalid JSON is `invalid_json` with "Error
-    parsing JSON body.", and a parsed value that is not an object gets the object's 400, `[]`
-    quoted back the way real does. A non-JSON content type carrying neither an object nor JSON is
-    read as no members."""
-    content_type = (request.headers.get("content-type") or "").split(";")[0].strip().lower()
-    declared_json = not content_type or content_type == "application/json"
-    raw = await request.body()
-    if not raw.strip():
-        return {}, None
-    try:
-        parsed = json.loads(raw)
-    except ValueError:
-        if not declared_json:
-            return {}, None
-        return {}, _error(request, 400, "invalid_json", "Error parsing JSON body.")
-    if isinstance(parsed, dict):
-        return parsed, None
-    if not declared_json:
-        return {}, None
-    return {}, _error(
-        request,
-        400,
-        "validation_error",
-        f"body failed validation: body should be an object, instead was `{_inline(parsed)}`.",
-    )
-
-
-def _search_filter_refusal(request: Request, body: dict, version: str) -> JSONResponse | None:
-    """The 400 for a search `filter` real refuses, or None for one it serves.
-
-    Real's rule is a union: `property` must be `"object"` and `value` one of the version's object
-    types, or `in_trash` must be defined. When neither branch holds the message lists the line
-    each branch failed on, which is why the measured refusals carry the `in_trash` line after the
-    one that is actually wrong. Under 2022-06-28 `database` is the database row's type; from
-    2025-09-03 the same row is a `data_source` (measured 2026-09-30 and 2026-10-14)."""
-    flt = body["filter"]
-    allowed = (
-        ("page", "data_source")
-        if _data_sources_model(version)
-        else ("page", "database", "data_source")
-    )
-    lines = []
-    prop = flt.get("property", _MISSING)
-    if prop != "object":
-        lines.append(f'body.filter.property should be `"object"`, instead was `{_inline(prop)}`.')
-    value = flt.get("value", _MISSING)
-    if value not in allowed:
-        listed = " or ".join(f'`"{v}"`' for v in allowed)
-        lines.append(f"body.filter.value should be {listed}, instead was `{_inline(value)}`.")
-    if not lines:
-        return None
-    lines.append("body.filter.in_trash should be defined, instead was `undefined`.")
-    return _error(
-        request,
-        400,
-        "validation_error",
-        "body failed validation. Fix one:\n" + "\n".join(lines),
-    )
-
-
-def _search_sort_refusal(request: Request, body: dict) -> JSONResponse | None:
-    """The 400 for a search `sort` real refuses, or None for one it serves.
-
-    Real sorts either by relevance, naming the property (`property` must be `"relevance"`), or by
-    a timestamp, where `timestamp` must be `last_edited_time` and `property` must be absent. The
-    direction's refusal is the mixed-branch message the measurement records, with the timestamp
-    branch's own line beneath it."""
-    sort = body["sort"]
-    if not isinstance(sort, dict):
-        return _error(
-            request,
-            400,
-            "validation_error",
-            f"body failed validation: body.sort should be an object or `undefined`, "
-            f"instead was `{_inline(sort)}`.",
-        )
-    direction = sort.get("direction", _MISSING)
-    direction_ok = direction is _MISSING or direction in ("ascending", "descending")
-    if "property" in sort:
-        if sort["property"] != "relevance":
-            return _error(
-                request,
-                400,
-                "validation_error",
-                f'body.sort.property should be "relevance", instead was `{sort["property"]}`.',
-            )
-        if direction_ok:
-            return None
-        return _error(
-            request,
-            400,
-            "validation_error",
-            'body failed validation: body.sort.direction should be `"ascending"`, '
-            f'`"descending"`, or `undefined`, instead was `{_inline(direction)}`.',
-        )
-    if sort.get("timestamp", _MISSING) != "last_edited_time":
-        return _error(
-            request,
-            400,
-            "validation_error",
-            'body.sort.timestamp should be "last_edited_time" when sorting by timestamp.',
-        )
-    if not direction_ok:
-        return _error(
-            request,
-            400,
-            "validation_error",
-            "body failed validation. Fix one:\n"
-            'body.sort.direction should be `"ascending"`, `"descending"`, or `undefined`, '
-            f"instead was `{_inline(direction)}`.\n"
-            "body.sort.property should be defined, instead was `undefined`.",
-        )
-    return None
-
-
-def _query_body_refusal(request: Request, body: dict, db) -> JSONResponse | None:
-    """The 400 for a data-source query body real refuses, or None for one it serves.
-
-    A filter or a sort that names a property the database does not have is refused by name
-    (measured 2026-09-30); a member of the wrong type is refused the way the rest of the router
-    refuses one."""
-    names = set(_schema_props(db))
-    if "filter" in body:
-        flt = body["filter"]
-        if not isinstance(flt, dict):
-            return _error(
-                request,
-                400,
-                "validation_error",
-                f"body failed validation: body.filter should be an object or `undefined`, "
-                f"instead was `{_inline(flt)}`.",
-            )
-        if "property" in flt and str(flt["property"]) not in names:
-            return _error(
-                request,
-                400,
-                "validation_error",
-                f"Could not find property with name or id: {flt['property']}",
-            )
-    if "sorts" in body:
-        sorts = body["sorts"]
-        if not isinstance(sorts, list):
-            return _error(
-                request,
-                400,
-                "validation_error",
-                f"body failed validation: body.sorts should be an array or `undefined`, "
-                f"instead was `{_inline(sorts)}`.",
-            )
-        for sort in sorts:
-            if not isinstance(sort, dict):
-                return _error(
-                    request,
-                    400,
-                    "validation_error",
-                    "body failed validation: body.sorts should be an array of objects, "
-                    f"instead was `{_inline(sort)}`.",
-                )
-            if "property" in sort and str(sort["property"]) not in names:
-                return _error(
-                    request,
-                    400,
-                    "validation_error",
-                    f"Could not find sort property with name or id: {sort['property']}",
-                )
-    return None
-
-
-def _first_cursor_page(cursor: str | None, type_key: str) -> dict:
-    """The page real answers a negative `page_size` with: no results, `has_more` true, and the
-    first item's own cursor (the first user's, block's or page's id; an `s:` token on the query)."""
-    return {
-        "object": "list",
-        "results": [],
-        "next_cursor": cursor,
-        "has_more": cursor is not None,
-        "type": type_key,
-        type_key: {},
-    }
-
-
-def _list_obj(
-    results: list,
-    offset: int,
-    page_len: int,
-    total: int,
-    type_key: str,
-    *,
-    encode=pagination.encode_cursor,
-) -> dict:
-    nxt = offset + page_len
-    has_more = nxt < total
+def _list_obj(results: list, next_cursor: str | None, type_key: str) -> dict:
+    """A page of a list: `has_more` is whether a cursor follows it."""
     return {
         "object": "list",
         "results": results,
-        "next_cursor": encode(nxt) if has_more else None,
-        "has_more": has_more,
+        "next_cursor": next_cursor,
+        "has_more": next_cursor is not None,
         "type": type_key,
         type_key: {},
     }
+
+
+# --------------------------------------------------------------------------- what a request carries
+
+
+def _error_id(request: Request) -> str:
+    """The `errorId` of a body Express refuses, derived as :func:`_request_id` is but apart from
+    it: real's two differ on each such answer."""
+    raw = hashlib.shake_256(
+        f"notion-error:{request.method} {request.url.path}?{request.url.query}".encode()
+    )
+    return str(uuid.UUID(bytes=raw.digest(16), version=4))
+
+
+async def front_door_body(request: Request) -> JSONResponse | None:
+    """Read the body as Express reads one ahead of every route (``notion_request.read_body``), and
+    answer the refusal it draws, or None with what it read left on the request for
+    :func:`_json_body`.
+
+    ``backlot.main`` calls this on every `/notion` request, the root included. A body Express
+    refuses is answered in its error handler's shape, an `errorId` and no `request_id` member, with
+    `x-notion-request-id` on the response as on every answer; one ``JSON.parse`` refuses is
+    `invalid_json` in Notion's own envelope."""
+    read = req.read_body(
+        await request.body(),
+        # Sent more than once, the type reaches Express joined (`application/json, text/plain`), a
+        # type its parser cannot read: real served `{"foo":1}` under those two in either order and
+        # under `application/json` twice (2026-10-21).
+        request_body.joined_header(request.headers.getlist("content-type")),
+        request_body.joined_header(request.headers.getlist("content-encoding")),
+    )
+    if isinstance(read, req.Unreadable):
+        content = {
+            "isNotionError": False,
+            "errorId": _error_id(request),
+            "name": read.name,
+            "message": read.message,
+        }
+        if read.status == 413:
+            content["code"] = 413
+        return JSONResponse(
+            status_code=read.status,
+            content=content,
+            headers={"x-notion-request-id": _request_id(request)},
+        )
+    if read == "invalid_json":
+        return _error(request, 400, "invalid_json", "Error parsing JSON body.")
+    request.state.notion_body = read
+    return None
+
+
+def _query(request: Request, schema: req.Obj, *, reads_filter_properties: bool = False):
+    """``(values, refusal)``: the query string's members as the validator reads them, or the 400 it
+    answers. A key that is not one value is refused first (``notion_request.query_shape_refusal``),
+    then the members against ``schema``, the route's own in its order and then each one it does
+    not name. `filter_properties` is the list :func:`_filter_properties_keep` reads wherever it is
+    sent: under its key in ``values`` on a route that reads it, and quoted back by ``schema`` on
+    one that does not (`query.filter_properties should be not present, instead was `["title"]``,
+    2026-10-21)."""
+    members = req.query_members(request.url.query)
+    keep, refused = _filter_properties_keep(request)
+    own = {"filter_properties": _NOT_A_LIST if refused else None}
+    shape = req.query_shape_refusal(members, own=own)
+    if shape is not None:
+        return None, _error(request, 400, "validation_error", shape)
+    values = {k: req.coerce(m.value) for k, m in members.items() if k not in own}
+    if keep is not None and not reads_filter_properties:
+        values["filter_properties"] = keep
+    problems = schema.check(values, ("query",))
+    if problems:
+        message = req.refusal_message("query", problems)
+        return None, _error(request, 400, "validation_error", message)
+    values["filter_properties"] = keep
+    return values, None
+
+
+def _get(request: Request, schema: req.Obj, *, reads_filter_properties: bool = False):
+    """``(values, refusal)`` for a `GET`: its query string as :func:`_query` reads it, then a body,
+    which no `GET` takes a member of (``notion_request.NOTHING``)."""
+    query, refusal = _query(request, schema, reads_filter_properties=reads_filter_properties)
+    if refusal is None:
+        refusal = _json_body(request, req.NOTHING)[1]
+    return query, refusal
+
+
+def _json_body(request: Request, schema: req.Obj):
+    """``(body, refusal)``: the body Express read, or the 400 for one that is not an object or that
+    fails ``schema``."""
+    body = getattr(request.state, "notion_body", {})
+    problems = schema.check(body, ("body",))
+    if problems:
+        message = req.refusal_message("body", problems)
+        return None, _error(request, 400, "validation_error", message)
+    return body, None
+
+
+def _cursor_refusal(request: Request, cursor: str, *, comments: bool = False) -> JSONResponse:
+    """The 400 for a `start_cursor` that names no item of the list. `comments` adds the three
+    `tool_error_*` members real carried there, and no other route did (2026-10-21)."""
+    extra = None
+    if comments:
+        extra = {
+            "tool_error_code": "invalid_cursor",
+            "tool_error_class": "validation",
+            "tool_error_retryable": "false",
+        }
+    message = f"The start_cursor provided is invalid: {cursor}"
+    return _error(request, 400, "validation_error", message, extra)
+
+
+def _start(ids: list[str], cursor) -> int | None:
+    """Where a page that starts at ``cursor`` starts in ``ids``: at the item it names, which the
+    page includes, the first item for no cursor, and None for a cursor naming none of them. Measured
+    on `users`, `blocks/{id}/children`, `comments` and `search` (2026-10-21): the second user's,
+    the third block's, the second comment's and the third result's id each start the page with that
+    item. An id in upper case names nothing, and so does one without its dashes on `users`, the one
+    route whose schema lets it through."""
+    if cursor is None:
+        return 0
+    return ids.index(cursor) if cursor in ids else None
+
+
+def _size(value) -> int | None:
+    """The page size a list reads off a `page_size` its schema let through, or None for the empty
+    page. Zero, and anything past 100 (`101` and `1e3`), are 100; a negative is the empty page
+    (`-1`, `-2` and `-5`); and `search`'s body, which reads a fraction, cuts one toward zero, so
+    `1.5` is 1, `2.5` is 2 and `0.5`, `0.9999` and `-0.5` an empty page (2026-10-21)."""
+    if value is None or value == 0:
+        return _PAGE_MAX
+    if value < 0:
+        return None
+    return int(min(value, _PAGE_MAX))
+
+
+def _paged(items: list, ids: list[str], start: int, size: int | None):
+    """The slice of ``items`` a page shows from ``start``, and the cursor after it: the id of the
+    next item, the cursor real hands back. The empty page (``size`` None) names the item it would
+    have started with, which is the first item, or the one the cursor named
+    (`users?page_size=-1&start_cursor=<the bot>` named the bot)."""
+    if size is None:
+        return [], ids[start] if start < len(ids) else None
+    end = start + size
+    return items[start:end], ids[end] if end < len(ids) else None
 
 
 # The objects below carry real's members in real's order, as api.notion.com answered one object of
@@ -1016,16 +706,23 @@ _FILTER_PROPERTIES_KEY = re.compile(r"filter_properties((?:\[[^\[\]]*\])*)")
 _BRACKET = re.compile(r"\[([^\[\]]*)\]")
 
 
-def _filter_properties_keep(request: Request) -> list[str] | None | JSONResponse:
-    """The ``filter_properties`` names, ``None`` when the parameter is absent, or the 400 real
-    answers. Measured against api.notion.com (2022-06-28 and 2025-09-03) on 2026-10-15, which reads
-    the query string the way Node's ``qs`` does: the bare key, ``[]`` and an index from 0 to 20
-    all add to one list; any other single bracket (``[x]``, ``[21]``, ``[01]``) is a 400 unless the
-    bare key came first, and then lists nothing; a deeper bracket (``[0][x]``) or an index given
-    twice lists nothing. A bare ``[][]=Tags`` kept ``Tags`` on real and keeps nothing here."""
+_NOT_A_LIST = (
+    'The value of "filter_properties" in query parameters must be a string or list of strings'
+)
+
+
+def _filter_properties_keep(request: Request) -> tuple[list[str] | None, bool]:
+    """``(names, refused)``: the ``filter_properties`` names, ``None`` when the parameter is
+    absent, and whether real refuses it with :data:`_NOT_A_LIST`. Measured against api.notion.com
+    (2022-06-28 and 2025-09-03) on 2026-10-15, which reads the query string the way Node's ``qs``
+    does: the bare key, ``[]`` and an index from 0 to 20 all add to one list; any other single
+    bracket (``[x]``, ``[21]``, ``[01]``) is a 400 unless the bare key came first, and then lists
+    nothing; a deeper bracket (``[0][x]``) or an index given twice lists nothing. A bare
+    ``[][]=Tags`` kept ``Tags`` on real and keeps nothing here."""
     keep: list[str] = []
     slots: dict[str, list[str]] = {}
-    first = refused = None
+    first = None
+    refused = False
     for key, value in request.query_params.multi_items():
         if (m := _FILTER_PROPERTIES_KEY.fullmatch(key)) is None:
             continue
@@ -1039,17 +736,8 @@ def _filter_properties_keep(request: Request) -> list[str] | None | JSONResponse
             slots.setdefault(i, []).append(value)
         else:
             refused = first != []
-    if first is None:
-        return None
-    if refused:
-        return _error(
-            request,
-            400,
-            "validation_error",
-            'The value of "filter_properties" in query parameters must be a string or list of '
-            "strings",
-        )
-    return keep + [values[0] for values in slots.values() if len(values) == 1]
+    names = keep + [values[0] for values in slots.values() if len(values) == 1]
+    return (names if first is not None else None), refused
 
 
 def _filter_properties(page: dict, keep: list[str] | None) -> dict:
@@ -1183,6 +871,8 @@ async def get_page(page_id: str, request: Request):
     caller = auth.resolve_bearer(request)
     if (refusal := _refusal(request, caller)) is not None:
         return refusal
+    if (refusal := _get(request, req.PAGE_QUERY, reads_filter_properties=True)[1]) is not None:
+        return refusal
     conn = auth.conn(request)
     # One ACL-scoped query, not a resolve followed by a get_document refetch of the same row:
     # `id` is the PRIMARY KEY, so the ACL clause can only narrow "found" to "not found", never
@@ -1197,6 +887,8 @@ async def get_page(page_id: str, request: Request):
 async def get_block(block_id: str, request: Request):
     caller = auth.resolve_bearer(request)
     if (refusal := _refusal(request, caller)) is not None:
+        return refusal
+    if (refusal := _get(request, req.NOTHING)[1]) is not None:
         return refusal
     conn = auth.conn(request)
     row = store.notion_by_id(conn, _norm(block_id), auth.visible_ids(request, caller))
@@ -1234,11 +926,10 @@ async def get_block_children(block_id: str, request: Request):
     caller = auth.resolve_bearer(request)
     if (refusal := _refusal(request, caller)) is not None:
         return refusal
-    # The query string is judged before the lookup, the order the comments route keeps: a member
-    # real refuses is the 400 it answers, not the 404 for a block that is also missing.
-    if (refusal := _unknown_query(request, _Q_PAGINATE)) is not None:
-        return refusal
-    limit, refusal = _query_page_size(request, "list")
+    # The query string is read before the block is looked up, a cursor that names no block after
+    # (2026-10-21: an unknown block with `start_cursor=bogus` is the shape's 400, with a uuid
+    # that names nothing the 404).
+    query, refusal = _get(request, req.CHILDREN_QUERY)
     if refusal is not None:
         return refusal
     conn = auth.conn(request)
@@ -1252,25 +943,11 @@ async def get_block_children(block_id: str, request: Request):
     # empty list, and its block reports `has_children` false.
     blocks = [] if row["subtype"] == "database" else synth.notion_blocks(row["id"], row["content"])
     ids = [b["id"] for b in blocks]
-    offset, refusal = _cursor(
-        request.query_params.get("start_cursor"), ids, "uuid", request, "query"
-    )
-    if refusal is not None:
-        return refusal
-    if limit is _NEGATIVE_PAGE:
-        return _answer(request, _first_cursor_page(ids[0] if ids else None, "block"))
-    page = blocks[offset : offset + limit]
-    return _answer(
-        request,
-        _list_obj(
-            [_block_child(conn, row, b) for b in page],
-            offset,
-            len(page),
-            len(blocks),
-            "block",
-            encode=_uuid_cursor,
-        ),
-    )
+    start = _start(ids, query.get("start_cursor"))
+    if start is None:
+        return _cursor_refusal(request, query["start_cursor"])
+    page, after = _paged(blocks, ids, start, _size(query.get("page_size")))
+    return _answer(request, _list_obj([_block_child(conn, row, b) for b in page], after, "block"))
 
 
 # --------------------------------------------------------------------------- databases / data sources
@@ -1280,6 +957,8 @@ async def get_block_children(block_id: str, request: Request):
 async def get_database(database_id: str, request: Request):
     caller = auth.resolve_bearer(request)
     if (refusal := _refusal(request, caller)) is not None:
+        return refusal
+    if (refusal := _get(request, req.NOTHING)[1]) is not None:
         return refusal
     conn = auth.conn(request)
     row = store.notion_by_id(conn, _norm(database_id), auth.visible_ids(request, caller))
@@ -1296,6 +975,8 @@ async def get_data_source(data_source_id: str, request: Request):
     if (refusal := _refusal(request, caller)) is not None:
         return refusal
     if (refusal := _unmounted_here(request, data_sources=True)) is not None:
+        return refusal
+    if (refusal := _get(request, req.NOTHING)[1]) is not None:
         return refusal
     conn = auth.conn(request)
     # No subtype check needed here, unlike get_database's lookup by `id` (which spans both pages
@@ -1315,17 +996,86 @@ async def get_data_source(data_source_id: str, request: Request):
     return _answer(request, _data_source_obj(conn, row))
 
 
+def _query_session(db) -> str:
+    """The session a first page's `next_cursor` names, `s:<session>:<the next row's id>`. Real's
+    is random per first page and a later page carries the one it was handed; this one is derived
+    from the data source, so a corpus served twice pages the same way."""
+    raw = hashlib.shake_256(f"notion-query-session:{db['data_source_id']}".encode())
+    return str(uuid.UUID(bytes=raw.digest(16), version=4))
+
+
+_SESSION_CURSOR = re.compile(r"s:([^:]+):(.+)", re.DOTALL)
+
+
+def _row_start(ids: list[str], cursor: str | None, issued: str):
+    """``(start, session, named)`` for a data source query's `start_cursor`: the index the page
+    starts at (None to refuse it), the session the next cursor carries (None for a cursor that was
+    a row's id, whose next cursor is the next row's id), and what a refusal names.
+
+    Measured 2026-10-21. No cursor and an empty one are the first page. `s:<session>:<row>` starts
+    at that row and carries the session. A session real handed out reads only a row's dashed id,
+    and names anything else (`s:<issued>:y` is `invalid: y`); one it never did also reads the id
+    without dashes in lower case, and is the first page for anything else (`s:<fresh>:y`,
+    `s:<fresh>:b:<row>`). `s:`, `s:x:` and `s::<row>` are not that shape, and with any other text
+    the cursor is a row's dashed id or refused whole."""
+    if not cursor:
+        return 0, issued, None
+    shaped = _SESSION_CURSOR.fullmatch(cursor)
+    if shaped is None:
+        return _start(ids, cursor), None, cursor
+    session, row = shaped.groups()
+    start = _start(ids, row)
+    if session != issued and re.fullmatch("[0-9a-f]{32}", row):
+        start = _start(ids, _norm(row))
+    if start is None and session != issued:
+        start = 0
+    return start, session, row
+
+
+def _property_names(db) -> set[str]:
+    """What a query may name a property by: its name or its id."""
+    return {name for k, v in _schema_props(db).items() for name in (k, v["id"], v["name"])}
+
+
+def _unknown_filter_property(flt, names: set[str]) -> str | None:
+    """The first `property` a filter names that the data source does not have, depth first and
+    `and` before `or` whichever is sent first; a compound's own `property` is read by nothing
+    (`{"and":[],"property":"Nope"}` is served). Measured 2026-10-21 with an unknown property under
+    each of `and` and `or`, sent in both orders: the one under `and` is named."""
+    if not isinstance(flt, dict):
+        return None
+    if "and" in flt or "or" in flt:
+        for each in [*(flt.get("and") or []), *(flt.get("or") or [])]:
+            if (found := _unknown_filter_property(each, names)) is not None:
+                return found
+        return None
+    prop = flt.get("property")
+    return None if prop in names else prop
+
+
 async def _query_rows(request: Request, row_id: str, *, data_sources: bool):
     """The rows of one database, reached by whichever of the two query paths the caller's version
     serves. ``row_id`` is the id as spelled in the path -- a data source's under ``data_sources``,
     the database's own under ``databases`` -- and is resolved only once the credential and the
-    version have both been accepted, so a refused request never runs a lookup."""
+    version have both been accepted, so a refused request never runs a lookup.
+
+    The query string and the body are refused ahead of the lookup, and what names a property or a
+    row after it, in this order (2026-10-21): an unknown data source with `{"sorts":[{}]}` or
+    `{"page_size":0}` is the 400, with `{"start_cursor":"bogus"}` or a filter on `Nope` the 404;
+    a sort on an unknown property comes ahead of a filter on one, a filter's ahead of a cursor,
+    and a cursor ahead of a `filter_properties` naming nothing. Neither `filter` nor `sorts` is
+    applied to the rows."""
     caller = auth.resolve_bearer(request)
     if (refusal := _refusal(request, caller)) is not None:
         return refusal
     if (refusal := _unmounted_here(request, data_sources=data_sources)) is not None:
         return refusal
-    if (refusal := _unknown_query(request, _Q_NONE)) is not None:
+    query, refusal = _query(request, req.NOTHING, reads_filter_properties=True)
+    if refusal is not None:
+        return refusal
+    keep = query.get("filter_properties")
+    body, refusal = _json_body(request, req.QUERY_BODY)
+    if refusal is not None:
         return refusal
     db_id = (
         _db_doc_for_data_source(request, row_id) if data_sources else _existing_id(request, row_id)
@@ -1335,47 +1085,39 @@ async def _query_rows(request: Request, row_id: str, *, data_sources: bool):
     db = store.get_document(conn, "notion", db_id, visible_ids=visible) if db_id else None
     if db is None or db["subtype"] != "database":
         return _error(request, 404, "object_not_found", "Could not find the requested database.")
-    body, refusal = await _body_object(request)
-    if refusal is not None:
-        return refusal
-    if (refusal := _unknown_body(request, body, _B_QUERY_MEMBERS)) is not None:
-        return refusal
-    if (refusal := _query_body_refusal(request, body, db)) is not None:
-        return refusal
-    limit, refusal = _body_page_size(body, "list", request)
-    if refusal is not None:
-        return refusal
+    names = _property_names(db)
+    for sort in body.get("sorts", []):
+        if "property" in sort and sort["property"] not in names:
+            message = f"Could not find sort property with name or id: {sort['property']}"
+            return _error(request, 400, "validation_error", message)
+    if (missing := _unknown_filter_property(body.get("filter"), names)) is not None:
+        message = f"Could not find property with name or id: {missing}"
+        return _error(request, 400, "validation_error", message)
+    rows = store.children(conn, "notion", db_id, visible, limit=-1)
+    if body.get("result_type") == "data_source":
+        rows = []  # a database here holds pages, never a data source
+    ids = [r["id"] for r in rows]
+    start, session, named = _row_start(ids, body.get("start_cursor"), _query_session(db))
+    if start is None:
+        return _cursor_refusal(request, named)
+    # An empty name is no property's, and refused by none: `filter_properties=` lists nothing.
+    for name in keep or []:
+        if name and name not in names:
+            return _error(
+                request,
+                400,
+                "validation_error",
+                "The schema for the data source with the following ID is malformed: "
+                f"{db['data_source_id']}. The provided `filter_properties` contains an invalid "
+                f"attribute: {name}.",
+            )
+    page, after = _paged(rows, ids, start, _size(body.get("page_size")))
+    if after is not None and session is not None:
+        after = f"s:{session}:{after}"
     version = _version(request)
+    results = [_filter_properties(_page_obj(conn, r, version), keep) for r in page]
     trailer = "page_or_data_source" if _data_sources_model(version) else "page_or_database"
-    token = body.get("start_cursor")
-    if limit is _NEGATIVE_PAGE:
-        # The empty page names the first row, so one row is all it reads.
-        first = store.children(conn, "notion", db_id, visible, limit=1, offset=0)
-        cursor = f"s:{first[0]['id']}:{db['data_source_id']}" if first else None
-        return _answer(request, _first_cursor_page(cursor, trailer))
-    # One row past the page tells `has_more`, so the fetch is the window the request needs -- not
-    # the whole row set. Only a cursor that names a row (this route's negative-size `s:` token, or
-    # a caller handing back a row id) has to find that row first, and only that request reads the
-    # ids; a token the route must refuse is judged before anything is read.
-    if token is not None and (not isinstance(token, str) or not token):
-        offset, refusal = _cursor(token, [], "query", request, "body")
-        if refusal is not None:
-            return refusal
-    offset = pagination.decode_cursor_or_none(token) if isinstance(token, str) and token else None
-    if token is None or offset is not None:
-        start = offset or 0
-        rows = store.children(conn, "notion", db_id, visible, limit=limit + 1, offset=start)
-        page = rows[:limit]
-        results = [_page_obj(conn, r, version) for r in page]
-        return _answer(request, _list_obj(results, start, len(page), start + len(rows), trailer))
-    ids = [r["id"] for r in store.children(conn, "notion", db_id, visible, limit=-1, offset=0)]
-    offset, refusal = _cursor(token, ids, "query", request, "body")
-    if refusal is not None:
-        return refusal
-    rows = store.children(conn, "notion", db_id, visible, limit=limit + 1, offset=offset)
-    page = rows[:limit]
-    results = [_page_obj(conn, r, version) for r in page]
-    return _answer(request, _list_obj(results, offset, len(page), offset + len(rows), trailer))
+    return _answer(request, _list_obj(results, after, trailer))
 
 
 @router.post(
@@ -1396,6 +1138,10 @@ async def query_database(database_id: str, request: Request):
 
 # --------------------------------------------------------------------------- search
 
+#: How many documents a page reads past its own size before it reads them all, where a filter on
+#: the object type can leave a window of the corpus short of a page.
+_OVERFETCH = 4
+
 
 @router.post(
     "/search",
@@ -1403,50 +1149,28 @@ async def query_database(database_id: str, request: Request):
     openapi_extra={**_B_SEARCH, **_params(_P_FILTER_PROPERTIES)},
 )
 async def search(request: Request):
+    """Pages and data sources (databases before 2025-09-03) the caller can see."""
     caller = auth.resolve_bearer(request)
     if (refusal := _refusal(request, caller)) is not None:
         return refusal
-    # Answered after the credential and the version and before the body, measured 2026-10-15.
-    if isinstance(keep := _filter_properties_keep(request), JSONResponse):
-        return keep
-    if (
-        refusal := _unknown_query(request, _Q_SEARCH, brackets=frozenset({"filter_properties"}))
-    ) is not None:
-        return refusal
-    body, refusal = await _body_object(request)
+    query, refusal = _query(request, req.NOTHING, reads_filter_properties=True)
     if refusal is not None:
         return refusal
-    if (refusal := _unknown_body(request, body, _B_SEARCH_MEMBERS)) is not None:
-        return refusal
-    # Measured against api.notion.com on 2026-10-01 and 2026-10-04: once the credential and the
-    # version clear, a `query` that is present must be a string and a `filter` that is present an
-    # object, `null` included, or the request is 400 `validation_error` quoting the value back.
-    # When both are wrong the message names `query`, wherever each sits in the body.
-    for member, kind, named in (("query", str, "a string"), ("filter", dict, "an object")):
-        if member in body and not isinstance(body[member], kind):
-            value = json.dumps(body[member], ensure_ascii=False, separators=(",", ":"))
-            return _error(
-                request,
-                400,
-                "validation_error",
-                f"body failed validation: body.{member} should be {named} or `undefined`, "
-                f"instead was `{value}`.",
-            )
-    # A filter and a sort real refuses are named before a row is read (measured 2026-09-30).
-    if "filter" in body:
-        if (refusal := _search_filter_refusal(request, body, _version(request))) is not None:
-            return refusal
-    if "sort" in body:
-        if (refusal := _search_sort_refusal(request, body)) is not None:
-            return refusal
-    limit, refusal = _body_page_size(body, "list", request)
+    keep = query.get("filter_properties")
+    version = _version(request)
+    body, refusal = _json_body(request, req.search_body(legacy=not _data_sources_model(version)))
     if refusal is not None:
         return refusal
+    if "sort" in body and (said := req.search_sort_refusal(body["sort"])) is not None:
+        return _error(request, 400, "validation_error", said)
     conn = auth.conn(request)
     visible = auth.visible_ids(request, caller)
-    query = body.get("query", "")
-    want = body.get("filter", {}).get("value")  # 'page' | 'database' | 'data_source' | None
-    version = _version(request)
+    # Trimmed as JavaScript trims: a `query` of U+3000, U+2028 or U+FEFF was every result, and one
+    # of U+001C, U+0085 or U+200B none (2026-10-21).
+    text = body.get("query", "").strip(req.JS_SPACE)
+    flt = body.get("filter", {})
+    # `page`, `data_source` or None; 2022-06-28's `database` asks for what `data_source` does.
+    want = {"database": "data_source"}.get(flt.get("value"), flt.get("value"))
     # A `data_source` filter keeps the database rows. That filter, an unfiltered search and a
     # `query` list each database as a database before 2025-09-03 and as its data source from it,
     # in the shape `GET /v1/data_sources/{id}` answers less its `request_id`. Real answered the
@@ -1455,43 +1179,41 @@ async def search(request: Request):
     # 2026-10-17), and a `query` naming one database's title with that database's data source
     # under 2025-09-03 (2026-10-17).
     render_data_source = _data_sources_model(version) and want in (None, "data_source")
+    cursor = body.get("start_cursor")
+    size = _size(body.get("page_size"))
 
-    def read(window: int) -> list:
-        """The object-type filter applied to one over-fetched window of the corpus. Over-fetching
-        keeps a filtered page full; the window is bounded, not the corpus. An empty query means
-        "everything the integration can see" (real Notion behavior), so list instead of FTS."""
-        if query.strip():
-            rows = store.search_documents(conn, query, "notion", visible, limit=window, offset=0)
+    def read(window: int) -> tuple[list, bool]:
+        """The results among the first ``window`` documents, and whether there were that many."""
+        if text:
+            rows = store.search_documents(conn, text, "notion", visible, limit=window, offset=0)
         else:
             rows = store.list_documents(conn, "notion", visible_ids=visible, limit=window, offset=0)
-        return [
+        picked = [
             r
             for r in rows
-            if not (want in ("database", "data_source") and r["subtype"] != "database")
+            if not flt.get("in_trash")
+            and not (want == "data_source" and r["subtype"] != "database")
             and not (want == "page" and r["subtype"] == "database")
         ]
+        return picked, window != -1 and len(rows) == window
 
-    size = _PAGE_MAX if limit is _NEGATIVE_PAGE else limit
-    token = body.get("start_cursor")
-    # A uuid this route did not mint (its own cursor is the reserved prefix) names an item, and
-    # the first window is where any item a page hands back as its cursor sits.
-    ids = []
-    window = None
-    if token and _own_cursor_offset(str(token)) is None and _UUID_RE.fullmatch(str(token)):
-        window = read(size * 4)
-        ids = [r["id"] for r in window]
-    offset, refusal = _cursor(token, ids, "uuid", request, "body")
-    if refusal is not None:
-        return refusal
-    # A uuid cursor already read the first window to find the item it names; reuse it when the
-    # page it resumes at still fits inside, so that request runs one store query, not two.
-    picked = (
-        window if window is not None and offset + size <= len(window) else read(size * 4 + offset)
-    )
-    if limit is _NEGATIVE_PAGE:
-        trailer = "page_or_data_source" if _data_sources_model(version) else "page_or_database"
-        return _answer(request, _first_cursor_page(picked[0]["id"] if picked else None, trailer))
-    shown = picked[offset : offset + size]
+    # A page and the result after it, read off a window of the corpus where that is enough; a
+    # cursor, which can name any result, reads the whole of it.
+    picked, cut = read(-1 if cursor else ((size or 1) + 1) * _OVERFETCH)
+    if cut and len(picked) <= (size or 0):
+        picked, cut = read(-1)
+    served = [
+        r["data_source_id"] if r["subtype"] == "database" and render_data_source else r["id"]
+        for r in picked
+    ]
+    start = _start(served, cursor)
+    if start is None:
+        # 2022-06-28 starts at a database named by its data source's id too, the id 2025-09-03
+        # serves it by (2026-10-21).
+        start = _start([r["data_source_id"] for r in picked], cursor)
+    if start is None:
+        return _cursor_refusal(request, cursor)
+    shown, after = _paged(picked, served, start, size)
     # A database row is narrowed under every Notion-Version, its parent typed `database_id` or
     # `data_source_id`; a page outside a database keeps its title whatever is listed.
     results = [
@@ -1503,10 +1225,7 @@ async def search(request: Request):
         for r in shown
     ]
     trailer = "page_or_data_source" if _data_sources_model(version) else "page_or_database"
-    return _answer(
-        request,
-        _list_obj(results, offset, len(shown), len(picked), trailer, encode=_uuid_cursor),
-    )
+    return _answer(request, _list_obj(results, after, trailer))
 
 
 # --------------------------------------------------------------------------- users
@@ -1514,33 +1233,40 @@ async def search(request: Request):
 
 @router.get("/users", response_model=NotionList, openapi_extra=_params(*_P_PAGINATE))
 async def list_users(request: Request):
+    """The workspace's users. A `page_size` of -2 or below is real's 503, which it answered after
+    reading the cursor (`page_size=-2&start_cursor=bogus` is the cursor's 400) and on each of
+    -2, -5 and -100 (2026-09-30 and 2026-10-21); -1 is the empty page, as on every list."""
     caller = auth.resolve_bearer(request)
     if (refusal := _refusal(request, caller)) is not None:
         return refusal
-    conn = auth.conn(request)
-    if (refusal := _unknown_query(request, _Q_PAGINATE)) is not None:
+    query, refusal = _get(request, req.USERS_QUERY)
+    if refusal is not None:
         return refusal
+    conn = auth.conn(request)
     users = store.list_users(conn)
     ids = [synth.notion_user_id(u["email"]) for u in users]
-    limit, refusal = _query_page_size(request, "users")
-    if refusal is not None:
-        return refusal
-    offset, refusal = _cursor(
-        request.query_params.get("start_cursor"), ids, "users", request, "query"
-    )
-    if refusal is not None:
-        return refusal
-    if limit is _NEGATIVE_PAGE:
-        return _answer(request, _first_cursor_page(ids[0] if ids else None, "user"))
-    page = users[offset : offset + limit]
+    start = _start(ids, query.get("start_cursor"))
+    if start is None:
+        return _cursor_refusal(request, query["start_cursor"])
+    if query.get("page_size", 0) <= -2:
+        return _error(
+            request,
+            503,
+            "service_unavailable",
+            "Public API service is temporarily unavailable, please try again later.",
+            {"endpoint_name": "public_listUsers", "notion_error_name": "DatastoreInfraError"},
+        )
+    page, after = _paged(users, ids, start, _size(query.get("page_size")))
     results = [_user_obj(conn, u["email"]) for u in page]
-    return _answer(request, _list_obj(results, offset, len(page), len(users), "user"))
+    return _answer(request, _list_obj(results, after, "user"))
 
 
 @router.get("/users/me", response_model=NotionObject, openapi_extra=_params())
 async def get_me(request: Request):
     caller = auth.resolve_bearer(request)
     if (refusal := _refusal(request, caller)) is not None:
+        return refusal
+    if (refusal := _get(request, req.NOTHING)[1]) is not None:
         return refusal
     conn = auth.conn(request)
     if caller.email:  # a user token → that person
@@ -1570,6 +1296,8 @@ async def get_user(user_id: str, request: Request):
     caller = auth.resolve_bearer(request)
     if (refusal := _refusal(request, caller)) is not None:
         return refusal
+    if (refusal := _get(request, req.NOTHING)[1]) is not None:
+        return refusal
     conn = auth.conn(request)
     key = _norm(user_id)
     for u in store.list_users(conn):
@@ -1586,46 +1314,14 @@ async def list_comments(request: Request):
     caller = auth.resolve_bearer(request)
     if (refusal := _refusal(request, caller)) is not None:
         return refusal
-    conn = auth.conn(request)
-    block_id = request.query_params.get("block_id")
-    # Once the credential and the version clear, real refuses a comments query whose `block_id`
-    # is absent, empty or not a uuid before it looks the id up (measured 2026-10-01 and
-    # 2026-10-02), and answers a database's id as restricted -- where a page's or a block's id is
-    # the 200 list both sides agree on.
-    if block_id is None:
-        return _error(
-            request,
-            400,
-            "validation_error",
-            "query failed validation: query.block_id should be defined, instead was `undefined`.",
-        )
-    if not block_id.strip():
-        return _error(
-            request,
-            400,
-            "validation_error",
-            "query failed validation: query.block_id should be a string, instead was `0`.",
-        )
-    # What real reads as a uuid here (measured 2026-10-02): the dashed 8-4-4-4-12 form in either
-    # case, or 32 lower-case hex digits. It echoes anything else as JSON.
-    if not re.fullmatch(
-        r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}|[0-9a-f]{32}",
-        block_id,
-    ):
-        return _error(
-            request,
-            400,
-            "validation_error",
-            "query failed validation: query.block_id should be a valid uuid, instead was "
-            f"`{json.dumps(block_id, ensure_ascii=False)}`.",
-        )
-    # The rest of the query string is judged before the id is looked up, so the derived-block
-    # answer below does not skip a member real refuses.
-    if (refusal := _unknown_query(request, _Q_COMMENTS)) is not None:
-        return refusal
-    limit, refusal = _query_page_size(request, "comments")
+    # Real reads `block_id`, then the cursor's shape and the page size, before it looks the id up
+    # (``notion_request.COMMENTS_QUERY``), answers a database's id as restricted, and serves a key
+    # it does not read. A cursor that names no comment is refused after the lookup.
+    query, refusal = _get(request, req.COMMENTS_QUERY)
     if refusal is not None:
         return refusal
+    conn = auth.conn(request)
+    block_id = query["block_id"]
     # One ACL-scoped query (the parent must itself be visible to the caller), not
     # a resolve followed by a get_document refetch of the same row -- see get_page and friends.
     row = store.notion_by_id(conn, _norm(block_id), auth.visible_ids(request, caller))
@@ -1639,12 +1335,9 @@ async def list_comments(request: Request):
             if page["subtype"] != "database" and any(
                 b["id"] == wanted for b in synth.notion_blocks(page["id"], page["content"])
             ):
-                offset, refusal = _cursor(
-                    request.query_params.get("start_cursor"), [], "uuid", request, "query"
-                )
-                if refusal is not None:
-                    return refusal
-                return _answer(request, _list_obj([], offset, 0, 0, "comment"))
+                if query.get("start_cursor") is not None:
+                    return _cursor_refusal(request, query["start_cursor"], comments=True)
+                return _answer(request, _list_obj([], None, "comment"))
         return _error(
             request, 404, "object_not_found", f"Could not find block with ID: {block_id}."
         )
@@ -1658,14 +1351,10 @@ async def list_comments(request: Request):
     parent_id = row["id"]
     comments = store.doc_comments(conn, "notion", parent_id)
     ids = [synth.notion_id(c["id"]) for c in comments]
-    offset, refusal = _cursor(
-        request.query_params.get("start_cursor"), ids, "uuid", request, "query"
-    )
-    if refusal is not None:
-        return refusal
-    if limit is _NEGATIVE_PAGE:
-        return _answer(request, _first_cursor_page(ids[0] if ids else None, "comment"))
-    page = comments[offset : offset + limit]
+    start = _start(ids, query.get("start_cursor"))
+    if start is None:
+        return _cursor_refusal(request, query["start_cursor"], comments=True)
+    page, after = _paged(comments, ids, start, _size(query.get("page_size")))
     results = [
         {
             "object": "comment",
@@ -1679,10 +1368,7 @@ async def list_comments(request: Request):
         }
         for c in page
     ]
-    return _answer(
-        request,
-        _list_obj(results, offset, len(page), len(comments), "comment", encode=_uuid_cursor),
-    )
+    return _answer(request, _list_obj(results, after, "comment"))
 
 
 # --------------------------------------------------------------------------- misc
