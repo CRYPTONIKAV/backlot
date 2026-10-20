@@ -533,7 +533,11 @@ def test_notion_search_lists_the_databases_in_the_versions_shape(
     as_kind = synth.notion_data_source_id if kind == "data_source" else synth.notion_id
     served_id = as_kind("nt-tasks-db")
     got = next(r for r in listed if r["id"] == served_id)
-    assert got == client.get(f"/notion/v1/{kind}s/{served_id}", headers=h).json()
+    fetched = client.get(f"/notion/v1/{kind}s/{served_id}", headers=h).json()
+    # `request_id` names the response, not the object: it rides the list body in a search and the
+    # object's own body in the `GET`, so it is dropped from the latter before comparing shapes.
+    fetched.pop("request_id", None)
+    assert got == fetched
 
 
 @pytest.mark.parametrize(
@@ -953,7 +957,7 @@ def test_notion_page_shape(tmp_path):
     assert obj["properties"]["title"]["type"] == "title"
     assert obj["properties"]["title"]["title"][0]["plain_text"] == "Runbook"
     assert obj["icon"] == {"type": "emoji", "emoji": "📟"}
-    assert obj["url"].startswith("https://www.notion.so/")
+    assert obj["url"] == "https://app.notion.com/p/" + obj["id"].replace("-", "")
     # a database row exposes its property values + a database_id parent
     row = _page_obj(conn, store.get_document(conn, "notion", served_id("notion", "nf-row")))
     assert row["parent"]["type"] == "database_id"
@@ -1013,3 +1017,189 @@ def test_database_blocks_have_no_children(client, admin_h, version):
     pid = synth.notion_id("nt-runbook")
     assert client.get(f"/notion/v1/blocks/{pid}", headers=h).json()["has_children"] is True
     assert client.get(f"/notion/v1/blocks/{pid}/children", headers=h).json()["results"]
+
+
+# --- the members real serves ----------------------------------------------------
+# The measurements are recorded, with their date, in backlot/routers/notion.py: the partial user
+# on `_partial_user`, the version-typed parent on `_parent_field`, the child block's members on
+# `_block_child`, the object members on `_page_obj`/`_database_obj`/`_data_source_obj`, the URL on
+# `_object_url` and the 200's request id on `_answer`.
+
+_DATA_SOURCE_MEMBERS = {
+    "object",
+    "id",
+    "archived",
+    "cover",
+    "created_by",
+    "created_time",
+    "database_parent",
+    "database_type",
+    "description",
+    "icon",
+    "in_trash",
+    "is_inline",
+    "last_edited_by",
+    "last_edited_time",
+    "parent",
+    "properties",
+    "public_url",
+    "title",
+    "url",
+}
+
+
+def test_notion_authors_are_the_partial_user_everywhere(tmp_path):
+    from backlot.routers.notion import _data_source_obj, _database_obj, _page_obj
+
+    conn = _notion_conn(tmp_path)
+    page_row = store.get_document(conn, "notion", served_id("notion", "nf-page"))
+    row = store.get_document(conn, "notion", served_id("notion", "nf-row"))
+    dbrow = store.get_document(conn, "notion", served_id("notion", "nf-db"))
+    for obj in (
+        _page_obj(conn, page_row, "2025-09-03"),
+        _page_obj(conn, row, "2025-09-03"),
+        _database_obj(conn, dbrow, "2022-06-28"),
+        _data_source_obj(conn, dbrow),
+    ):
+        assert set(obj["created_by"]) == {"object", "id"}
+        assert set(obj["last_edited_by"]) == {"object", "id"}
+        assert obj["created_by"]["object"] == "user"
+    # The page and the database are authored by ava, the row by bob: the id is the person's own
+    # served id, not a workspace-wide placeholder.
+    assert _page_obj(conn, page_row, "2025-09-03")["created_by"]["id"] == synth.notion_user_id(
+        "ava@acme.com"
+    )
+    assert _page_obj(conn, row, "2025-09-03")["created_by"]["id"] == synth.notion_user_id(
+        "bob@acme.com"
+    )
+
+
+def test_notion_row_parent_and_list_trailer_follow_the_version(tmp_path):
+    from backlot.routers.notion import _page_obj
+
+    conn = _notion_conn(tmp_path)
+    row = store.get_document(conn, "notion", served_id("notion", "nf-row"))
+    dbrow = store.get_document(conn, "notion", served_id("notion", "nf-db"))
+    new = _page_obj(conn, row, "2025-09-03")["parent"]
+    assert new == {
+        "type": "data_source_id",
+        "data_source_id": dbrow["data_source_id"],
+        "database_id": dbrow["id"],
+    }
+    old = _page_obj(conn, row, "2022-06-28")["parent"]
+    assert old == {"type": "database_id", "database_id": dbrow["id"]}
+
+
+def test_notion_child_block_has_parent_timestamps_and_authors(tmp_path):
+    from backlot.routers.notion import _block_child
+
+    conn = _notion_conn(tmp_path)
+    row = store.get_document(conn, "notion", served_id("notion", "nf-page"))
+    block = synth.notion_blocks(row["id"], row["content"])[0]
+    got = _block_child(conn, row, block)
+    assert len(got) == 12
+    assert got["parent"] == {"type": "page_id", "page_id": row["id"]}
+    assert got["created_by"] == {"object": "user", "id": synth.notion_user_id("ava@acme.com")}
+    assert got["last_edited_by"] == got["created_by"]
+    assert got["created_time"].endswith("Z") and got["last_edited_time"].endswith("Z")
+    assert got[got["type"]] == block[block["type"]]
+
+
+def test_notion_page_database_and_data_source_members_per_version(tmp_path):
+    from backlot.routers.notion import _data_source_obj, _database_obj, _page_obj
+
+    conn = _notion_conn(tmp_path)
+    dbrow = store.get_document(conn, "notion", served_id("notion", "nf-db"))
+    page = _page_obj(conn, store.get_document(conn, "notion", served_id("notion", "nf-page")))
+    assert page["is_archived"] is False and page["is_locked"] is False
+    new = _database_obj(conn, dbrow, "2025-09-03")
+    assert new["database_type"] is None and new["is_locked"] is False
+    assert "created_by" not in new and "last_edited_by" not in new
+    legacy = _database_obj(conn, dbrow, "2022-06-28")
+    assert legacy["database_type"] is None
+    assert legacy["created_by"]["object"] == "user" and "properties" in legacy
+    ds = _data_source_obj(conn, dbrow)
+    assert set(ds) == _DATA_SOURCE_MEMBERS
+    assert "name" not in ds
+    assert ds["title"][0]["plain_text"] == dbrow["title"]
+    assert ds["database_type"] is None and ds["is_inline"] is False
+
+
+def test_notion_url_is_the_app_host_on_all_four_objects(tmp_path):
+    from backlot.routers.notion import _data_source_obj, _database_obj, _page_obj
+
+    conn = _notion_conn(tmp_path)
+    page = _page_obj(conn, store.get_document(conn, "notion", served_id("notion", "nf-page")))
+    dbrow = store.get_document(conn, "notion", served_id("notion", "nf-db"))
+    for obj in (page, _database_obj(conn, dbrow, "2025-09-03"), _data_source_obj(conn, dbrow)):
+        assert obj["url"] == "https://app.notion.com/p/" + obj["id"].replace("-", "")
+        assert "www.notion.so" not in obj["url"]
+
+
+def test_notion_success_answers_name_a_request_id(client, notion_h):
+    import uuid
+
+    pid = synth.notion_id("nt-runbook")
+    answers = [
+        client.get("/notion/v1/users/me", headers=notion_h),
+        client.get(f"/notion/v1/pages/{pid}", headers=notion_h),
+        client.post("/notion/v1/search", json={}, headers=notion_h),
+    ]
+    for r in answers:
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["request_id"] == r.headers["x-notion-request-id"]
+        assert list(body)[-1] == "request_id"
+        assert uuid.UUID(body["request_id"]).version == 4
+    first = client.get("/notion/v1/users/me", headers=notion_h)
+    again = client.get("/notion/v1/users/me", headers=notion_h)
+    assert first.json()["request_id"] == again.json()["request_id"]
+    other = client.post("/notion/v1/search", json={}, headers=notion_h)
+    assert other.json()["request_id"] != first.json()["request_id"]
+
+
+def test_notion_search_and_query_trailers_follow_the_version(client, admin_h):
+    def post(h, path="/notion/v1/search", body=None):
+        return client.post(path, json=body or {}, headers=h).json()
+
+    new = post({**admin_h, "Notion-Version": "2025-09-03"})
+    assert new["type"] == "page_or_data_source" and "page_or_data_source" in new
+    old = post({**admin_h, "Notion-Version": "2022-06-28"})
+    assert old["type"] == "page_or_database" and "page_or_database" in old
+    dsid = synth.notion_data_source_id("nt-tasks-db")
+    new_rows = post(
+        {**admin_h, "Notion-Version": "2025-09-03"}, f"/notion/v1/data_sources/{dsid}/query"
+    )
+    assert new_rows["type"] == "page_or_data_source" and "page_or_data_source" in new_rows
+    dbid = synth.notion_id("nt-tasks-db")
+    old_rows = post(
+        {**admin_h, "Notion-Version": "2022-06-28"}, f"/notion/v1/databases/{dbid}/query"
+    )
+    assert old_rows["type"] == "page_or_database" and "page_or_database" in old_rows
+
+
+def test_notion_blocks_over_http_carry_authors_and_the_page_parent(client, notion_h):
+    pid = synth.notion_id("nt-runbook")
+    block = client.get(f"/notion/v1/blocks/{pid}", headers=notion_h).json()
+    assert block["created_by"] == block["last_edited_by"]
+    assert block["created_by"]["object"] == "user"
+    children = client.get(f"/notion/v1/blocks/{pid}/children", headers=notion_h)
+    assert children.status_code == 200
+    body = children.json()
+    assert body["request_id"] == children.headers["x-notion-request-id"]
+    for child in body["results"]:
+        assert child["parent"] == {"type": "page_id", "page_id": pid}
+        assert child["created_by"]["object"] == "user"
+        assert len(child) == 12
+
+
+def test_notion_bot_names_its_workspace(client, notion_h):
+    import uuid
+
+    me = client.get("/notion/v1/users/me", headers=notion_h).json()
+    bot = me["bot"]
+    assert set(bot) == {"owner", "workspace_name", "workspace_id", "workspace_limits"}
+    assert uuid.UUID(bot["workspace_id"]).version == 4
+    limits = bot["workspace_limits"]
+    assert isinstance(limits["max_file_upload_size_in_bytes"], int)
+    assert limits["max_file_upload_size_in_bytes"] > 0

@@ -401,6 +401,41 @@ def _list_obj(results: list, offset: int, page_len: int, total: int, type_key: s
     }
 
 
+def _partial_user(email: str) -> dict:
+    """The user member real puts on `created_by` / `last_edited_by`: `object` and `id` only.
+
+    Measured against api.notion.com on 2026-09-30: a page, a row, a block, a
+    database and a data source answer this two-member user there, while `GET /v1/users/{id}`
+    keeps the full person `_user_obj` renders.
+    """
+    return {"object": "user", "id": synth.notion_user_id(email or "")}
+
+
+def _object_url(object_id: str) -> str:
+    """The public URL real serves for a page, a database or a data source (measured 2026-09-30):
+    `app.notion.com/p/` and the served id without its dashes."""
+    return f"https://app.notion.com/p/{object_id.replace('-', '')}"
+
+
+def _workspace_id(name: str) -> str:
+    """A stable dashed uuid for one workspace, derived from its name the way the other served
+    ids are (the same corpus answers the same id)."""
+    raw = hashlib.shake_256(f"notion-workspace:{name}".encode()).digest(16)
+    return str(uuid.UUID(bytes=raw, version=4))
+
+
+def _answer(request: Request, payload: dict) -> JSONResponse:
+    """A 200 in Notion's envelope: `request_id` as the last body member and on the header.
+
+    Measured 2026-09-30: every 200, list bodies included, carries the same id in
+    `request_id` and `x-notion-request-id`; `_error` already answers refusals that way.
+    """
+    request_id = _request_id(request)
+    body = dict(payload)
+    body["request_id"] = request_id
+    return JSONResponse(content=body, headers={"x-notion-request-id": request_id})
+
+
 def _user_obj(conn, email: str) -> dict:
     u = store.get_user(conn, email)
     name = u["display_name"] if u else (email.split("@")[0] if email else "Unknown")
@@ -429,10 +464,22 @@ def _cover(url: str | None) -> dict | None:
     return {"type": "external", "external": {"url": url}} if url else None
 
 
-def _parent_field(row) -> dict:
-    # `parent_id` already HOLDS the parent's served id — the importer resolved it there.
-    # Hashing it again would name a page nothing serves.
+def _parent_field(conn, row, version: str | None = None) -> dict:
+    """The `parent` a page serves, in the model the caller's version reads.
+
+    `parent_id` already HOLDS the parent's served id -- the importer resolved it there. Under
+    `2025-09-03` real types a row's parent `data_source_id` and names the data source beside the
+    database id (measured 2026-09-30); before the split it types it `database_id`.
+    """
     if row["parent_id"]:
+        if version and _data_sources_model(version):
+            database = store.get_document(conn, "notion", row["parent_id"])
+            data_source_id = database["data_source_id"] if database is not None else None
+            return {
+                "type": "data_source_id",
+                "data_source_id": data_source_id,
+                "database_id": row["parent_id"],
+            }
         return {"type": "database_id", "database_id": row["parent_id"]}
     return {"type": "workspace", "workspace": True}
 
@@ -452,7 +499,7 @@ def _prop_value(name: str, value) -> dict:
     return {"id": name, "type": "rich_text", "rich_text": synth.notion_rich_text(str(value))}
 
 
-def _page_obj(conn, row) -> dict:
+def _page_obj(conn, row, version: str | None = None) -> dict:
     pid = row["id"]
     created = row["created_ts"]
     updated = row["updated_ts"] or created
@@ -464,15 +511,17 @@ def _page_obj(conn, row) -> dict:
         "id": pid,
         "created_time": synth.rfc3339(created),
         "last_edited_time": synth.rfc3339(updated),
-        "created_by": _user_obj(conn, row["author_email"]),
-        "last_edited_by": _user_obj(conn, row["author_email"]),
+        "created_by": _partial_user(row["author_email"]),
+        "last_edited_by": _partial_user(row["author_email"]),
         "cover": _cover(row["cover"]),
         "icon": _emoji_icon(row["icon"]),
-        "parent": _parent_field(row),
+        "parent": _parent_field(conn, row, version),
         "archived": False,
         "in_trash": False,
+        "is_archived": False,
+        "is_locked": False,
         "properties": props,
-        "url": f"https://www.notion.so/{pid.replace('-', '')}",
+        "url": _object_url(pid),
         "public_url": None,
     }
 
@@ -548,8 +597,8 @@ def _database_obj(conn, row, version: str) -> dict:
         "id": did,
         "created_time": synth.rfc3339(created),
         "last_edited_time": synth.rfc3339(updated),
-        "created_by": _user_obj(conn, row["author_email"]),
-        "last_edited_by": _user_obj(conn, row["author_email"]),
+        "created_by": _partial_user(row["author_email"]),
+        "last_edited_by": _partial_user(row["author_email"]),
         "title": synth.notion_rich_text(row["title"]),
         "description": synth.notion_rich_text(row["content"]),
         "icon": _emoji_icon(row["icon"]),
@@ -558,10 +607,16 @@ def _database_obj(conn, row, version: str) -> dict:
         "archived": False,
         "in_trash": False,
         "is_inline": False,
-        "url": f"https://www.notion.so/{did.replace('-', '')}",
+        "database_type": None,
+        "is_locked": False,
+        "url": _object_url(did),
         "public_url": None,
     }
     if _data_sources_model(version):
+        # Real drops the two authors from a database under the data-sources model (measured
+        # 2026-09-30).
+        obj.pop("created_by")
+        obj.pop("last_edited_by")
         obj["data_sources"] = [{"id": row["data_source_id"], "name": row["title"]}]
     else:
         obj["properties"] = _schema_props(row)
@@ -569,17 +624,58 @@ def _database_obj(conn, row, version: str) -> dict:
 
 
 def _data_source_obj(conn, row) -> dict:
+    """The data source real serves under `2025-09-03` (measured 2026-09-30): the
+    members `GET /v1/data_sources/{id}` answers, with `title` where Backlot used to send `name`
+    and no `name` at all."""
+    created = row["created_ts"]
+    updated = row["updated_ts"] or created
     return {
         "object": "data_source",
         "id": row["data_source_id"],
-        "name": row["title"],
+        "created_time": synth.rfc3339(created),
+        "last_edited_time": synth.rfc3339(updated),
+        "created_by": _partial_user(row["author_email"]),
+        "last_edited_by": _partial_user(row["author_email"]),
+        "title": synth.notion_rich_text(row["title"]),
+        "description": synth.notion_rich_text(row["content"]),
+        "icon": _emoji_icon(row["icon"]),
+        "cover": _cover(row["cover"]),
         "parent": {"type": "database_id", "database_id": row["id"]},
         "database_parent": {"type": "database_id", "database_id": row["id"]},
+        "database_type": None,
         "properties": _schema_props(row),
+        "archived": False,
+        "in_trash": False,
+        "is_inline": False,
+        "public_url": None,
+        "url": _object_url(row["data_source_id"]),
     }
 
 
 # --------------------------------------------------------------------------- pages / blocks
+
+
+def _block_child(conn, page_row, block: dict) -> dict:
+    """A block of `blocks.children` in the twelve-member shape real serves (measured 2026-09-30):
+    the seven `synth.notion_blocks` emits plus the page parent, both timestamps and the two
+    partial authors."""
+    created = page_row["created_ts"]
+    updated = page_row["updated_ts"] or created
+    kind = block["type"]
+    return {
+        "object": "block",
+        "id": block["id"],
+        "parent": {"type": "page_id", "page_id": page_row["id"]},
+        "created_time": synth.rfc3339(created),
+        "last_edited_time": synth.rfc3339(updated),
+        "created_by": _partial_user(page_row["author_email"]),
+        "last_edited_by": _partial_user(page_row["author_email"]),
+        "has_children": block["has_children"],
+        "in_trash": block["in_trash"],
+        "archived": block["archived"],
+        "type": kind,
+        kind: block[kind],
+    }
 
 
 @router.get("/pages/{page_id}", response_model=NotionObject, openapi_extra=_params())
@@ -594,7 +690,7 @@ async def get_page(page_id: str, request: Request):
     row = store.notion_by_id(conn, _norm(page_id), auth.visible_ids(request, caller))
     if row is None or row["subtype"] == "database":
         return _error(request, 404, "object_not_found", f"Could not find page with ID: {page_id}.")
-    return _page_obj(conn, row)
+    return _answer(request, _page_obj(conn, row, _version(request)))
 
 
 @router.get("/blocks/{block_id}", response_model=NotionObject, openapi_extra=_params())
@@ -610,18 +706,23 @@ async def get_block(block_id: str, request: Request):
         )
     bid = row["id"]
     kind = "child_database" if row["subtype"] == "database" else "child_page"
-    return {
-        "object": "block",
-        "id": bid,
-        "type": kind,
-        "has_children": row["subtype"] != "database",
-        "archived": False,
-        "in_trash": False,
-        "created_time": synth.rfc3339(row["created_ts"]),
-        "last_edited_time": synth.rfc3339(row["updated_ts"] or row["created_ts"]),
-        "parent": _parent_field(row),
-        kind: {"title": row["title"]},
-    }
+    return _answer(
+        request,
+        {
+            "object": "block",
+            "id": bid,
+            "type": kind,
+            "has_children": row["subtype"] != "database",
+            "archived": False,
+            "in_trash": False,
+            "created_time": synth.rfc3339(row["created_ts"]),
+            "last_edited_time": synth.rfc3339(row["updated_ts"] or row["created_ts"]),
+            "created_by": _partial_user(row["author_email"]),
+            "last_edited_by": _partial_user(row["author_email"]),
+            "parent": _parent_field(conn, row, _version(request)),
+            kind: {"title": row["title"]},
+        },
+    )
 
 
 @router.get(
@@ -646,7 +747,16 @@ async def get_block_children(block_id: str, request: Request):
     offset = pagination.decode_cursor(request.query_params.get("start_cursor"))
     limit = _page_size(request.query_params.get("page_size"))
     page = blocks[offset : offset + limit]
-    return _list_obj(page, offset, len(page), len(blocks), "block")
+    return _answer(
+        request,
+        _list_obj(
+            [_block_child(conn, row, b) for b in page],
+            offset,
+            len(page),
+            len(blocks),
+            "block",
+        ),
+    )
 
 
 # --------------------------------------------------------------------------- databases / data sources
@@ -663,7 +773,7 @@ async def get_database(database_id: str, request: Request):
         return _error(
             request, 404, "object_not_found", f"Could not find database with ID: {database_id}."
         )
-    return _database_obj(conn, row, _version(request))
+    return _answer(request, _database_obj(conn, row, _version(request)))
 
 
 @router.get("/data_sources/{data_source_id}", response_model=NotionObject, openapi_extra=_params())
@@ -688,7 +798,7 @@ async def get_data_source(data_source_id: str, request: Request):
             "object_not_found",
             f"Could not find data source with ID: {data_source_id}.",
         )
-    return _data_source_obj(conn, row)
+    return _answer(request, _data_source_obj(conn, row))
 
 
 async def _query_rows(request: Request, row_id: str, *, data_sources: bool):
@@ -715,8 +825,10 @@ async def _query_rows(request: Request, row_id: str, *, data_sources: bool):
     rows = store.children(conn, "notion", db_id, visible, limit=limit + 1, offset=offset)
     page = rows[:limit]
     total = offset + len(rows)  # +1 probe tells us whether there's a next page
-    results = [_page_obj(conn, r) for r in page]
-    return _list_obj(results, offset, len(page), total, "page_or_database")
+    version = _version(request)
+    results = [_page_obj(conn, r, version) for r in page]
+    trailer = "page_or_data_source" if _data_sources_model(version) else "page_or_database"
+    return _answer(request, _list_obj(results, offset, len(page), total, trailer))
 
 
 @router.post(
@@ -803,10 +915,11 @@ async def search(request: Request):
         if r["subtype"] == "database" and render_data_source
         else _database_obj(conn, r, version)
         if r["subtype"] == "database"
-        else _filter_properties(_page_obj(conn, r), keep if r["parent_id"] else None)
+        else _filter_properties(_page_obj(conn, r, version), keep if r["parent_id"] else None)
         for r in window
     ]
-    return _list_obj(results, offset, len(window), len(picked), "page_or_database")
+    trailer = "page_or_data_source" if _data_sources_model(version) else "page_or_database"
+    return _answer(request, _list_obj(results, offset, len(window), len(picked), trailer))
 
 
 # --------------------------------------------------------------------------- users
@@ -823,7 +936,7 @@ async def list_users(request: Request):
     limit = _page_size(request.query_params.get("page_size"))
     page = users[offset : offset + limit]
     results = [_user_obj(conn, u["email"]) for u in page]
-    return _list_obj(results, offset, len(page), len(users), "user")
+    return _answer(request, _list_obj(results, offset, len(page), len(users), "user"))
 
 
 @router.get("/users/me", response_model=NotionObject, openapi_extra=_params())
@@ -833,19 +946,26 @@ async def get_me(request: Request):
         return refusal
     conn = auth.conn(request)
     if caller.email:  # a user token → that person
-        return _user_obj(conn, caller.email)
+        return _answer(request, _user_obj(conn, caller.email))
     # admin/service token → the integration's bot user
-    return {
-        "object": "user",
-        "id": synth.notion_user_id("bot:backlot"),
-        "type": "bot",
-        "name": "backlot",
-        "avatar_url": None,
-        "bot": {
-            "owner": {"type": "workspace", "workspace": True},
-            "workspace_name": auth.acl(request).org_name,
+    return _answer(
+        request,
+        {
+            "object": "user",
+            "id": synth.notion_user_id("bot:backlot"),
+            "type": "bot",
+            "name": "backlot",
+            "avatar_url": None,
+            "bot": {
+                "owner": {"type": "workspace", "workspace": True},
+                "workspace_name": auth.acl(request).org_name,
+                "workspace_id": _workspace_id(auth.acl(request).org_name),
+                # The issue records the member, not the portal's plan limit; 5 MiB is the ceiling
+                # Notion publishes for a workspace's file uploads (read 2026-09-30).
+                "workspace_limits": {"max_file_upload_size_in_bytes": 5 * 1024 * 1024},
+            },
         },
-    }
+    )
 
 
 @router.get("/users/{user_id}", response_model=NotionObject, openapi_extra=_params())
@@ -857,7 +977,7 @@ async def get_user(user_id: str, request: Request):
     key = _norm(user_id)
     for u in store.list_users(conn):
         if _norm(synth.notion_user_id(u["email"])) == key:
-            return _user_obj(conn, u["email"])
+            return _answer(request, _user_obj(conn, u["email"]))
     return _error(request, 404, "object_not_found", f"Could not find user with ID: {user_id}.")
 
 
@@ -915,7 +1035,7 @@ async def list_comments(request: Request):
             if page["subtype"] != "database" and any(
                 b["id"] == wanted for b in synth.notion_blocks(page["id"], page["content"])
             ):
-                return _list_obj([], 0, 0, 0, "comment")
+                return _answer(request, _list_obj([], 0, 0, 0, "comment"))
         return _error(
             request, 404, "object_not_found", f"Could not find block with ID: {block_id}."
         )
@@ -944,7 +1064,7 @@ async def list_comments(request: Request):
         }
         for c in page
     ]
-    return _list_obj(results, offset, len(page), len(comments), "comment")
+    return _answer(request, _list_obj(results, offset, len(page), len(comments), "comment"))
 
 
 # --------------------------------------------------------------------------- misc
