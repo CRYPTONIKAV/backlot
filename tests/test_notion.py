@@ -13,7 +13,7 @@ import pytest
 from backlot import store, synth
 from backlot.routers.notion import DATA_SOURCES_VERSION, PUBLISHED_VERSIONS
 from backlot.routers.notion import router as notion_router
-from tests._helpers import served_id, tiny_corpus, tok
+from tests._helpers import corpus_client, served_id, tiny_corpus, tok
 
 
 @pytest.fixture
@@ -820,7 +820,7 @@ def test_notion_data_source_retrieve_is_mounted_only_above_the_cut(client, notio
 def test_notion_search_documents_body_param(client):
     op = client.get("/openapi.json").json()["paths"]["/notion/v1/search"]["post"]
     props = op["requestBody"]["content"]["application/json"]["schema"]["properties"]
-    assert "query" in props and "filter" in props
+    assert "query" in props and "filter" in props and "sort" in props
 
 
 def test_notion_every_route_declares_the_version_header_it_enforces(client):
@@ -1013,3 +1013,534 @@ def test_database_blocks_have_no_children(client, admin_h, version):
     pid = synth.notion_id("nt-runbook")
     assert client.get(f"/notion/v1/blocks/{pid}", headers=h).json()["has_children"] is True
     assert client.get(f"/notion/v1/blocks/{pid}/children", headers=h).json()["results"]
+
+
+# --- request members real Notion refuses ------------------------------------
+#
+# The three families below are the query string and the body against the operation's own schema:
+# a key the route does not take, a page size that is not a number or is out of the route's range,
+# and a start cursor that is not one. The rule and its measurement dates live in
+# `backlot/routers/notion.py`; these tests point at them.
+
+_USERS = "/notion/v1/users"
+_DOC_PAGE = synth.notion_id("nt-runbook")
+_DATA_SOURCE = synth.notion_data_source_id("nt-tasks-db")
+
+
+def _refused(r):
+    return r.status_code, r.json()["code"], r.json()["message"]
+
+
+def test_notion_unknown_key_is_refused_where_real_refuses_it(client, notion_h):
+    assert _refused(client.get(f"{_USERS}?foo=1", headers=notion_h)) == (
+        400,
+        "validation_error",
+        "query failed validation: query.foo should be not present, instead was `1`.",
+    )
+    assert _refused(client.post("/notion/v1/search?page_size=1", json={}, headers=notion_h)) == (
+        400,
+        "validation_error",
+        "query failed validation: query.page_size should be not present, instead was `1`.",
+    )
+    assert _refused(client.post("/notion/v1/search", json={"foo": 1}, headers=notion_h)) == (
+        400,
+        "validation_error",
+        "body failed validation: body.foo should be not present, instead was `1`.",
+    )
+    query = f"/notion/v1/data_sources/{_DATA_SOURCE}/query"
+    assert _refused(client.post(query, json={"foo": 1}, headers=notion_h)) == (
+        400,
+        "validation_error",
+        "body failed validation: body.foo should be not present, instead was `1`.",
+    )
+    # The two places real takes the extra member: a page keeps an unknown query parameter, and
+    # search reads `filter_properties` from the query string.
+    assert client.get(f"/notion/v1/pages/{_DOC_PAGE}?foo=1", headers=notion_h).status_code == 200
+    assert (
+        client.post(
+            "/notion/v1/search?filter_properties=title", json={}, headers=notion_h
+        ).status_code
+        == 200
+    )
+
+
+def test_notion_bracketed_key_is_refused_outside_filter_properties(client, notion_h):
+    """The bracketed spelling belongs to `filter_properties` alone -- the one key measured to read
+    `[]` and `[0]` -- so every other key is matched exactly and a bracketed one is a member the
+    route does not take."""
+    assert _refused(client.get(f"{_USERS}?start_cursor[0]=bogus", headers=notion_h)) == (
+        400,
+        "validation_error",
+        "query failed validation: query.start_cursor[0] should be not present, "
+        'instead was `"bogus"`.',
+    )
+    assert _refused(client.get(f"{_USERS}?page_size[0]=5", headers=notion_h)) == (
+        400,
+        "validation_error",
+        "query failed validation: query.page_size[0] should be not present, instead was `5`.",
+    )
+    assert (
+        client.post(
+            "/notion/v1/search?filter_properties[0]=title", json={}, headers=notion_h
+        ).status_code
+        == 200
+    )
+
+
+_PAGE_SIZE_ROWS = [
+    ("abc", '`"abc"`'),
+    ("1.5", "`1.5`"),
+    ("1_0", '`"1_0"`'),
+]
+
+
+@pytest.mark.parametrize("value, quoted", _PAGE_SIZE_ROWS)
+def test_notion_page_size_that_is_not_a_number_is_refused(client, notion_h, value, quoted):
+    assert _refused(client.get(f"{_USERS}?page_size={value}", headers=notion_h)) == (
+        400,
+        "validation_error",
+        "query failed validation: query.page_size should be a number or `undefined`, "
+        f"instead was {quoted}.",
+    )
+
+
+def test_notion_page_size_zero_and_over_the_cap_are_the_default_page(client, notion_h):
+    default = len(client.get(_USERS, headers=notion_h).json()["results"])
+    for value in ("0", "101"):
+        page = client.get(f"{_USERS}?page_size={value}", headers=notion_h).json()
+        assert len(page["results"]) == default, value
+        assert page["has_more"] is False, value
+    empty = client.get(f"{_USERS}?page_size=", headers=notion_h).json()
+    assert len(empty["results"]) == default
+
+
+def test_notion_page_size_repeated_is_refused_whatever_it_repeats(client, notion_h):
+    # Real refuses a repeated parameter even when both values agree: `1&1` gets the same
+    # "Conflicting values" answer as `1&100`.
+    conflict = (400, "validation_error", 'Conflicting values for "page_size" in query parameters.')
+    for query in ("page_size=1&page_size=1", "page_size=1&page_size=100"):
+        assert _refused(client.get(f"{_USERS}?{query}", headers=notion_h)) == conflict
+    children = f"/notion/v1/blocks/{_DOC_PAGE}/children?page_size=1&page_size=1"
+    assert _refused(client.get(children, headers=notion_h)) == conflict
+    comments = f"/notion/v1/comments?block_id={_DOC_PAGE}&page_size=1&page_size=1"
+    assert _refused(client.get(comments, headers=notion_h)) == conflict
+
+
+def test_notion_negative_page_size_is_an_empty_page_with_the_first_cursor(client, notion_h):
+    first = client.get(_USERS, headers=notion_h).json()["results"][0]["id"]
+    page = client.get(f"{_USERS}?page_size=-1", headers=notion_h).json()
+    assert page["results"] == [] and page["has_more"] is True
+    assert page["next_cursor"] == first
+    children = client.get(f"/notion/v1/blocks/{_DOC_PAGE}/children?page_size=-1", headers=notion_h)
+    block = client.get(f"/notion/v1/blocks/{_DOC_PAGE}/children", headers=notion_h).json()
+    assert children.json()["results"] == []
+    assert children.json()["next_cursor"] == block["results"][0]["id"]
+    search = client.post("/notion/v1/search", json={"page_size": -1}, headers=notion_h).json()
+    everything = client.post("/notion/v1/search", json={}, headers=notion_h).json()["results"]
+    assert search["results"] == [] and search["next_cursor"] == everything[0]["id"]
+    rows = client.post(
+        f"/notion/v1/data_sources/{_DATA_SOURCE}/query", json={"page_size": -1}, headers=notion_h
+    ).json()
+    first_row = client.post(
+        f"/notion/v1/data_sources/{_DATA_SOURCE}/query", json={}, headers=notion_h
+    ).json()["results"][0]["id"]
+    assert rows["results"] == [] and rows["has_more"] is True
+    assert rows["next_cursor"] == f"s:{first_row}:{_DATA_SOURCE}"
+
+
+def test_notion_users_refuses_a_page_size_below_minus_one_with_the_measured_503(client, notion_h):
+    for value in ("-2", "-5", "-100"):
+        r = client.get(f"{_USERS}?page_size={value}", headers=notion_h)
+        assert r.status_code == 503, value
+        assert r.json()["code"] == "service_unavailable"
+        assert r.json()["message"] == (
+            "Public API service is temporarily unavailable, please try again later."
+        )
+        assert r.json()["additional_data"] == {"endpoint_name": "public_listUsers"}
+
+
+def test_notion_comments_refuses_a_page_size_outside_its_range(client, notion_h):
+    for value, relation in (("0", "\u2265 `1`"), ("101", "\u2264 `100`"), ("-1", "\u2265 `1`")):
+        r = client.get(
+            "/notion/v1/comments",
+            params={"block_id": _DOC_PAGE, "page_size": value},
+            headers=notion_h,
+        )
+        assert _refused(r) == (
+            400,
+            "validation_error",
+            f"query failed validation: query.page_size should be {relation} or `undefined`, "
+            f"instead was `{value}`.",
+        )
+
+
+def test_notion_body_page_size_that_is_not_a_number_is_refused(client, notion_h):
+    assert _refused(
+        client.post("/notion/v1/search", json={"page_size": "5"}, headers=notion_h)
+    ) == (
+        400,
+        "validation_error",
+        "body failed validation: body.page_size should be a number or `undefined`, "
+        'instead was `"5"`.',
+    )
+    query = f"/notion/v1/data_sources/{_DATA_SOURCE}/query"
+    assert _refused(client.post(query, json={"page_size": "5"}, headers=notion_h)) == (
+        400,
+        "validation_error",
+        "body failed validation: body.page_size should be a number or `undefined`, "
+        'instead was `"5"`.',
+    )
+
+
+def test_notion_json_body_is_judged_under_a_non_json_content_type(client, notion_h):
+    plain = {**notion_h, "Content-Type": "text/plain"}
+    assert _refused(client.post("/notion/v1/search", content='{"foo":1}', headers=plain)) == (
+        400,
+        "validation_error",
+        "body failed validation: body.foo should be not present, instead was `1`.",
+    )
+    query = f"/notion/v1/data_sources/{_DATA_SOURCE}/query"
+    assert _refused(client.post(query, content='{"foo":1}', headers=plain)) == (
+        400,
+        "validation_error",
+        "body failed validation: body.foo should be not present, instead was `1`.",
+    )
+    # What the measurement records: `text/plain` with `{}` stays a 200.
+    assert client.post("/notion/v1/search", content="{}", headers=plain).status_code == 200
+
+
+def test_notion_children_judges_the_query_string_before_the_lookup(client, notion_h):
+    """A block that is missing and a member real refuses answer the member's 400, the same order
+    the comments route keeps."""
+    missing = "11111111-2222-4333-8444-555555555555"
+    assert _refused(
+        client.get(f"/notion/v1/blocks/{missing}/children?foo=1", headers=notion_h)
+    ) == (
+        400,
+        "validation_error",
+        "query failed validation: query.foo should be not present, instead was `1`.",
+    )
+    assert _refused(
+        client.get(f"/notion/v1/blocks/{missing}/children?page_size=abc", headers=notion_h)
+    ) == (
+        400,
+        "validation_error",
+        "query failed validation: query.page_size should be a number or `undefined`, "
+        'instead was `"abc"`.',
+    )
+
+
+def test_notion_start_cursor_that_is_not_one_is_refused(client, notion_h):
+    zero = "00000000-0000-0000-0000-000000000000"
+    assert _refused(client.get(f"{_USERS}?start_cursor=bogus", headers=notion_h)) == (
+        400,
+        "validation_error",
+        "The start_cursor provided is invalid: bogus",
+    )
+    assert _refused(client.get(f"{_USERS}?start_cursor={zero}", headers=notion_h)) == (
+        400,
+        "validation_error",
+        f"The start_cursor provided is invalid: {zero}",
+    )
+    assert _refused(client.get(f"{_USERS}?start_cursor=", headers=notion_h)) == (
+        400,
+        "validation_error",
+        "query failed validation: query.start_cursor should be a string or `undefined`, "
+        "instead was `0`.",
+    )
+    uuid_wording = (
+        "query failed validation: query.start_cursor should be a valid uuid or `undefined`, "
+        'instead was `"bogus"`.'
+    )
+    assert _refused(
+        client.get(f"/notion/v1/blocks/{_DOC_PAGE}/children?start_cursor=bogus", headers=notion_h)
+    )[1:] == ("validation_error", uuid_wording)
+    assert _refused(
+        client.get(
+            "/notion/v1/comments",
+            params={"block_id": _DOC_PAGE, "start_cursor": "bogus"},
+            headers=notion_h,
+        )
+    )[1:] == ("validation_error", uuid_wording)
+    body_wording = (
+        "body failed validation: body.start_cursor should be a valid uuid or `undefined`, "
+        'instead was `""`.'
+    )
+    assert _refused(client.post("/notion/v1/search", json={"start_cursor": ""}, headers=notion_h))[
+        1:
+    ] == ("validation_error", body_wording)
+    query = f"/notion/v1/data_sources/{_DATA_SOURCE}/query"
+    assert _refused(client.post(query, json={"start_cursor": "bogus"}, headers=notion_h)) == (
+        400,
+        "validation_error",
+        "The start_cursor provided is invalid: bogus",
+    )
+
+
+def test_notion_start_cursor_from_a_page_still_reads_the_next_page(client, notion_h):
+    users = client.get(f"{_USERS}?page_size=1", headers=notion_h).json()
+    first = users["results"][0]["id"]
+    second = client.get(
+        _USERS, params={"page_size": 1, "start_cursor": users["next_cursor"]}, headers=notion_h
+    ).json()
+    assert len(second["results"]) == 1 and second["results"][0]["id"] != first
+    children = client.get(
+        f"/notion/v1/blocks/{_DOC_PAGE}/children?page_size=1", headers=notion_h
+    ).json()
+    assert children["has_more"] is True
+    resumed = client.get(
+        f"/notion/v1/blocks/{_DOC_PAGE}/children",
+        params={"page_size": 1, "start_cursor": children["next_cursor"]},
+        headers=notion_h,
+    ).json()
+    assert resumed["results"] and resumed["results"][0]["id"] != children["results"][0]["id"]
+    search = client.post("/notion/v1/search", json={"page_size": 2}, headers=notion_h).json()
+    resumed_search = client.post(
+        "/notion/v1/search",
+        json={"page_size": 2, "start_cursor": search["next_cursor"]},
+        headers=notion_h,
+    ).json()
+    assert resumed_search["results"]
+    assert resumed_search["results"][0]["id"] not in {r["id"] for r in search["results"]}
+
+
+_NOTION_TWO_ROWS = [
+    {
+        "source_type": "notion",
+        "doc_id": "nt-db",
+        "subtype": "database",
+        "title": "Tasks",
+        "content": "Two rows, for the cursor round trip.",
+        "author_email": "ava@acme.com",
+        "visibility": "public",
+        "properties": {"Status": {"type": "select"}},
+    },
+    {
+        "source_type": "notion",
+        "doc_id": "nt-a",
+        "parent": "nt-db",
+        "title": "First row",
+        "content": "One.",
+        "author_email": "ava@acme.com",
+        "visibility": "public",
+        "properties": {"Status": "Open"},
+        "comments": [
+            {"content": "one", "author_email": "ava@acme.com"},
+            {"content": "two", "author_email": "ava@acme.com"},
+        ],
+    },
+    {
+        "source_type": "notion",
+        "doc_id": "nt-b",
+        "parent": "nt-db",
+        "title": "Second row",
+        "content": "Two.",
+        "author_email": "ava@acme.com",
+        "visibility": "public",
+        "properties": {"Status": "Done"},
+    },
+]
+
+
+def test_notion_data_source_query_cursor_from_a_page_reads_the_next_page(tmp_path):
+    """A query page's cursor is the token the route hands back, and the negative page's `s:` token
+    resumes after the row it names -- both on a data source with more rows than one page."""
+    with corpus_client(tmp_path, _NOTION_TWO_ROWS) as (client, settings):
+        h = {
+            "Authorization": f"Bearer {settings.admin_token}",
+            "Notion-Version": DATA_SOURCES_VERSION,
+        }
+        dsid = synth.notion_data_source_id("nt-db")
+        url = f"/notion/v1/data_sources/{dsid}/query"
+        first = client.post(url, json={"page_size": 1}, headers=h).json()
+        assert first["has_more"] is True
+        second = client.post(
+            url, json={"page_size": 1, "start_cursor": first["next_cursor"]}, headers=h
+        ).json()
+        assert second["results"]
+        assert second["results"][0]["id"] != first["results"][0]["id"]
+        negative = client.post(url, json={"page_size": -1}, headers=h).json()
+        assert negative["next_cursor"] == f"s:{first['results'][0]['id']}:{dsid}"
+        resumed = client.post(url, json={"start_cursor": negative["next_cursor"]}, headers=h).json()
+        assert resumed["results"][0]["id"] == second["results"][0]["id"]
+        # Search's negative page hands back the first item's id, and that id resumes it too.
+        search = client.post("/notion/v1/search", json={"page_size": -1}, headers=h).json()
+        assert search["next_cursor"]
+        resumed_search = client.post(
+            "/notion/v1/search", json={"start_cursor": search["next_cursor"]}, headers=h
+        ).json()
+        assert resumed_search["results"]
+        # The same round trip on the comment list, whose real cursor is a uuid.
+        page = synth.notion_id("nt-a")
+        comments = client.get(
+            "/notion/v1/comments", params={"block_id": page, "page_size": 1}, headers=h
+        ).json()
+        assert comments["has_more"] is True
+        more = client.get(
+            "/notion/v1/comments",
+            params={"block_id": page, "page_size": 1, "start_cursor": comments["next_cursor"]},
+            headers=h,
+        ).json()
+        assert more["results"]
+        assert more["results"][0]["id"] != comments["results"][0]["id"]
+
+
+_SEARCH_REFUSALS = [
+    (
+        "filter value database",
+        {"filter": {"property": "object", "value": "database"}},
+        "body failed validation. Fix one:\n"
+        'body.filter.value should be `"page"` or `"data_source"`, instead was `"database"`.\n'
+        "body.filter.in_trash should be defined, instead was `undefined`.",
+    ),
+    (
+        "filter value bogus",
+        {"filter": {"property": "object", "value": "bogus"}},
+        "body failed validation. Fix one:\n"
+        'body.filter.value should be `"page"` or `"data_source"`, instead was `"bogus"`.\n'
+        "body.filter.in_trash should be defined, instead was `undefined`.",
+    ),
+    (
+        "filter property type",
+        {"filter": {"property": "type", "value": "page"}},
+        "body failed validation. Fix one:\n"
+        'body.filter.property should be `"object"`, instead was `"type"`.\n'
+        "body.filter.in_trash should be defined, instead was `undefined`.",
+    ),
+    (
+        "sort direction up",
+        {"sort": {"direction": "up", "timestamp": "last_edited_time"}},
+        "body failed validation. Fix one:\n"
+        'body.sort.direction should be `"ascending"`, `"descending"`, or `undefined`, '
+        'instead was `"up"`.\n'
+        "body.sort.property should be defined, instead was `undefined`.",
+    ),
+    (
+        "sort timestamp created_time",
+        {"sort": {"direction": "ascending", "timestamp": "created_time"}},
+        'body.sort.timestamp should be "last_edited_time" when sorting by timestamp.',
+    ),
+    (
+        "sort without timestamp",
+        {"sort": {"direction": "ascending"}},
+        'body.sort.timestamp should be "last_edited_time" when sorting by timestamp.',
+    ),
+    (
+        "sort property x",
+        {"sort": {"direction": "ascending", "timestamp": "last_edited_time", "property": "x"}},
+        'body.sort.property should be "relevance", instead was `x`.',
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "label, body, message", _SEARCH_REFUSALS, ids=[row[0] for row in _SEARCH_REFUSALS]
+)
+def test_notion_search_body_real_refuses_is_refused(client, notion_h, label, body, message):
+    assert _refused(client.post("/notion/v1/search", json=body, headers=notion_h)) == (
+        400,
+        "validation_error",
+        message,
+    )
+
+
+def test_notion_search_body_that_is_not_an_object_or_not_json_is_refused(client, notion_h):
+    assert _refused(client.post("/notion/v1/search", json=[], headers=notion_h)) == (
+        400,
+        "validation_error",
+        "body failed validation: body should be an object, instead was `[]`.",
+    )
+    broken = client.post(
+        "/notion/v1/search",
+        content=b"{",
+        headers={**notion_h, "Content-Type": "application/json"},
+    )
+    assert _refused(broken) == (400, "invalid_json", "Error parsing JSON body.")
+
+
+def test_notion_search_serves_a_body_it_takes_and_the_versions_database_filter(client, notion_h):
+    for body in ({}, {"sort": {"direction": "ascending", "timestamp": "last_edited_time"}}):
+        assert client.post("/notion/v1/search", json=body, headers=notion_h).status_code == 200
+    legacy = {**notion_h, "Notion-Version": "2022-06-28"}
+    for value in ("database", "data_source"):
+        r = client.post(
+            "/notion/v1/search",
+            json={"filter": {"property": "object", "value": value}},
+            headers=legacy,
+        )
+        assert r.status_code == 200 and any(
+            row["object"] == "database" for row in r.json()["results"]
+        )
+    plain = client.post(
+        "/notion/v1/search", content=b"{}", headers={**notion_h, "Content-Type": "text/plain"}
+    )
+    assert plain.status_code == 200
+    bare = client.post("/notion/v1/search", content=b"{}", headers=notion_h)
+    assert bare.status_code == 200
+
+
+_DATA_SOURCE_QUERY = f"/notion/v1/data_sources/{_DATA_SOURCE}/query"
+
+_QUERY_REFUSALS = [
+    (
+        "unknown key",
+        {"foo": 1},
+        "body failed validation: body.foo should be not present, instead was `1`.",
+    ),
+    (
+        "filter property",
+        {"filter": {"property": "Nope", "title": {"equals": "x"}}},
+        "Could not find property with name or id: Nope",
+    ),
+    (
+        "sort property",
+        {"sorts": [{"property": "Nope", "direction": "ascending"}]},
+        "Could not find sort property with name or id: Nope",
+    ),
+    (
+        "page size",
+        {"page_size": "5"},
+        'body failed validation: body.page_size should be a number or `undefined`, instead was `"5"`.',
+    ),
+    ("start cursor", {"start_cursor": "bogus"}, "The start_cursor provided is invalid: bogus"),
+]
+
+
+@pytest.mark.parametrize(
+    "label, body, message", _QUERY_REFUSALS, ids=[row[0] for row in _QUERY_REFUSALS]
+)
+def test_notion_data_source_query_body_real_refuses_is_refused(
+    client, notion_h, label, body, message
+):
+    assert _refused(client.post(_DATA_SOURCE_QUERY, json=body, headers=notion_h)) == (
+        400,
+        "validation_error",
+        message,
+    )
+
+
+def test_notion_data_source_query_serves_the_rows_a_valid_body_asks_for(client, notion_h):
+    everything = client.post(_DATA_SOURCE_QUERY, json={}, headers=notion_h)
+    assert everything.status_code == 200 and everything.json()["results"]
+    filtered = client.post(
+        _DATA_SOURCE_QUERY,
+        json={"filter": {"property": "title", "title": {"equals": "Fix gateway 502s"}}},
+        headers=notion_h,
+    )
+    assert filtered.status_code == 200
+
+
+def test_notion_validation_error_uses_the_envelope_real_uses(client, notion_h):
+    r = client.get(f"{_USERS}?foo=1", headers=notion_h)
+    payload = r.json()
+    assert set(payload) == {"object", "status", "code", "message", "request_id"}
+    assert (payload["object"], payload["status"], payload["code"]) == (
+        "error",
+        400,
+        "validation_error",
+    )
+    assert payload["request_id"] == r.headers["x-notion-request-id"]
+    # A refusal this change does not add keeps its shape.
+    gone = client.get(f"/notion/v1/pages/{synth.notion_id('missing')}", headers=notion_h)
+    assert (gone.status_code, gone.json()["code"]) == (404, "object_not_found")
+    assert gone.json()["request_id"] == gone.headers["x-notion-request-id"]
