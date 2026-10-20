@@ -383,23 +383,31 @@ _CONTENT_NOT_FOUND = {
 }
 
 
-def content_not_found(route: str, content_id: int) -> AtlassianError:
+def content_not_found(route: str, content_id: int, *, attachment: bool = False) -> AtlassianError:
     """Confluence's 404 for a content id naming no page, in the three members and the two `data`
     shapes :data:`_CONTENT_NOT_FOUND` records.
 
     The id named is the one READ, never the one sent: `content/05/child/page` names
     `ContentId{id=5}`, because real converts the path variable before it looks the page up
-    (:func:`content_id_not_convertible` is what refuses the ones it cannot).
+    (:func:`content_id_not_convertible` is what refuses the ones it cannot). A page the caller may
+    not read answers this too, so its 404 and a made-up id's differ only in the id each names.
 
-    A page the caller may not read answers this too, and that is what keeps it byte for byte the
-    same as a made-up id: both raise here with the same route and the same read id, which
-    ``tests.test_atlassian.test_confluence_a_page_an_outsider_cannot_read_is_a_made_up_id`` pins.
+    ``attachment`` is what `content/{id}` and `label` pass for an id sent as `att<long>`, which
+    names an attachment, and no corpus record is one. Those two routes answer it with a third shape
+    whatever the number, a readable page's included: measured on Confluence Cloud, 2026-10-21,
+    `content/att229469` and `content/att229469/label` (229469 a page that serves) and
+    `att999999999` on both are `NotFoundException: null` beside `authorized` false and `valid`
+    true. The other four routes read the number alone and answer as for the bare id.
     """
     sentence_of, readable = _CONTENT_NOT_FOUND[route]
-    sentence = sentence_of(content_id)
-    if readable:
+    if attachment:
+        sentence = "null"
+        data = {"authorized": False, "valid": True, "errors": [], "successful": False}
+    elif readable:
+        sentence = sentence_of(content_id)
         data = {"authorized": True, "valid": True, "errors": [], "successful": True}
     else:
+        sentence = sentence_of(content_id)
         data = {
             "authorized": False,
             "valid": False,
@@ -419,15 +427,23 @@ def content_not_found(route: str, content_id: int) -> AtlassianError:
 
 
 def content_id_not_convertible(value: str) -> AtlassianError:
-    """Spring's 400 for a `content/{id}` path variable Confluence's `ContentId` cannot parse.
+    """Spring's 400 for a `content/{id}` path variable Confluence's `ContentId` cannot parse, the
+    value named as the path decodes it.
 
-    Measured on Confluence Cloud, 2026-10-16 for `abc`, `1.5`, `1e3`, a space,
-    `9223372036854775808`, `-9223372036854775809` and `99999999999999999999`, each as sent and
-    decoded inside the brackets. Three refusals name it and this is the third: the credential's 403
-    comes first and the route's own parameter refusals (`?limit=abc`, `?limit=-1`) come after, so
-    the routes read the id where they read the parameters, not in the signature
-    (``routers.atlassian._confluence_content_id``).
+    What ends the message depends on the value's first three characters. After `att`, it is the
+    `NumberFormatException` of the `long` that should follow, naming what does: `att` names `""`,
+    `attabc` names `"abc"`. Otherwise it is `Can't parse as a ContentId`. Measured on Confluence
+    Cloud, 2026-10-16 (`abc`, `1.5`, `1e3`, a space, `9223372036854775808`, `-9223372036854775809`,
+    `99999999999999999999`) and 2026-10-21 (`att`, `attabc`, `att%205`, `att9223372036854775808`,
+    and `ATT999999999` and `Att5`, which end as `abc` does).
     """
+    if value.startswith("att"):
+        cause = f'java.lang.NumberFormatException: For input string: "{value[3:]}"'
+    else:
+        cause = (
+            "com.atlassian.confluence.api.service.exceptions.api.BadRequestException: "
+            "Can't parse as a ContentId"
+        )
     return AtlassianError(
         400,
         {
@@ -440,9 +456,7 @@ def content_id_not_convertible(value: str) -> AtlassianError:
                 "org.springframework.core.convert.ConversionFailedException: Failed to convert "
                 "from type [java.lang.String] to type [@org.springframework.web.bind.annotation."
                 f"PathVariable com.atlassian.confluence.api.model.content.id.ContentId] for "
-                f"value [{value}]; nested exception is "
-                "com.atlassian.confluence.api.service.exceptions.api.BadRequestException: "
-                "Can't parse as a ContentId"
+                f"value [{value}]; nested exception is {cause}"
             ),
         },
     )
@@ -2461,10 +2475,9 @@ def http_body(path: str, exc, query=None) -> dict:
 
 def validation_body(path: str, errors) -> tuple[int, dict]:
     """A 422 from FastAPI's own request validation, in the product's refusal envelope. The per-field
-    detail collapses to one sentence because that is the only part a client reads. Jira's routes
-    read their own parameters, so what reaches this is a Confluence integer path parameter, for
-    which real answers a 400 in the same two members, a Spring
-    `MethodArgumentTypeMismatchException`, where this answers the 422."""
+    detail collapses to one sentence because that is the only part a client reads. Jira's and
+    Confluence's routes read their own parameters and path variables, so a route reaches this only
+    if it declares one typed."""
     message = "; ".join(e.get("msg", "invalid request") for e in errors) or "Invalid request"
     if is_confluence(path):
         return 422, _confluence_envelope(422, message)

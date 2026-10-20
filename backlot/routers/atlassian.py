@@ -652,17 +652,10 @@ def _java_long(raw: str) -> int | None:
     return value if -(2**63) <= value < 2**63 else None
 
 
-def _confluence_content_id(raw: str) -> int | None:
-    """``raw`` as Confluence's ``ContentId`` reads it, or None where it cannot.
-
-    A `ContentId` is `Long.parseLong` with no hex and no trimming, unlike the `long` of
-    :func:`_java_long`: `+5` and `05` read as 5, `-9223372036854775808` and `9223372036854775807`
-    are ids, and `abc`, `1.5`, `1e3`, a space, `9223372036854775808`, `-9223372036854775809` and
-    `99999999999999999999` are None. Measured on Confluence Cloud, 2026-10-16.
-
-    A digit of any script in the Basic Multilingual Plane counts, as :func:`_java_digit` reads it
-    (`٥` is five); a character past U+FFFF is two `char`s to Java and neither of them a digit.
-    """
+def _parse_long(raw: str) -> int | None:
+    """``raw`` as Java's `Long.parseLong` reads it, or None where it throws: an optional sign, then
+    decimal digits as :func:`_java_digit` reads them, within a `long`. Nothing is trimmed and there
+    is no hexadecimal, unlike :func:`_java_long`."""
     negative = raw.startswith("-")
     digits = raw[1:] if raw[:1] in ("+", "-") else raw
     if not digits:
@@ -677,22 +670,26 @@ def _confluence_content_id(raw: str) -> int | None:
     return value if -(2**63) <= value < 2**63 else None
 
 
-def _content_id(request: Request, raw: str) -> int:
-    """The ``content_id`` path variable as real reads it, or the 400 it answers.
+def _content_id(raw: str) -> tuple[int, bool]:
+    """The ``content_id`` path variable as Confluence's `ContentId` reads it, and whether it was
+    sent as an attachment's, or the 400 it answers.
 
-    Every route under `content/{id}` reads it in its body rather than declaring it an ``int``:
-    Spring converts the path variable AFTER the credential's 403 and BEFORE the route's own
-    parameter refusals, which a signature annotation cannot order (``errors.atlassian``
-    ``.validation_body``'s own docstring records this server answering a 422 there).
+    An id is :func:`_parse_long` of the value, or of what follows a leading `att`, which marks an
+    attachment's (:func:`backlot.errors.atlassian.content_not_found` says what that changes).
+    Measured on Confluence Cloud, 2026-10-16 and 2026-10-21: `05`, `٥` and `att5` are 5, and
+    `0x10`, a space beside the digits, `Att5` and `attabc` are the 400.
+
+    Every route under `content/{id}` reads it in its body rather than declaring it in the
+    signature: Spring converts the path variable after the credential's 403 and before the route's
+    own parameter refusals (`content/abc/child/page?limit=abc`, `?limit=-1` and
+    `content/abc/label?prefix=bogus` are this 400), and a declared type is checked before the
+    route runs.
     """
-    # Tests call the route functions directly with the served int id; FastAPI hands the raw
-    # path string. Both read as the same ContentId.
-    if isinstance(raw, int):
-        return raw
-    content_id = _confluence_content_id(raw)
+    attachment = raw.startswith("att")
+    content_id = _parse_long(raw[3:] if attachment else raw)
     if content_id is None:
         raise errors_atlassian.content_id_not_convertible(raw)
-    return content_id
+    return content_id, attachment
 
 
 def _role_id(request: Request, raw: str) -> int:
@@ -2018,11 +2015,11 @@ async def confluence_content_list(request: Request):
 async def confluence_content_get(content_id: str, request: Request):
     conn = auth.conn(request)
     caller = _confluence_caller(request)
-    content_id = _content_id(request, content_id)
+    content_id, attachment = _content_id(content_id)
     ids = auth.visible_ids(request, caller)
     row = store.confluence_by_id(conn, content_id, visible_ids=ids)
-    if row is None:
-        raise errors_atlassian.content_not_found("content", content_id)
+    if row is None or attachment:
+        raise errors_atlassian.content_not_found("content", content_id, attachment=attachment)
     return _confluence_page(conn, request, row, _str_param(request, "expand", "body.storage"))
 
 
@@ -2034,10 +2031,7 @@ async def confluence_content_get(content_id: str, request: Request):
 async def confluence_child_pages(content_id: str, request: Request):
     conn = auth.conn(request)
     caller = _confluence_caller(request)
-    content_id = _content_id(request, content_id)
-    # Real reads `limit` and `start` before it looks the page up: on an unknown id
-    # `?limit=abc` is the conversion 400 and `?limit=-1` the negative one, not the 404
-    # (measured 2026-10-16, as `child/attachment` has read them since 2026-10-10).
+    content_id, _ = _content_id(content_id)
     limit, start = _confluence_page_params(request)
     ids = auth.visible_ids(request, caller)
     if store.get_document(conn, "confluence", content_id, visible_ids=ids) is None:
@@ -2066,8 +2060,7 @@ async def confluence_child_pages(content_id: str, request: Request):
 async def confluence_comments(content_id: str, request: Request):
     conn = auth.conn(request)
     caller = _confluence_caller(request)
-    content_id = _content_id(request, content_id)
-    # Conversion and negative before the lookup, measured 2026-10-16 as on `child/page`.
+    content_id, _ = _content_id(content_id)
     limit, start = _confluence_page_params(request, cap=1000)
     ids = auth.visible_ids(request, caller)
     if store.get_document(conn, "confluence", content_id, visible_ids=ids) is None:
@@ -2119,14 +2112,10 @@ async def confluence_comments(content_id: str, request: Request):
 async def confluence_attachments(content_id: str, request: Request):
     """A page's attachments, which is the empty page for every page: a corpus record states no
     attachment, and this is the page real answers for a page holding none.
-
-    Measured 2026-10-10: `limit` and `start` are read before the page is looked up, so
-    `content/999999999/child/attachment?limit=abc` is the conversion 400 and `?limit=-1` the
-    negative one, not the unknown id's 404.
     """
     conn = auth.conn(request)
     caller = _confluence_caller(request)
-    content_id = _content_id(request, content_id)
+    content_id, _ = _content_id(content_id)
     limit, start = _confluence_page_params(request, default=50)
     ids = auth.visible_ids(request, caller)
     if store.get_document(conn, "confluence", content_id, visible_ids=ids) is None:
@@ -2172,17 +2161,18 @@ def _refuse_a_label_prefix(request: Request) -> None:
 async def confluence_labels(content_id: str, request: Request):
     conn = auth.conn(request)
     caller = _confluence_caller(request)
-    content_id = _content_id(request, content_id)
-    # Real converts `limit` and `start` before it reads `prefix` and before it looks the page up,
-    # and refuses a negative or zero one after it (measured 2026-10-14 and 2026-10-16, where an
-    # unknown id with `?limit=-1` is the 404 and with `?limit=abc` the conversion 400).
+    content_id, attachment = _content_id(content_id)
+    # Real converts `limit` and `start`, then reads `prefix`, before it looks the page up, and
+    # refuses a negative or zero one after it: on an id naming nothing, `?limit=abc` and
+    # `?prefix=bogus` are their 400s and `?limit=-1` and `?limit=0` the 404 (Confluence Cloud,
+    # 2026-10-14, 2026-10-16 and 2026-10-21).
     _int_param(request, "limit", 200)
     _int_param(request, "start", 0)
+    _refuse_a_label_prefix(request)
     ids = auth.visible_ids(request, caller)
     row = store.get_document(conn, "confluence", content_id, visible_ids=ids)
-    if row is None:
-        raise errors_atlassian.content_not_found("label", content_id)
-    _refuse_a_label_prefix(request)
+    if row is None or attachment:
+        raise errors_atlassian.content_not_found("label", content_id, attachment=attachment)
     limit, start = _confluence_page_params(request, default=200, cap=200, refuse_zero=True)
     labels = store.jcol(row, "labels")
     results = [
@@ -2209,7 +2199,7 @@ async def confluence_labels(content_id: str, request: Request):
 async def confluence_restrictions(content_id: str, request: Request):
     conn = auth.conn(request)
     caller = _confluence_caller(request)
-    content_id = _content_id(request, content_id)
+    content_id, _ = _content_id(content_id)
     ids = auth.visible_ids(request, caller)
     if store.get_document(conn, "confluence", content_id, visible_ids=ids) is None:
         raise errors_atlassian.content_not_found("restriction/byOperation", content_id)
@@ -2755,6 +2745,11 @@ def _confluence_page_params(
     400. Unclamped, a listing would hand them to SQLite, which reads a negative LIMIT as no limit at
     all and so would answer `?limit=-1` with the whole collection. `content` reads the pair itself,
     since it puts refusals of its own between these (``_CONTENT_TYPES``).
+
+    The three `child/*` listings call it before they look the page up, so on an id naming nothing
+    its refusals come ahead of the 404: `?limit=abc` and `?limit=-1` are its 400s there. Measured
+    on `child/attachment` 2026-10-10 and on `child/page` and `child/comment` 2026-10-16. `label`
+    converts the pair before its lookup and calls this after it (:func:`confluence_labels`).
 
     Order is measured too, because both parameters can be wrong at once. Conversion comes first for
     BOTH — `?limit=-1&start=abc` is the conversion failure about `abc`, not the negative about
